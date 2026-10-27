@@ -85,7 +85,10 @@ class TradingPipeline:
     As-of bars pass through :class:`~app.data.quality.DataQualityGate` before
     any signals are produced.  Quality warning codes are surfaced as regime
     degraded flags alongside missing-namechange, stock-basic-industry,
-    empty-limit-list, index-fallback, and initial-sentiment-stage markers.
+    empty-limit-list, index-fallback, initial-sentiment-stage, and
+    historical-reference-gap markers.  A bar code absent from the current
+    ``stock_basic`` snapshot is allowed with ``stock_reference_incomplete``;
+    missing required codes remain fatal.
 
     Breadth, industry strength, and leader percentiles use the broad tradable
     universe (listed, non-ST, non-suspended) rather than the narrower
@@ -231,6 +234,15 @@ class TradingPipeline:
             _add_flag(degraded, warning)
         if expected_codes is not None and not expected_codes:
             raise DataNotReadyError("all listed stocks are suspended")
+        # A current stock_basic snapshot can omit codes that existed on a
+        # historical date (merged/retired names).  Keep such bars as allowed
+        # but surface the reference gap; only missing required codes are fatal.
+        actual_codes = set(as_of_bars["ts_code"].drop_nulls().to_list())
+        if allowed_codes is not None:
+            reference_extras = actual_codes - allowed_codes
+            if reference_extras:
+                _add_flag(degraded, "stock_reference_incomplete")
+                allowed_codes = allowed_codes | reference_extras
         quality = DataQualityGate().check(
             as_of,
             as_of_bars,

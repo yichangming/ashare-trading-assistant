@@ -402,16 +402,21 @@ The help output must list `sync`, `calendar`, `assemble`,
   checksums for the day they were written, but old reference bytes are not
   retrievable. Versioned reference snapshots are a M3 follow-up.
 - **Real Tushare contracts need token verification.** `trade_cal` is fetched
-  in yearly chunks and `stock_basic` is fetched once per list status
-  (`L`, `D`, `P`). The client calls each endpoint once per request and does
-  not implement row/page pagination. The exact pagination behavior,
-  `namechange` fields, and `index_member`/`index_classify` contracts should
-  be verified against a live token before relying on them for production
-  history.
+  in yearly chunks, `stock_basic` once per list status (`L`, `D`, `P`),
+  `namechange` in five-year chunks, and `index_member` per SW L1 industry.
+  Per-day endpoints are assumed to fit Tushare's row caps. Verify row caps,
+  `namechange` fields, and `index_member`/`index_classify` contracts against
+  a live token before relying on them for other data vintages.
 - **A-template overhead resistance is a proxy.** The take-profit resistance
   gate uses `high_60d_raw`, a rolling 60-day high that includes the current
   bar. It is not a true swing-high detector; proper swing-high resistance
   detection is a follow-up.
+- **Historical stock-reference gaps are warnings.** A current
+  `stock_basic` snapshot can omit codes that existed on a historical date
+  (for example, merged/retired names). `run` keeps such bars allowed and adds
+  the `stock_reference_incomplete` degraded flag; a required listed code
+  missing from the bars remains fatal. Use `quality --day` for a strict
+  exact-code check when investigating a date.
 - **Industry history uses as-of membership.** Multi-day industry strength
   computes prior days with the as-of tradeable membership. This is a slight
   approximation when stocks are reclassified or enter/leave the tradable

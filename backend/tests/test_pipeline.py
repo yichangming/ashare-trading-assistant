@@ -976,7 +976,7 @@ def test_pipeline_present_empty_suspend_partition_uses_exact_codes():
         _run_real_path(provider)
 
 
-def test_pipeline_present_empty_suspend_partition_same_count_swap_fails():
+def test_pipeline_present_empty_suspend_partition_missing_code_still_fails():
     provider = RealPathProvider(
         missing_daily_codes=(_BACKGROUND_CODES[0],),
         extra_bar_code="699999.SH",
@@ -985,16 +985,12 @@ def test_pipeline_present_empty_suspend_partition_same_count_swap_fails():
         _run_real_path(provider)
     message = str(excinfo.value)
     assert "missing expected codes" in message
-    assert "unexpected codes" in message
 
 
-def test_pipeline_pure_extra_bar_fails_unexpected_codes_on_zero_suspension_day():
+def test_pipeline_pure_extra_bar_is_reference_gap_warning():
     provider = RealPathProvider(extra_bar_code="699999.SH")
-    with pytest.raises(DataQualityError) as excinfo:
-        _run_real_path(provider)
-    message = str(excinfo.value)
-    assert "unexpected codes" in message
-    assert "coverage" not in message
+    result = _run_real_path(provider)
+    assert "stock_reference_incomplete" in result.regime.degraded_flags
 
 
 def test_pipeline_resume_only_suspend_partition_uses_exact_codes():
