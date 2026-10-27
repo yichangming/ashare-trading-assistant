@@ -2,7 +2,7 @@
 name = "ashare-trading-assistant"
 version = "0.1.0"
 description = "A-share personal trading assistant: data foundation and dual-template planning pipeline"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.3,<3",
