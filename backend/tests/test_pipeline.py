@@ -243,6 +243,57 @@ def test_correlations_include_positions_pending_and_skip_short_history():
     assert "000004.SZ" not in correlations
 
 
+def test_correlations_omit_non_finite_pairs():
+    as_of = date(2024, 2, 1)
+    dates = _trading_days_ending(as_of, 25)
+    varying = [
+        10.0 * (1 + 0.01 * ((index % 5) - 2))
+        for index in range(len(dates))
+    ]
+    rows: list[dict] = []
+    for code, closes in (
+        ("000001.SZ", varying),
+        ("000002.SZ", varying),
+        # A constant close produces zero-variance returns and NaN correlation.
+        ("000003.SZ", [10.0] * len(dates)),
+    ):
+        for trade_date, close in zip(dates, closes, strict=True):
+            rows.append(
+                {"ts_code": code, "trade_date": trade_date, "close": close}
+            )
+    account = _account(
+        pending_plans=[
+            PendingExposure(
+                ts_code="000002.SZ",
+                sector="银行",
+                entry_price=Decimal("10"),
+                stop_price=Decimal("9"),
+                shares=100,
+                template=Template.A,
+            ),
+            PendingExposure(
+                ts_code="000003.SZ",
+                sector="银行",
+                entry_price=Decimal("10"),
+                stop_price=Decimal("9"),
+                shares=100,
+                template=Template.A,
+            ),
+        ],
+    )
+    pipeline = TradingPipeline(
+        provider=DummyProvider(), config=load_strategy_config()
+    )
+
+    correlations = pipeline._correlations_map(
+        pl.DataFrame(rows), ["000001.SZ"], account, as_of
+    )
+
+    inner = correlations["000001.SZ"]
+    assert inner["000002.SZ"] == pytest.approx(1.0)
+    assert "000003.SZ" not in inner
+
+
 # ---------------------------------------------------------------------------
 # Tradable universe / breadth
 # ---------------------------------------------------------------------------
@@ -445,7 +496,11 @@ def _background_closes() -> list[float]:
     return values
 
 
-def _real_bars(bad_quality: bool = False) -> pl.DataFrame:
+def _real_bars(
+    bad_quality: bool = False,
+    suspended_codes: tuple[str, ...] = (),
+    extra_bar_code: str | None = None,
+) -> pl.DataFrame:
     rows: list[dict] = []
     a_path = _a_closes()
     background_path = _background_closes()
@@ -504,6 +559,37 @@ def _real_bars(bad_quality: bool = False) -> pl.DataFrame:
                 }
             )
             previous = close
+    if suspended_codes:
+        # Tushare ``daily`` omits suspended names for the day.
+        rows = [
+            row
+            for row in rows
+            if not (
+                row["trade_date"] == _AS_OF
+                and row["ts_code"] in suspended_codes
+            )
+        ]
+    if extra_bar_code is not None:
+        rows.append(
+            {
+                "ts_code": extra_bar_code,
+                "trade_date": _AS_OF,
+                "open": 10.0,
+                "high": 10.05,
+                "low": 9.95,
+                "close": 10.0,
+                "pre_close": 10.0,
+                "vol": 1e5,
+                "amount": 1e8,
+                "adj_factor": 1.0,
+                "turnover_rate": 0.05,
+                "circ_mv": 1e10,
+                "up_limit": 11.0,
+                "down_limit": 9.0,
+                "is_suspended": False,
+                "limit_derived": True,
+            }
+        )
     return pl.DataFrame(rows).sort(["ts_code", "trade_date"])
 
 
@@ -516,12 +602,26 @@ class RealPathProvider:
         calendar_end: date | None = None,
         degraded: bool = False,
         bad_quality: bool = False,
+        suspended_codes: tuple[str, ...] = (),
+        suspend_available: bool = True,
+        extra_bar_code: str | None = None,
+        empty_index: bool = False,
+        empty_trade_cal: bool = False,
     ):
         self.calendar_end = calendar_end or (
             _AS_OF + timedelta(days=45)
         )
         self.degraded = degraded
-        self.bars = _real_bars(bad_quality=bad_quality)
+        self.suspended_codes = suspended_codes
+        self.suspend_available = suspend_available
+        self.empty_index = empty_index
+        self.empty_trade_cal = empty_trade_cal
+        self.trade_cal_calls: list[tuple[date, date]] = []
+        self.bars = _real_bars(
+            bad_quality=bad_quality,
+            suspended_codes=suspended_codes,
+            extra_bar_code=extra_bar_code,
+        )
 
     def load_bars(self, start: date, end: date) -> pl.DataFrame:
         return self.bars.filter(
@@ -529,10 +629,29 @@ class RealPathProvider:
             & (pl.col("trade_date") <= end)
         )
 
+    def load_suspend(self, start: date, end: date) -> pl.DataFrame:
+        schema = {
+            "trade_date": pl.Date,
+            "ts_code": pl.String,
+            "suspend_type": pl.String,
+        }
+        if not self.suspend_available:
+            return pl.DataFrame(schema=schema)
+        rows = [
+            {
+                "trade_date": _AS_OF,
+                "ts_code": code,
+                "suspend_type": "S",
+            }
+            for code in self.suspended_codes
+            if start <= _AS_OF <= end
+        ]
+        return pl.DataFrame(rows, schema=schema)
+
     def load_index_bars(
         self, index_code: str, start: date, end: date
     ) -> pl.DataFrame:
-        if index_code != "000300.SH":
+        if self.empty_index or index_code != "000300.SH":
             return pl.DataFrame()
         dates = _business_days(start, end)
         return pl.DataFrame(
@@ -570,6 +689,9 @@ class RealPathProvider:
         )
 
     def load_trade_cal(self, start: date, end: date) -> pl.DataFrame:
+        self.trade_cal_calls.append((start, end))
+        if self.empty_trade_cal:
+            return pl.DataFrame()
         limit = min(end, self.calendar_end)
         dates = _business_days(start, limit)
         return pl.DataFrame(
@@ -685,3 +807,69 @@ def test_pipeline_requires_forward_trade_cal_window():
     )
     with pytest.raises(DataNotReadyError, match="forward trade_cal"):
         pipeline.run(as_of=_AS_OF, account=_account())
+
+
+def test_pipeline_requests_forward_trade_cal_window():
+    provider = RealPathProvider()
+    _run_real_path(provider)
+    assert provider.trade_cal_calls == [
+        (_AS_OF - timedelta(days=400), _AS_OF + timedelta(days=45))
+    ]
+
+
+def test_pipeline_requires_open_trade_cal_for_as_of():
+    guidance = "sync/backfill a forward trade_cal window"
+    empty_calendar = TradingPipeline(
+        provider=RealPathProvider(empty_trade_cal=True),
+        config=load_strategy_config(),
+    )
+    with pytest.raises(DataNotReadyError, match=guidance):
+        empty_calendar.run(as_of=_AS_OF, account=_account())
+
+    # Saturday is not an open trading day in the fake calendar.
+    non_trading_day = TradingPipeline(
+        provider=RealPathProvider(), config=load_strategy_config()
+    )
+    with pytest.raises(DataNotReadyError, match=guidance):
+        non_trading_day.run(
+            as_of=_AS_OF + timedelta(days=5), account=_account()
+        )
+
+
+def test_pipeline_raises_when_both_index_sources_are_empty():
+    with pytest.raises(DataNotReadyError, match="index bars missing"):
+        _run_real_path(RealPathProvider(empty_index=True))
+
+
+def test_pipeline_suspended_reference_code_absent_from_daily_passes():
+    suspended = _BACKGROUND_CODES[0]
+    result = _run_real_path(
+        RealPathProvider(suspended_codes=(suspended,))
+    )
+    assert [candidate.ts_code for candidate in result.candidates] == [
+        "600000.SH",
+        "600001.SH",
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_unexpected_bar_code_fails_with_exact_expected_universe():
+    provider = RealPathProvider(
+        suspended_codes=(_BACKGROUND_CODES[0],),
+        extra_bar_code="699999.SH",
+    )
+    with pytest.raises(DataQualityError, match="unexpected codes"):
+        _run_real_path(provider)
+
+
+def test_pipeline_suspend_unavailable_falls_back_to_count_coverage():
+    provider = RealPathProvider(
+        suspended_codes=(_BACKGROUND_CODES[0],),
+        suspend_available=False,
+    )
+    result = _run_real_path(provider)
+    assert [candidate.ts_code for candidate in result.candidates] == [
+        "600000.SH",
+        "600001.SH",
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)

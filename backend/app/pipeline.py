@@ -156,22 +156,29 @@ class TradingPipeline:
         if bars.is_empty():
             raise DataNotReadyError(f"bars missing for {as_of}")
         forward_end = as_of + timedelta(days=_FORWARD_CALENDAR_DAYS)
-        trade_cal = self.provider.load_trade_cal(start, forward_end)
-        calendar = TradingCalendar.from_trade_cal(trade_cal)
-        if not calendar.is_trading_day(as_of):
-            raise DataNotReadyError(f"{as_of} is not a trading day in trade_cal")
         expiry_days = max(
             self.config.template_a.entry_valid_days,
             self.config.template_b.entry_valid_days,
         )
+        calendar_guidance = (
+            f"trade_cal does not cover a forward window through {forward_end}; "
+            "sync/backfill a forward trade_cal window "
+            f"covering {as_of} + {expiry_days} trading days"
+        )
+        trade_cal = self.provider.load_trade_cal(start, forward_end)
+        if trade_cal.is_empty():
+            raise DataNotReadyError(
+                f"{calendar_guidance}: trade_cal is empty"
+            )
+        calendar = TradingCalendar.from_trade_cal(trade_cal)
+        if not calendar.is_trading_day(as_of):
+            raise DataNotReadyError(
+                f"{calendar_guidance}: {as_of} is not an open trading day"
+            )
         try:
             calendar.add_trading_days(as_of, expiry_days)
         except ValueError as exc:
-            raise DataNotReadyError(
-                "trade_cal does not cover the entry expiry window through "
-                f"{forward_end}; sync/backfill a forward trade_cal window "
-                f"covering {as_of} + {expiry_days} trading days: {exc}"
-            ) from exc
+            raise DataNotReadyError(f"{calendar_guidance}: {exc}") from exc
 
         stocks = self.provider.load_stock_basic(as_of)
         if stocks.is_empty():
@@ -179,21 +186,26 @@ class TradingPipeline:
 
         degraded: list[str] = []
         as_of_bars = bars.filter(pl.col("trade_date") == as_of)
-        # ``stocks`` is the listed/delisted reference as of ``as_of``: the
-        # provider already drops names delisted by then, but a stock suspended
-        # for the day legitimately has no bar and still counts in the coverage
-        # denominator.  A large suspension cohort can therefore fail coverage;
-        # supply an explicit suspension exclusion if that becomes material.
-        # As-of bar codes are added so a code absent from the reference (for
-        # example a newly listed name) is not reported as unexpected; names
-        # missing from the bars still fail ``missing_expected_codes``.
-        expected_codes = set(stocks["ts_code"].to_list()) | set(
-            as_of_bars["ts_code"].to_list()
-        )
+        # A suspended stock is legitimately absent from Tushare ``daily``.
+        # When ``suspend_d`` partitions are available, remove exactly those
+        # codes from the expected universe so the exact-code check neither
+        # reports them missing nor rejects their absence.  When the optional
+        # suspend endpoint is unavailable or empty, do not fabricate an exact
+        # universe: fall back to count-based coverage against all listed
+        # names, where the 99% threshold tolerates a small suspended cohort.
+        suspend = self.provider.load_suspend(as_of, as_of)
+        if not suspend.is_empty() and "ts_code" in suspend.columns:
+            suspended_codes = set(suspend["ts_code"].drop_nulls().to_list())
+            exact_codes = set(stocks["ts_code"].to_list()) - suspended_codes
+            expected_codes: set[str] | None = exact_codes
+            expected_count = len(exact_codes)
+        else:
+            expected_codes = None
+            expected_count = len(stocks)
         quality = DataQualityGate().check(
             as_of,
             as_of_bars,
-            expected_count=len(expected_codes),
+            expected_count=expected_count,
             expected_codes=expected_codes,
         )
         if not quality.passed:

@@ -103,6 +103,48 @@ def test_provider_normalizes_trade_cal_string_dates(store: ParquetStore):
     assert loaded.schema["cal_date"] == pl.Date
 
 
+def test_provider_load_suspend_range(store: ParquetStore):
+    store.write_raw(
+        "suspend_d",
+        "20240102",
+        pl.DataFrame(
+            {
+                "ts_code": ["000001.SZ", "000002.SZ"],
+                "trade_date": ["20240102", "20240102"],
+                "suspend_type": ["S", "R"],
+            }
+        ),
+    )
+    store.write_raw(
+        "suspend_d",
+        "20240103",
+        pl.DataFrame(
+            {
+                "ts_code": ["000003.SZ"],
+                "trade_date": ["20240103"],
+                "suspend_type": ["S"],
+            }
+        ),
+    )
+    provider = ParquetMarketDataProvider(store)
+    loaded = provider.load_suspend(date(2024, 1, 2), date(2024, 1, 3))
+    assert loaded.sort("ts_code")["ts_code"].to_list() == [
+        "000001.SZ",
+        "000003.SZ",
+    ]
+    assert loaded.schema["trade_date"] == pl.Date
+    assert (loaded["trade_date"] == date(2024, 1, 2)).sum() == 1
+
+
+def test_provider_load_suspend_missing_is_typed_empty(store: ParquetStore):
+    loaded = ParquetMarketDataProvider(store).load_suspend(
+        date(2024, 1, 2), date(2024, 1, 2)
+    )
+    assert loaded.is_empty()
+    assert loaded.schema["trade_date"] == pl.Date
+    assert loaded.schema["ts_code"] == pl.String
+
+
 def test_processed_multi_partition_range(store: ParquetStore):
     store.write_processed(
         "bars",

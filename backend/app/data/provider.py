@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 
 from app.data.store import ParquetStore
 
 _DATE_FORMATS = ("%Y%m%d", "%Y-%m-%d")
+_SUSPEND_SCHEMA = {
+    "trade_date": pl.Date,
+    "ts_code": pl.String,
+    "suspend_type": pl.String,
+}
+
+
+def _empty_suspend() -> pl.DataFrame:
+    return pl.DataFrame(schema=_SUSPEND_SCHEMA)
 
 
 def _normalize_date_columns(
@@ -43,6 +52,40 @@ class ParquetMarketDataProvider:
 
     def load_bars(self, start: date, end: date) -> pl.DataFrame:
         return self.store.read_processed("bars", start, end)
+
+    def load_suspend(self, start: date, end: date) -> pl.DataFrame:
+        """Load ``suspend_d`` raw partitions for ``[start, end]``.
+
+        Returns only ``suspend_type == "S"`` rows when the column is present,
+        with ``trade_date`` normalized to :class:`polars.Date`.  An empty,
+        typed frame signals that the optional endpoint is unavailable or has
+        no usable rows, which lets callers fall back to count-based coverage.
+        """
+        if start > end:
+            return _empty_suspend()
+        frames: list[pl.DataFrame] = []
+        current = start
+        while current <= end:
+            frame = self.store.read_raw(
+                "suspend_d", current.strftime("%Y%m%d")
+            )
+            if not frame.is_empty():
+                frames.append(frame)
+            current += timedelta(days=1)
+        if not frames:
+            return _empty_suspend()
+        merged = pl.concat(frames, how="vertical_relaxed")
+        if "trade_date" not in merged.columns:
+            return _empty_suspend()
+        merged = _normalize_date_columns(merged, ("trade_date",))
+        merged = merged.filter(
+            (pl.col("trade_date") >= start) & (pl.col("trade_date") <= end)
+        )
+        if "suspend_type" in merged.columns:
+            merged = merged.filter(pl.col("suspend_type") == "S")
+        if merged.is_empty():
+            return _empty_suspend()
+        return merged
 
     def load_index_bars(
         self, index_code: str, start: date, end: date
