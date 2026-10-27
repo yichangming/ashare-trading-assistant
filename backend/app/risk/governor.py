@@ -62,6 +62,9 @@ class RiskGovernor:
     Size reductions name the binding cap in ``RiskDecision.reasons``.  When
     ``correlations`` is not supplied, an approval is labelled
     ``"correlation unavailable"`` rather than claiming every check passed.
+    ``correlation_unavailable`` names candidates whose partner correlations
+    could not be computed; approved or reduced decisions for those codes also
+    carry that reason.
     """
 
     def apply(
@@ -71,6 +74,7 @@ class RiskGovernor:
         regime: MarketRegime,
         config: StrategyConfig,
         correlations: dict[str, dict[str, float]] | None = None,
+        correlation_unavailable: set[str] | None = None,
     ) -> list[TradePlan]:
         if self._halted(account, config):
             return [self._reject(plan, _HALT_REASON) for plan in plans]
@@ -203,11 +207,17 @@ class RiskGovernor:
                 continue
 
             if shares < plan.position_plan.shares:
+                reasons = [
+                    f"{name} reduced size" for name in binding_caps
+                ]
+                if (
+                    correlation_unavailable is not None
+                    and code in correlation_unavailable
+                ):
+                    reasons.append("correlation unavailable")
                 decision = RiskDecision(
                     outcome=RiskOutcome.REDUCE,
-                    reasons=[
-                        f"{name} reduced size" for name in binding_caps
-                    ],
+                    reasons=reasons,
                     adjusted_shares=shares,
                 )
             elif correlations is None:
@@ -216,9 +226,15 @@ class RiskGovernor:
                     reasons=["correlation unavailable"],
                 )
             else:
+                reasons = ["all checks passed"]
+                if (
+                    correlation_unavailable is not None
+                    and code in correlation_unavailable
+                ):
+                    reasons.append("correlation unavailable")
                 decision = RiskDecision(
                     outcome=RiskOutcome.APPROVE,
-                    reasons=["all checks passed"],
+                    reasons=reasons,
                 )
 
             position_value = money(entry_price * shares)

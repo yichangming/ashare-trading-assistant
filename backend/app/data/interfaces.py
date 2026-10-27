@@ -10,7 +10,18 @@ class DataSource(Protocol):
 
 class MarketDataProvider(Protocol):
     def load_bars(self, start: date, end: date) -> pl.DataFrame: ...
-    def load_suspend(self, start: date, end: date) -> pl.DataFrame | None: ...
+    def load_suspend(self, start: date, end: date) -> pl.DataFrame | None:
+        """Load suspension events in ``[start, end]``.
+
+        ``None`` means no raw ``suspend_d`` partition exists anywhere in the
+        range (the optional endpoint has not been synced).  A typed frame
+        means at least one partition exists; it contains only ``S`` rows and
+        may be empty (R-only or zero-suspension day).  When present,
+        ``suspend_timing`` is a String: null or empty means a full-day
+        suspension, while a non-empty time range denotes an intraday
+        suspension.
+        """
+        ...
     def load_index_bars(
         self, index_code: str, start: date, end: date
     ) -> pl.DataFrame: ...

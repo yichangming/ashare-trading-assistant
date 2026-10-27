@@ -55,6 +55,14 @@ class RejectedCandidate(BaseModel):
 
 
 class PipelineResult(BaseModel):
+    """Outcome of one pipeline run.
+
+    ``account`` is the latched input snapshot; it does **not** include the
+    same-day approved pending plans produced by this run.  Callers that
+    persist state should merge ``plans`` (status ``PENDING_ENTRY``) into
+    ``account.pending_plans`` themselves.
+    """
+
     as_of: date
     regime: MarketRegime
     sectors: list[SectorStrength]
@@ -151,15 +159,20 @@ class TradingPipeline:
                 account=account,
             )
 
-        start = as_of - timedelta(days=_HISTORY_DAYS)
-        bars = self.provider.load_bars(start, as_of)
-        if bars.is_empty():
-            raise DataNotReadyError(f"bars missing for {as_of}")
-        forward_end = as_of + timedelta(days=_FORWARD_CALENDAR_DAYS)
         expiry_days = max(
             self.config.template_a.entry_valid_days,
             self.config.template_b.entry_valid_days,
         )
+        forward_days = max(_FORWARD_CALENDAR_DAYS, expiry_days * 2 + 10)
+        forward_end = as_of + timedelta(days=forward_days)
+        history_days = max(
+            _HISTORY_DAYS,
+            self.config.template_a.min_listing_days * 2 + 60,
+        )
+        start = as_of - timedelta(days=history_days)
+        bars = self.provider.load_bars(start, as_of)
+        if bars.is_empty():
+            raise DataNotReadyError(f"bars missing for {as_of}")
         calendar_guidance = (
             f"trade_cal does not cover a forward window through {forward_end}; "
             "sync/backfill a forward trade_cal window "
@@ -174,6 +187,19 @@ class TradingPipeline:
         if not calendar.is_trading_day(as_of):
             raise DataNotReadyError(
                 f"{calendar_guidance}: {as_of} is not an open trading day"
+            )
+        min_listing_days = self.config.template_a.min_listing_days
+        listing_coverage = (
+            calendar.count_between(calendar.dates[0], as_of)
+            if calendar.dates
+            else 0
+        )
+        if listing_coverage < min_listing_days:
+            raise DataNotReadyError(
+                f"trade_cal covers only {listing_coverage} trading days "
+                f"before {as_of}; need at least {min_listing_days} for the "
+                "listing filter; sync/backfill a trade_cal window covering "
+                "the required history"
             )
         try:
             calendar.add_trading_days(as_of, expiry_days)
@@ -191,26 +217,47 @@ class TradingPipeline:
         # partition exists at all; that means the optional endpoint has not
         # been synced, so fall back to count-based coverage against all listed
         # names where the 99% threshold tolerates a small suspended cohort.
-        # A typed empty frame instead means a partition exists but has no S
-        # rows (R-only or a zero-suspension day): the exact expected universe
-        # is known and the exact-code check stays active.
+        # A typed frame instead means a partition exists: full-day suspensions
+        # are excluded from the required set, while every listed code remains
+        # allowed so a legitimate bar for a suspended name is not "unexpected".
         suspend = self.provider.load_suspend(as_of, as_of)
+        all_stock_codes = set(stocks["ts_code"].to_list())
         if suspend is None:
+            _add_flag(degraded, "suspend_d_missing")
             expected_codes: set[str] | None = None
+            allowed_codes: set[str] | None = all_stock_codes
             expected_count = len(stocks)
         else:
-            suspended_codes = (
-                set(suspend["ts_code"].drop_nulls().to_list())
-                if "ts_code" in suspend.columns
-                else set()
-            )
-            expected_codes = set(stocks["ts_code"].to_list()) - suspended_codes
-            expected_count = len(expected_codes)
+            if "ts_code" not in suspend.columns:
+                # A malformed partition cannot identify suspensions; keep the
+                # exact universe at all listed names.
+                full_day_suspended: set[str] = set()
+            else:
+                suspended = suspend.drop_nulls(subset=["ts_code"])
+                if "suspend_timing" in suspended.columns:
+                    timing = (
+                        pl.col("suspend_timing")
+                        .cast(pl.String, strict=False)
+                        .str.strip_chars()
+                    )
+                    full_day = suspended.filter(
+                        pl.col("suspend_timing").is_null() | (timing == "")
+                    )
+                else:
+                    full_day = suspended
+                full_day_suspended = set(full_day["ts_code"].to_list())
+            required_codes = all_stock_codes - full_day_suspended
+            if not required_codes:
+                raise DataNotReadyError("all listed stocks are suspended")
+            expected_codes = required_codes
+            allowed_codes = all_stock_codes
+            expected_count = len(required_codes)
         quality = DataQualityGate().check(
             as_of,
             as_of_bars,
             expected_count=expected_count,
             expected_codes=expected_codes,
+            allowed_codes=allowed_codes,
         )
         if not quality.passed:
             raise DataQualityError("; ".join(quality.failures))
@@ -227,11 +274,15 @@ class TradingPipeline:
         )
         sector_frame = industry_map.to_frame()
 
+        history_count = max(
+            _FEATURE_HISTORY_DATES,
+            self.config.industry.persistence_days + 3,
+        )
         dates = sorted(
             bars.filter(pl.col("trade_date") <= as_of)["trade_date"]
             .unique()
             .to_list()
-        )[-_FEATURE_HISTORY_DATES:]
+        )[-history_count:]
         features_history = pl.concat(
             [
                 self.feature_builder.build(bars, trade_date)
@@ -288,18 +339,24 @@ class TradingPipeline:
         if self.provider.load_limit_list(as_of, as_of).is_empty():
             _add_flag(degraded, "limit_list_d")
 
-        index_code = self.config.environment.index_code
-        index_bars = self.provider.load_index_bars(index_code, start, as_of)
-        if index_bars.is_empty():
-            index_code = self.config.environment.fallback_index_code
+        primary_index = self.config.environment.index_code
+        fallback_index = self.config.environment.fallback_index_code
+        min_index_bars = self.config.environment.ma_slow
+        index_bars = self.provider.load_index_bars(
+            primary_index, start, as_of
+        )
+        if not self._index_ready(index_bars, as_of, min_index_bars):
             index_bars = self.provider.load_index_bars(
-                index_code, start, as_of
+                fallback_index, start, as_of
             )
+            if not self._index_ready(index_bars, as_of, min_index_bars):
+                raise DataNotReadyError(
+                    f"index bars missing or insufficient for {as_of}: "
+                    f"{primary_index} and {fallback_index} each need at "
+                    f"least {min_index_bars} bars including an as-of row; "
+                    "sync/backfill index_daily"
+                )
             _add_flag(degraded, "index_fallback")
-        if index_bars.is_empty():
-            raise DataNotReadyError(
-                f"index bars missing for {as_of} (primary and fallback)"
-            )
 
         regime = self.regime_service.compute(
             as_of=as_of,
@@ -321,7 +378,7 @@ class TradingPipeline:
             as_of, regime, universe, sectors, leaders, self.config
         )
         candidates = self._filter_mode(candidates, template_mode)
-        correlations = self._correlations_map(
+        correlations, correlation_unavailable = self._correlations_map(
             bars, [candidate.ts_code for candidate in candidates], account, as_of
         )
         plans, rejected = self._build_plans(
@@ -331,6 +388,7 @@ class TradingPipeline:
             calendar,
             as_of,
             correlations=correlations,
+            correlation_unavailable=correlation_unavailable,
         )
         return PipelineResult(
             as_of=as_of,
@@ -353,42 +411,97 @@ class TradingPipeline:
             return list(candidates)
         raise ValueError(f"unknown template_mode: {template_mode}")
 
+    @staticmethod
+    def _index_ready(
+        index_bars: pl.DataFrame, as_of: date, min_bars: int
+    ) -> bool:
+        """Return whether ``index_bars`` can produce an as-of regime read."""
+        if index_bars.is_empty():
+            return False
+        if not {"trade_date", "close"} <= set(index_bars.columns):
+            return False
+        history = index_bars.filter(pl.col("trade_date") <= as_of)
+        as_of_rows = history.filter(pl.col("trade_date") == as_of)
+        if as_of_rows.is_empty() or as_of_rows["close"].is_null().all():
+            return False
+        return (
+            history["trade_date"].n_unique() >= min_bars
+            and history["close"].is_not_null().sum() >= min_bars
+        )
+
+    @staticmethod
+    def _correlation_returns(
+        bars: pl.DataFrame, as_of: date
+    ) -> pl.DataFrame:
+        """Return gap-aware adjusted close returns per code up to ``as_of``.
+
+        Using ``close * adj_factor`` keeps splits and dividends from creating
+        spurious moves.  A return is nulled when the code's previous bar is
+        not the previous market date (suspension or listing gap), so a
+        resumed/split jump is not treated as a one-day return.
+        """
+        frame = (
+            bars.filter(pl.col("trade_date") <= as_of)
+            .sort(["ts_code", "trade_date"])
+            .with_columns(
+                (pl.col("close") * pl.col("adj_factor")).alias("_adj_close")
+            )
+            .with_columns(
+                (
+                    pl.col("_adj_close")
+                    / pl.col("_adj_close").shift(1).over("ts_code")
+                    - 1
+                ).alias("ret"),
+                pl.col("trade_date")
+                .shift(1)
+                .over("ts_code")
+                .alias("_prev_date"),
+            )
+        )
+        market_dates = (
+            frame.select(pl.col("trade_date").unique().sort())
+            .with_columns(
+                pl.col("trade_date").shift(1).alias("_market_prev")
+            )
+        )
+        frame = frame.join(market_dates, on="trade_date", how="left")
+        return frame.with_columns(
+            pl.when(pl.col("_prev_date") == pl.col("_market_prev"))
+            .then(pl.col("ret"))
+            .otherwise(None)
+            .alias("ret")
+        ).select(["ts_code", "trade_date", "ret"])
+
     def _correlations_map(
         self,
         bars: pl.DataFrame,
         candidate_codes: list[str],
         account: AccountState,
         as_of: date,
-    ) -> dict[str, dict[str, float]]:
-        """Close-return correlations for each candidate vs every partner.
+    ) -> tuple[dict[str, dict[str, float]], set[str]]:
+        """Adjusted, gap-aware correlations for each candidate vs partners.
 
-        Returns ``{candidate_code: {other_code: correlation}}`` where partners
-        are existing positions, pending plans, and the other candidates.
-        Each series uses up to 60 trading days of close returns ending at
-        ``as_of``; pairs with fewer than 20 overlapping observations, or a
-        non-finite coefficient, are omitted.  A candidate with no computable
-        partner correlation is omitted entirely so the governor treats it as
-        unavailable.
+        Returns ``({candidate_code: {other_code: correlation}}, unavailable)``
+        where partners are existing positions, pending plans, and the other
+        candidates.  Each series uses up to 60 trading days of adjusted close
+        returns ending at ``as_of``; pairs with fewer than 20 overlapping
+        observations, or a non-finite coefficient, are omitted.  A candidate
+        with partners but no computable correlation is omitted from the map
+        and listed in the unavailable set so callers can label its decisions.
         """
         existing = [item.ts_code for item in account.positions] + [
             item.ts_code for item in account.pending_plans
         ]
         partners = list(dict.fromkeys(existing + candidate_codes))
-        if len(partners) < 2:
-            return {}
-        frame = (
-            bars.filter(pl.col("trade_date") <= as_of)
-            .sort(["ts_code", "trade_date"])
-            .with_columns(
-                (
-                    pl.col("close")
-                    / pl.col("close").shift(1).over("ts_code")
-                    - 1
-                ).alias("ret")
-            )
-        )
         result: dict[str, dict[str, float]] = {}
+        unavailable: set[str] = set()
+        if len(partners) < 2:
+            return result, unavailable
+        frame = self._correlation_returns(bars, as_of)
         for candidate_code in candidate_codes:
+            has_partner = any(
+                other != candidate_code for other in partners
+            )
             candidate = (
                 frame.filter(pl.col("ts_code") == candidate_code)
                 .select(["trade_date", "ret"])
@@ -421,7 +534,9 @@ class TradingPipeline:
                 inner[other] = correlation
             if inner:
                 result[candidate_code] = inner
-        return result
+            elif has_partner:
+                unavailable.add(candidate_code)
+        return result, unavailable
 
     def _build_plans(
         self,
@@ -431,6 +546,7 @@ class TradingPipeline:
         calendar: TradingCalendar,
         as_of: date,
         correlations: dict[str, dict[str, float]] | None = None,
+        correlation_unavailable: set[str] | None = None,
     ) -> tuple[list[TradePlan], list[RejectedCandidate]]:
         plans: list[TradePlan] = []
         rejected: list[RejectedCandidate] = []
@@ -487,5 +603,6 @@ class TradingPipeline:
             regime,
             self.config,
             correlations=correlations,
+            correlation_unavailable=correlation_unavailable,
         )
         return plans, rejected

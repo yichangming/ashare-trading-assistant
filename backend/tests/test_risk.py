@@ -263,6 +263,7 @@ def _apply(
     regime: MarketRegime | None = None,
     config: StrategyConfig | None = None,
     correlations: dict[str, dict[str, float]] | None = None,
+    correlation_unavailable: set[str] | None = None,
 ) -> list[TradePlan]:
     from app.risk.governor import RiskGovernor
 
@@ -272,6 +273,7 @@ def _apply(
         regime if regime is not None else _regime(),
         config if config is not None else load_strategy_config(),
         correlations=correlations,
+        correlation_unavailable=correlation_unavailable,
     )
 
 
@@ -773,6 +775,32 @@ def test_approval_reason_marks_correlation_unavailable():
         [_plan("000001.SZ", "银行")], correlations={}
     )
     assert _reasons(with_correlations[0]) == ["all checks passed"]
+
+
+def test_correlation_unavailable_set_marks_approved_reason():
+    result = _apply(
+        [_plan("000001.SZ", "银行")],
+        correlations={},
+        correlation_unavailable={"000001.SZ"},
+    )
+    assert result[0].status == PlanStatus.PENDING_ENTRY
+    assert _reasons(result[0]) == [
+        "all checks passed",
+        "correlation unavailable",
+    ]
+
+
+def test_correlation_unavailable_set_appends_to_reduced_decision():
+    config = _config_with_risk(max_single_position_pct=0.05)
+    result = _apply(
+        [_plan("000001.SZ", "银行")],
+        config=config,
+        correlations={},
+        correlation_unavailable={"000001.SZ"},
+    )
+    assert result[0].status == PlanStatus.PENDING_ENTRY
+    assert result[0].risk_decision.outcome == RiskOutcome.REDUCE
+    assert "correlation unavailable" in _reasons(result[0])
 
 
 def test_correlation_threshold_is_exclusive():

@@ -350,6 +350,27 @@ def test_suspension_uses_only_s_events(store: ParquetStore):
     assert bars["is_suspended"].to_list() == [True, False]
 
 
+def test_suspension_timing_marks_only_full_day_rows(store: ParquetStore):
+    suspend = pl.DataFrame(
+        {
+            "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
+            "trade_date": ["20240102"] * 3,
+            "suspend_type": ["S", "S", "S"],
+            "suspend_timing": ["09:30-10:30", None, ""],
+        }
+    )
+    _write_case(
+        store,
+        markets=["主板", "主板", "主板"],
+        names=["正常公司", "正常公司", "正常公司"],
+        pre_closes=[10.0, 10.0, 10.0],
+        suspend=suspend,
+    )
+    bars = DataAssembler(store).build_day(date(2024, 1, 2)).sort("ts_code")
+    # The partial-day name still traded; null/empty timing is a full-day halt.
+    assert bars["is_suspended"].to_list() == [False, True, True]
+
+
 def test_suspension_includes_zero_volume_or_amount(store: ParquetStore):
     _write_case(
         store,

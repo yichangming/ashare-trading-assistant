@@ -137,6 +137,34 @@ def test_provider_load_suspend_range(store: ParquetStore):
     assert (loaded["trade_date"] == date(2024, 1, 2)).sum() == 1
 
 
+def test_provider_load_suspend_keeps_timing(store: ParquetStore):
+    store.write_raw(
+        "suspend_d",
+        "20240102",
+        pl.DataFrame(
+            {
+                "ts_code": ["000001.SZ", "000002.SZ"],
+                "trade_date": ["20240102", "20240102"],
+                "suspend_type": ["S", "S"],
+                "suspend_timing": ["09:30-10:30", None],
+            }
+        ),
+    )
+    loaded = ParquetMarketDataProvider(store).load_suspend(
+        date(2024, 1, 2), date(2024, 1, 2)
+    )
+    assert loaded is not None
+    timings = {
+        row["ts_code"]: row["suspend_timing"]
+        for row in loaded.to_dicts()
+    }
+    assert timings == {
+        "000001.SZ": "09:30-10:30",
+        "000002.SZ": None,
+    }
+    assert loaded.schema["suspend_timing"] == pl.String
+
+
 def test_provider_load_suspend_no_partition_returns_none(store: ParquetStore):
     loaded = ParquetMarketDataProvider(store).load_suspend(
         date(2024, 1, 2), date(2024, 1, 2)
@@ -166,6 +194,7 @@ def test_provider_load_suspend_present_but_no_s_rows_is_typed_empty(
     assert loaded.is_empty()
     assert loaded.schema["trade_date"] == pl.Date
     assert loaded.schema["ts_code"] == pl.String
+    assert loaded.schema["suspend_timing"] == pl.String
 
 
 def test_provider_load_suspend_empty_partition_is_typed_empty(

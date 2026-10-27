@@ -540,3 +540,46 @@ def test_expected_codes_extra_code_reports_unexpected_not_coverage():
     # failure would only duplicate that diagnosis.
     assert "coverage_exceeds_one" not in report.failure_codes
     assert not any("coverage" in item for item in report.failures)
+
+
+def test_allowed_codes_accept_bars_for_suspended_names():
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        _bars(),
+        expected_count=1,
+        expected_codes={"000001.SZ"},
+        allowed_codes={"000001.SZ", "000002.SZ"},
+    )
+    assert report.passed, report.failures
+    # Coverage above 100% is explained by the larger allowed set.
+    assert report.coverage == 2.0
+
+
+def test_allowed_codes_still_require_expected_codes():
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        _bars().filter(pl.col("ts_code") == "000002.SZ"),
+        expected_count=1,
+        expected_codes={"000001.SZ"},
+        allowed_codes={"000001.SZ", "000002.SZ"},
+    )
+    assert not report.passed
+    assert "missing_expected_codes" in report.failure_codes
+    assert "000001.SZ" in "; ".join(report.failures)
+
+
+def test_allowed_codes_flag_unknown_extra_codes():
+    bars = _bars().with_columns(
+        pl.Series("ts_code", ["000001.SZ", "000003.SZ"])
+    )
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        bars,
+        expected_count=1,
+        expected_codes={"000001.SZ"},
+        allowed_codes={"000001.SZ", "000002.SZ"},
+    )
+    assert not report.passed
+    assert "unexpected_codes" in report.failure_codes
+    assert "000003.SZ" in "; ".join(report.failures)
+    assert "coverage_exceeds_one" not in report.failure_codes

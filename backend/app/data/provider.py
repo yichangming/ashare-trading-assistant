@@ -11,6 +11,7 @@ _SUSPEND_SCHEMA = {
     "trade_date": pl.Date,
     "ts_code": pl.String,
     "suspend_type": pl.String,
+    "suspend_timing": pl.String,
 }
 
 
@@ -90,6 +91,12 @@ class ParquetMarketDataProvider:
         )
         if "suspend_type" in merged.columns:
             merged = merged.filter(pl.col("suspend_type") == "S")
+        if "suspend_timing" in merged.columns:
+            merged = merged.with_columns(
+                pl.col("suspend_timing")
+                .cast(pl.String, strict=False)
+                .alias("suspend_timing")
+            )
         if merged.is_empty():
             return _empty_suspend()
         return merged

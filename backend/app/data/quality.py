@@ -32,6 +32,14 @@ def _is_float_dtype(dtype: pl.DataType) -> bool:
     return dtype in (pl.Float32, pl.Float64)
 
 
+def _code_sample(codes: set[str], limit: int = 3) -> str:
+    ordered = sorted(codes)
+    rendered = ", ".join(ordered[:limit])
+    if len(ordered) > limit:
+        rendered += f", +{len(ordered) - limit} more"
+    return f" ({rendered})"
+
+
 @dataclass
 class QualityReport:
     trade_date: date
@@ -60,7 +68,20 @@ class DataQualityGate:
         bars: pl.DataFrame,
         expected_count: int,
         expected_codes: set[str] | None = None,
+        allowed_codes: set[str] | None = None,
     ) -> QualityReport:
+        """Validate one day of bars.
+
+        ``expected_codes`` is the set of *required* codes: any missing from
+        the bars is a ``missing_expected_codes`` failure.  ``allowed_codes``
+        is the set of codes permitted to appear: any others are
+        ``unexpected_codes``.  When ``allowed_codes`` is omitted it defaults
+        to ``expected_codes``, preserving the historical exact-set behavior.
+        ``expected_count`` is the coverage denominator (normally
+        ``len(expected_codes)``); coverage above 100% is only reported when no
+        code set is supplied, because the exact set already identifies stray
+        codes.
+        """
         failures: list[str] = []
         warnings: list[str] = []
         failure_codes: list[str] = []
@@ -100,7 +121,8 @@ class DataQualityGate:
                 )
             if expected_codes:
                 fail(
-                    f"missing expected codes: {len(expected_codes)}",
+                    f"missing expected codes: {len(expected_codes)}"
+                    f"{_code_sample(expected_codes)}",
                     "missing_expected_codes",
                 )
             return report(coverage)
@@ -116,6 +138,9 @@ class DataQualityGate:
         coverage = (
             bars["ts_code"].n_unique() / expected_count if expected_count > 0 else 0.0
         )
+        effective_allowed = (
+            allowed_codes if allowed_codes is not None else expected_codes
+        )
         if expected_count <= 0:
             fail(
                 f"expected universe unavailable: expected_count={expected_count}",
@@ -127,27 +152,30 @@ class DataQualityGate:
                     f"coverage {coverage:.2%} below {self.min_coverage:.2%}",
                     "coverage_below_min",
                 )
-            # With exact expected codes, extra bar codes are reported below as
+            # With an exact allowed set, extra bar codes are reported below as
             # unexpected_codes, so the generic coverage failure would only
             # duplicate that diagnosis.
-            if coverage > 1.0 and expected_codes is None:
+            if coverage > 1.0 and effective_allowed is None:
                 fail(
                     f"coverage {coverage:.2%} exceeds 100%",
                     "coverage_exceeds_one",
                 )
 
+        actual_codes = set(bars["ts_code"].drop_nulls().to_list())
         if expected_codes is not None:
-            actual_codes = set(bars["ts_code"].drop_nulls().to_list())
             missing_codes = expected_codes - actual_codes
-            extra_codes = actual_codes - expected_codes
             if missing_codes:
                 fail(
-                    f"missing expected codes: {len(missing_codes)}",
+                    f"missing expected codes: {len(missing_codes)}"
+                    f"{_code_sample(missing_codes)}",
                     "missing_expected_codes",
                 )
+        if effective_allowed is not None:
+            extra_codes = actual_codes - effective_allowed
             if extra_codes:
                 fail(
-                    f"unexpected codes: {len(extra_codes)}",
+                    f"unexpected codes: {len(extra_codes)}"
+                    f"{_code_sample(extra_codes)}",
                     "unexpected_codes",
                 )
 

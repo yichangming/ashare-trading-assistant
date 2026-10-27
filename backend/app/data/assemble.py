@@ -133,6 +133,17 @@ def _apply_suspension(bars: pl.DataFrame, suspend: pl.DataFrame) -> pl.DataFrame
     if not suspend.is_empty() and "ts_code" in suspend.columns:
         if "suspend_type" in suspend.columns:
             suspend = suspend.filter(pl.col("suspend_type") == "S")
+        if "suspend_timing" in suspend.columns:
+            # Partial-day suspensions still trade for part of the session;
+            # only null/empty timing denotes a full-day suspension.
+            timing = (
+                pl.col("suspend_timing")
+                .cast(pl.String, strict=False)
+                .str.strip_chars()
+            )
+            suspend = suspend.filter(
+                pl.col("suspend_timing").is_null() | (timing == "")
+            )
         suspended_codes = set(suspend["ts_code"].to_list())
     return bars.with_columns(
         (

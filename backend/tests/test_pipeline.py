@@ -26,6 +26,7 @@ from app.domain.models import (
     RegimeIndicators,
     TemplatePolicy,
 )
+from app.indicators.features import FeatureBuilder
 from app.pipeline import TradingPipeline
 
 
@@ -191,7 +192,12 @@ def test_correlations_include_positions_pending_and_skip_short_history():
     for code in ("000001.SZ", "000002.SZ", "000003.SZ"):
         for trade_date, close in zip(dates, closes, strict=True):
             rows.append(
-                {"ts_code": code, "trade_date": trade_date, "close": close}
+                {
+                    "ts_code": code,
+                    "trade_date": trade_date,
+                    "close": close,
+                    "adj_factor": 1.0,
+                }
             )
     # A short listing history cannot supply the 20 overlapping observations.
     for trade_date, close in zip(dates[-10:], closes[-10:], strict=True):
@@ -200,6 +206,7 @@ def test_correlations_include_positions_pending_and_skip_short_history():
                 "ts_code": "000004.SZ",
                 "trade_date": trade_date,
                 "close": close,
+                "adj_factor": 1.0,
             }
         )
     bars = pl.DataFrame(rows)
@@ -231,7 +238,7 @@ def test_correlations_include_positions_pending_and_skip_short_history():
         provider=DummyProvider(), config=load_strategy_config()
     )
 
-    correlations = pipeline._correlations_map(
+    correlations, unavailable = pipeline._correlations_map(
         bars, ["000001.SZ", "000004.SZ"], account, as_of
     )
 
@@ -239,8 +246,9 @@ def test_correlations_include_positions_pending_and_skip_short_history():
     assert inner["000002.SZ"] == pytest.approx(1.0)
     assert inner["000003.SZ"] == pytest.approx(1.0)
     assert "000004.SZ" not in inner
-    # No computable pair means the candidate key is omitted entirely.
+    # Candidates with partners but no computable pair are reported separately.
     assert "000004.SZ" not in correlations
+    assert unavailable == {"000004.SZ"}
 
 
 def test_correlations_omit_non_finite_pairs():
@@ -259,7 +267,12 @@ def test_correlations_omit_non_finite_pairs():
     ):
         for trade_date, close in zip(dates, closes, strict=True):
             rows.append(
-                {"ts_code": code, "trade_date": trade_date, "close": close}
+                {
+                    "ts_code": code,
+                    "trade_date": trade_date,
+                    "close": close,
+                    "adj_factor": 1.0,
+                }
             )
     account = _account(
         pending_plans=[
@@ -285,13 +298,14 @@ def test_correlations_omit_non_finite_pairs():
         provider=DummyProvider(), config=load_strategy_config()
     )
 
-    correlations = pipeline._correlations_map(
+    correlations, unavailable = pipeline._correlations_map(
         pl.DataFrame(rows), ["000001.SZ"], account, as_of
     )
 
     inner = correlations["000001.SZ"]
     assert inner["000002.SZ"] == pytest.approx(1.0)
     assert "000003.SZ" not in inner
+    assert unavailable == set()
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +514,8 @@ def _real_bars(
     bad_quality: bool = False,
     suspended_codes: tuple[str, ...] = (),
     missing_daily_codes: tuple[str, ...] = (),
+    short_history_codes: tuple[str, ...] = (),
+    zero_volume_codes: tuple[str, ...] = (),
     extra_bar_code: str | None = None,
 ) -> pl.DataFrame:
     rows: list[dict] = []
@@ -573,6 +589,27 @@ def _real_bars(
                 and row["ts_code"] in omitted_codes
             )
         ]
+    if short_history_codes:
+        # Keep only the last ten bars so return overlap falls below the
+        # correlation minimum against full-history partners.
+        cutoff = _REAL_DATES[-10]
+        rows = [
+            row
+            for row in rows
+            if not (
+                row["ts_code"] in short_history_codes
+                and row["trade_date"] < cutoff
+            )
+        ]
+    if zero_volume_codes:
+        for row in rows:
+            if (
+                row["trade_date"] == _AS_OF
+                and row["ts_code"] in zero_volume_codes
+            ):
+                row["vol"] = 0.0
+                row["amount"] = 0.0
+                row["is_suspended"] = True
     if extra_bar_code is not None:
         rows.append(
             {
@@ -604,34 +641,52 @@ class RealPathProvider:
         self,
         *,
         calendar_end: date | None = None,
+        calendar_start: date | None = None,
         degraded: bool = False,
         bad_quality: bool = False,
         suspended_codes: tuple[str, ...] = (),
+        suspended_with_bar_codes: tuple[str, ...] = (),
+        partial_day_suspended_codes: tuple[str, ...] = (),
         suspend_resume_codes: tuple[str, ...] = (),
         missing_daily_codes: tuple[str, ...] = (),
+        short_history_codes: tuple[str, ...] = (),
+        zero_volume_codes: tuple[str, ...] = (),
         suspend_available: bool = True,
         extra_bar_code: str | None = None,
         empty_index: bool = False,
+        stale_primary_index: bool = False,
+        short_primary_index: bool = False,
+        short_fallback_index: bool = False,
         empty_trade_cal: bool = False,
     ):
         self.calendar_end = calendar_end or (
             _AS_OF + timedelta(days=45)
         )
+        self.calendar_start = calendar_start
         self.degraded = degraded
         self.suspended_codes = suspended_codes
+        self.suspended_with_bar_codes = suspended_with_bar_codes
+        self.partial_day_suspended_codes = partial_day_suspended_codes
         self.suspend_resume_codes = suspend_resume_codes
         self.suspend_available = suspend_available
         self.empty_index = empty_index
+        self.stale_primary_index = stale_primary_index
+        self.short_primary_index = short_primary_index
+        self.short_fallback_index = short_fallback_index
         self.empty_trade_cal = empty_trade_cal
         self.trade_cal_calls: list[tuple[date, date]] = []
+        self.bars_calls: list[tuple[date, date]] = []
         self.bars = _real_bars(
             bad_quality=bad_quality,
             suspended_codes=suspended_codes,
             missing_daily_codes=missing_daily_codes,
+            short_history_codes=short_history_codes,
+            zero_volume_codes=zero_volume_codes,
             extra_bar_code=extra_bar_code,
         )
 
     def load_bars(self, start: date, end: date) -> pl.DataFrame:
+        self.bars_calls.append((start, end))
         return self.bars.filter(
             (pl.col("trade_date") >= start)
             & (pl.col("trade_date") <= end)
@@ -642,6 +697,7 @@ class RealPathProvider:
             "trade_date": pl.Date,
             "ts_code": pl.String,
             "suspend_type": pl.String,
+            "suspend_timing": pl.String,
         }
         if not self.suspend_available or not (start <= _AS_OF <= end):
             return None
@@ -650,13 +706,26 @@ class RealPathProvider:
                 "trade_date": _AS_OF,
                 "ts_code": code,
                 "suspend_type": "S",
+                "suspend_timing": None,
             }
-            for code in self.suspended_codes
+            for code in (
+                *self.suspended_codes,
+                *self.suspended_with_bar_codes,
+            )
+        ] + [
+            {
+                "trade_date": _AS_OF,
+                "ts_code": code,
+                "suspend_type": "S",
+                "suspend_timing": "09:30-10:30",
+            }
+            for code in self.partial_day_suspended_codes
         ] + [
             {
                 "trade_date": _AS_OF,
                 "ts_code": code,
                 "suspend_type": "R",
+                "suspend_timing": None,
             }
             for code in self.suspend_resume_codes
         ]
@@ -667,16 +736,39 @@ class RealPathProvider:
     def load_index_bars(
         self, index_code: str, start: date, end: date
     ) -> pl.DataFrame:
-        if self.empty_index or index_code != "000300.SH":
+        if self.empty_index:
             return pl.DataFrame()
-        dates = _business_days(start, end)
-        return pl.DataFrame(
-            {
-                "ts_code": [index_code] * len(dates),
-                "trade_date": dates,
-                "close": [3000.0 + index for index in range(len(dates))],
-            }
-        )
+        if index_code == "000985.CSI":
+            if not (self.stale_primary_index or self.short_primary_index):
+                return pl.DataFrame()
+            if self.stale_primary_index:
+                end = end - timedelta(days=1)
+            dates = _business_days(start, end)
+            if self.short_primary_index:
+                dates = dates[-10:]
+            return pl.DataFrame(
+                {
+                    "ts_code": [index_code] * len(dates),
+                    "trade_date": dates,
+                    "close": [
+                        3000.0 + index for index in range(len(dates))
+                    ],
+                }
+            )
+        if index_code == "000300.SH":
+            dates = _business_days(start, end)
+            if self.short_fallback_index:
+                dates = dates[-10:]
+            return pl.DataFrame(
+                {
+                    "ts_code": [index_code] * len(dates),
+                    "trade_date": dates,
+                    "close": [
+                        3000.0 + index for index in range(len(dates))
+                    ],
+                }
+            )
+        return pl.DataFrame()
 
     def load_stock_basic(self, as_of: date) -> pl.DataFrame:
         return pl.DataFrame(
@@ -709,7 +801,12 @@ class RealPathProvider:
         if self.empty_trade_cal:
             return pl.DataFrame()
         limit = min(end, self.calendar_end)
-        dates = _business_days(start, limit)
+        effective_start = (
+            max(start, self.calendar_start)
+            if self.calendar_start is not None
+            else start
+        )
+        dates = _business_days(effective_start, limit)
         return pl.DataFrame(
             {"cal_date": dates, "is_open": [1] * len(dates)}
         )
@@ -927,3 +1024,237 @@ def test_pipeline_no_suspend_partition_falls_back_to_count_coverage():
         "600001.SH",
     ]
     assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+    assert "suspend_d_missing" in result.regime.degraded_flags
+
+
+def test_pipeline_full_day_suspended_code_with_bar_passes():
+    # A full-day suspended name is allowed (not required) to have a bar.
+    provider = RealPathProvider(
+        suspended_with_bar_codes=(_BACKGROUND_CODES[0],)
+    )
+    result = _run_real_path(provider)
+    assert [candidate.ts_code for candidate in result.candidates] == [
+        "600000.SH",
+        "600001.SH",
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_partial_day_suspended_code_with_bar_passes():
+    # A partial-day suspension still trades, so its bar is required.
+    provider = RealPathProvider(
+        partial_day_suspended_codes=(_BACKGROUND_CODES[0],)
+    )
+    result = _run_real_path(provider)
+    assert [candidate.ts_code for candidate in result.candidates] == [
+        "600000.SH",
+        "600001.SH",
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_zero_volume_suspended_bar_passes():
+    # A zero-volume bar is still present for a required code, so it passes.
+    provider = RealPathProvider(
+        zero_volume_codes=(_BACKGROUND_CODES[0],)
+    )
+    result = _run_real_path(provider)
+    assert [candidate.ts_code for candidate in result.candidates] == [
+        "600000.SH",
+        "600001.SH",
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_all_stocks_suspended_raises():
+    provider = RealPathProvider(suspended_codes=_REAL_CODES)
+    with pytest.raises(DataNotReadyError, match="all listed stocks are suspended"):
+        _run_real_path(provider)
+
+
+class SingleShortHistoryScreener:
+    name = "single_short_history"
+    version = "1"
+
+    def generate(self, as_of, regime, features, sectors, leaders, config):
+        return [
+            Candidate(
+                ts_code=_A_CODES[0],
+                trade_date=as_of,
+                template=Template.A,
+                setup_type="test",
+                horizon="mid",
+                sector="银行",
+                leader_rank=1,
+                leader_score=90.0,
+                score=90.0,
+                reasons=["test"],
+                features={
+                    "ma20_raw": 10.0,
+                    "ma5_raw": 10.5,
+                    "ma10_raw": 10.0,
+                    "board_height": 0.0,
+                    "atr14_raw": 0.5,
+                    "low_10d_raw": 9.5,
+                    "low_5d_raw": 9.7,
+                    "high_60d_raw": 30.0,
+                    "close": 10.2,
+                },
+                sentiment_stage=regime.sentiment_stage,
+                strategy_version=config.version,
+                data_version=regime.data_version,
+            )
+        ]
+
+
+def test_pipeline_marks_correlation_unavailable_for_short_history_candidate():
+    provider = RealPathProvider(short_history_codes=(_A_CODES[0],))
+    account = _account(
+        positions=[
+            PositionState(
+                ts_code=_BACKGROUND_CODES[0],
+                sector="银行",
+                shares=100,
+                available_shares=100,
+                cost_price=Decimal("10"),
+                current_stop=Decimal("9"),
+                current_price=Decimal("10"),
+                template=Template.A,
+            )
+        ]
+    )
+    result = TradingPipeline(
+        provider=provider,
+        config=load_strategy_config(),
+        screener=SingleShortHistoryScreener(),
+    ).run(as_of=_AS_OF, account=account)
+
+    assert len(result.plans) == 1
+    plan = result.plans[0]
+    assert plan.status == PlanStatus.PENDING_ENTRY
+    assert "correlation unavailable" in plan.risk_decision.reasons
+
+
+def test_correlation_returns_use_adjusted_close_and_drop_gaps():
+    as_of = date(2024, 2, 1)
+    dates = _trading_days_ending(as_of, 25)
+    a_closes = [
+        10.0 * (1 + 0.01 * ((index % 5) - 2))
+        for index in range(len(dates))
+    ]
+    rows: list[dict] = []
+    for index, trade_date in enumerate(dates):
+        rows.append(
+            {
+                "ts_code": "000001.SZ",
+                "trade_date": trade_date,
+                "close": a_closes[index],
+                "adj_factor": 1.0,
+            }
+        )
+    for index, trade_date in enumerate(dates):
+        if index == 10:
+            continue  # suspension gap
+        adj_factor = 2.0 if index >= 12 else 1.0  # 2:1 split at index 12
+        rows.append(
+            {
+                "ts_code": "000002.SZ",
+                "trade_date": trade_date,
+                "close": a_closes[index] / adj_factor,
+                "adj_factor": adj_factor,
+            }
+        )
+
+    returns = TradingPipeline._correlation_returns(
+        pl.DataFrame(rows), as_of
+    )
+    second = returns.filter(pl.col("ts_code") == "000002.SZ").sort(
+        "trade_date"
+    )
+    gap_return = second.filter(
+        pl.col("trade_date") == dates[11]
+    )["ret"][0]
+    assert gap_return is None
+    split_return = second.filter(
+        pl.col("trade_date") == dates[12]
+    )["ret"][0]
+    assert split_return == pytest.approx(
+        a_closes[12] / a_closes[11] - 1
+    )
+
+
+def test_pipeline_falls_back_on_stale_primary_index():
+    result = _run_real_path(RealPathProvider(stale_primary_index=True))
+    assert "index_fallback" in result.regime.degraded_flags
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_falls_back_on_short_primary_index():
+    result = _run_real_path(RealPathProvider(short_primary_index=True))
+    assert "index_fallback" in result.regime.degraded_flags
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_raises_when_index_history_insufficient():
+    provider = RealPathProvider(
+        short_primary_index=True, short_fallback_index=True
+    )
+    with pytest.raises(
+        DataNotReadyError, match="index bars missing or insufficient"
+    ):
+        _run_real_path(provider)
+
+
+def test_pipeline_requested_windows_follow_config():
+    config = load_strategy_config()
+    template_a = config.template_a.model_copy(
+        update={"entry_valid_days": 30, "min_listing_days": 250}
+    )
+    config = config.model_copy(update={"template_a": template_a})
+    provider = RealPathProvider()
+
+    result = TradingPipeline(
+        provider=provider, config=config
+    ).run(as_of=_AS_OF, account=_account())
+
+    assert provider.bars_calls == [
+        (_AS_OF - timedelta(days=560), _AS_OF)
+    ]
+    assert provider.trade_cal_calls == [
+        (_AS_OF - timedelta(days=560), _AS_OF + timedelta(days=70))
+    ]
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+class RecordingFeatureBuilder:
+    def __init__(self) -> None:
+        self.calls: list[date] = []
+        self._inner = FeatureBuilder()
+
+    def build(self, bars: pl.DataFrame, trade_date: date) -> pl.DataFrame:
+        self.calls.append(trade_date)
+        return self._inner.build(bars, trade_date)
+
+
+def test_pipeline_feature_history_follows_persistence_config():
+    config = load_strategy_config()
+    industry = config.industry.model_copy(update={"persistence_days": 4})
+    config = config.model_copy(update={"industry": industry})
+    builder = RecordingFeatureBuilder()
+
+    result = TradingPipeline(
+        provider=RealPathProvider(),
+        config=config,
+        feature_builder=builder,
+    ).run(as_of=_AS_OF, account=_account())
+
+    assert len(builder.calls) == 7  # max(5, persistence_days + 3)
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+
+def test_pipeline_requires_calendar_history_for_listing_filter():
+    provider = RealPathProvider(
+        calendar_start=_AS_OF - timedelta(days=100)
+    )
+    with pytest.raises(DataNotReadyError, match="listing filter"):
+        _run_real_path(provider)
