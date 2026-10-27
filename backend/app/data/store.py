@@ -61,27 +61,64 @@ class ParquetStore:
         for directory in (self.raw_dir, self.processed_dir, self.regime_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+    def raw_path(self, endpoint: str, key: str) -> Path:
+        return self.raw_dir / _safe(endpoint) / f"{_safe(key)}.parquet"
+
+    def reference_path(self, name: str) -> Path:
+        return self.raw_dir / "reference" / f"{_safe(name)}.parquet"
+
+    def manifest_path(self, trade_date: date) -> Path:
+        return self.raw_dir / "manifests" / f"{trade_date.strftime('%Y%m%d')}.json"
+
     def write_raw(self, endpoint: str, key: str, df: pl.DataFrame) -> Path:
-        path = self.raw_dir / _safe(endpoint) / f"{_safe(key)}.parquet"
+        path = self.raw_path(endpoint, key)
         _atomic_write(path, df.write_parquet)
         return path
 
     def read_raw(self, endpoint: str, key: str) -> pl.DataFrame:
-        path = self.raw_dir / _safe(endpoint) / f"{_safe(key)}.parquet"
+        path = self.raw_path(endpoint, key)
         if not path.exists():
             return pl.DataFrame()
         return pl.read_parquet(path)
 
+    def remove_raw(self, endpoint: str, key: str) -> None:
+        self.raw_path(endpoint, key).unlink(missing_ok=True)
+
     def write_reference(self, name: str, df: pl.DataFrame) -> Path:
-        path = self.raw_dir / "reference" / f"{_safe(name)}.parquet"
+        path = self.reference_path(name)
         _atomic_write(path, df.write_parquet)
         return path
 
     def read_reference(self, name: str) -> pl.DataFrame:
-        path = self.raw_dir / "reference" / f"{_safe(name)}.parquet"
+        path = self.reference_path(name)
         if not path.exists():
             return pl.DataFrame()
         return pl.read_parquet(path)
+
+    def remove_reference(self, name: str) -> None:
+        self.reference_path(name).unlink(missing_ok=True)
+
+    def write_manifest(self, trade_date: date, payload: dict) -> Path:
+        path = self.manifest_path(trade_date)
+        content = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+        _atomic_write(
+            path,
+            lambda temp_path: temp_path.write_text(content, encoding="utf-8"),
+        )
+        return path
+
+    def read_manifest(self, trade_date: date) -> dict | None:
+        path = self.manifest_path(trade_date)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def invalidate_manifest(self, trade_date: date) -> None:
+        self.manifest_path(trade_date).unlink(missing_ok=True)
 
     def write_processed(self, dataset: str, trade_date: date, df: pl.DataFrame) -> Path:
         _validate_partition_date(df, trade_date)
