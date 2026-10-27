@@ -23,6 +23,8 @@ def test_load_strategy_config():
     assert config.name == "dual_template_v1"
     assert config.template_a.risk_pct == 0.025
     assert config.template_b.risk_pct == 0.02
+    assert config.template_a.atr_buffer == 0.5
+    assert config.template_b.atr_buffer == 0.5
     assert config.switching.ferment.b.max_positions == 2
     assert config.risk.max_positions == 3
     assert config.environment.stage_confirm_days == 2
@@ -91,6 +93,16 @@ def test_negative_max_positions_rejected(tmp_path):
 def test_reversed_stop_bounds_rejected(tmp_path):
     path = _modified_strategy(tmp_path, ("template_a",), "stop_min_pct", 0.09)
     with pytest.raises(ValidationError, match="stop_min_pct must be <= stop_max_pct"):
+        load_strategy_config(path)
+
+
+@pytest.mark.parametrize("section", ["template_a", "template_b"])
+@pytest.mark.parametrize("days", [0, -1])
+def test_non_positive_time_stop_days_rejected(
+    tmp_path: Path, section: str, days: int
+) -> None:
+    path = _modified_strategy(tmp_path, (section,), "time_stop_days", days)
+    with pytest.raises(ValidationError, match="greater than 0"):
         load_strategy_config(path)
 
 

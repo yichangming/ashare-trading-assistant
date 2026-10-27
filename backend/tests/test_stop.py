@@ -176,7 +176,7 @@ def test_a_min_stop_distance_is_widened():
         {"low_10d_raw": 9.98, "ma20_raw": 10.5, "atr14_raw": 0.04},
     )
     assert float(stop.initial_stop) == 9.70
-    assert stop.structure_ref == "support=9.98; widened to min stop"
+    assert stop.structure_ref == "support=low_10d_raw:9.98; widened to min stop"
     assert stop.stop_distance_pct == pytest.approx(0.03)
 
 
@@ -187,7 +187,7 @@ def test_a_exact_min_boundary_is_kept():
         {"low_10d_raw": 9.8, "ma20_raw": 10.5, "atr14_raw": 0.2},
     )
     assert float(stop.initial_stop) == 9.70
-    assert stop.structure_ref == "support=9.80"
+    assert stop.structure_ref == "support=low_10d_raw:9.8"
 
 
 def test_a_exact_max_boundary_is_allowed():
@@ -198,7 +198,18 @@ def test_a_exact_max_boundary_is_allowed():
     )
     assert float(stop.initial_stop) == 9.20
     assert stop.stop_distance_pct == pytest.approx(0.08)
-    assert stop.structure_ref == "support=9.40"
+    assert stop.structure_ref == "support=low_10d_raw:9.4"
+
+
+def test_a_multiple_below_entry_supports_choose_highest():
+    # Both levels are eligible; MA20 at 9.60 is the higher one.
+    stop = _plan(
+        Template.A,
+        {"low_10d_raw": 9.2, "ma20_raw": 9.6, "atr14_raw": 0.2},
+    )
+    assert stop.structure_ref == "support=ma20_raw:9.6"
+    assert float(stop.initial_stop) == 9.50
+    assert stop.stop_distance_pct == pytest.approx(0.05)
 
 
 def test_a_just_over_max_is_rejected_with_context():
@@ -224,7 +235,7 @@ def test_b_exact_max_boundary_is_kept():
         {"low_5d_raw": 9.6, "ma5_raw": 10.5, "ma10_raw": 10.4, "atr14_raw": 0.2},
     )
     assert float(stop.initial_stop) == 9.50
-    assert stop.structure_ref == "support=9.60"
+    assert stop.structure_ref == "support=low_5d_raw:9.6"
     assert stop.stop_distance_pct == pytest.approx(0.05)
 
 
@@ -236,7 +247,7 @@ def test_b_wide_stop_is_clamped_to_max():
     )
     # 10.50 * (1 - 0.05) == 9.975, which rounds half-up to 9.98.
     assert float(stop.initial_stop) == 9.98
-    assert stop.structure_ref == "support=9.80; clamped to max stop"
+    assert stop.structure_ref == "support=low_5d_raw:9.8; clamped to max stop"
     assert float(stop.r_value) == 0.52
     assert stop.stop_distance_pct == pytest.approx(0.52 / 10.5)
 
@@ -248,7 +259,7 @@ def test_b_exact_min_boundary_is_kept_and_highest_support_is_used():
         {"low_5d_raw": 9.7, "ma5_raw": 9.8, "ma10_raw": 9.9, "atr14_raw": 0.4},
     )
     assert float(stop.initial_stop) == 9.70
-    assert stop.structure_ref == "support=9.90"
+    assert stop.structure_ref == "support=ma10_raw:9.9"
     assert stop.stop_distance_pct == pytest.approx(0.03)
 
 
@@ -258,7 +269,7 @@ def test_b_min_stop_distance_is_widened():
         {"low_5d_raw": 9.99, "ma5_raw": 10.5, "ma10_raw": 10.4, "atr14_raw": 0.02},
     )
     assert float(stop.initial_stop) == 9.70
-    assert stop.structure_ref == "support=9.99; widened to min stop"
+    assert stop.structure_ref == "support=low_5d_raw:9.99; widened to min stop"
     assert stop.stop_distance_pct == pytest.approx(0.03)
 
 
@@ -273,6 +284,40 @@ def test_b_atr_fallback_without_support():
     assert stop.stop_distance_pct == pytest.approx(0.045)
 
 
+def test_fallback_is_widened_for_a():
+    stop = _plan(Template.A, {"atr14_raw": 0.1})
+    assert stop.structure_ref == "ATR fallback; widened to min stop"
+    assert float(stop.initial_stop) == 9.70
+    assert stop.stop_distance_pct == pytest.approx(0.03)
+
+
+def test_fallback_is_rejected_for_a():
+    candidate = _candidate(Template.A, {"atr14_raw": 1.0})
+    with pytest.raises(StopTooWideError, match="A stop distance"):
+        StopPlanner().plan(
+            candidate, _entry(), candidate.features, load_strategy_config()
+        )
+
+
+def test_fallback_is_clamped_for_b():
+    stop = _plan(Template.B, {"atr14_raw": 0.5})
+    assert stop.structure_ref == "ATR fallback; clamped to max stop"
+    assert float(stop.initial_stop) == 9.50
+    assert stop.stop_distance_pct == pytest.approx(0.05)
+
+
+def test_b_atr_buffer_comes_from_config():
+    features = {
+        "low_5d_raw": 9.8,
+        "ma5_raw": 10.5,
+        "ma10_raw": 10.4,
+        "atr14_raw": 0.2,
+    }
+    assert float(_plan(Template.B, features).initial_stop) == 9.70
+    wide_stop = _plan(Template.B, features, config=_config_b(atr_buffer=1.0))
+    assert float(wide_stop.initial_stop) == 9.60
+
+
 def test_decimal_half_cent_structure_stop_rounds_half_up():
     # In binary floats 10.94 - 0.5 * 0.01 is 10.934999999999999, which would
     # round to 10.93. Decimal arithmetic keeps the exact 10.935 half-cent.
@@ -282,8 +327,80 @@ def test_decimal_half_cent_structure_stop_rounds_half_up():
         entry_price=11.3,
     )
     assert stop.initial_stop == Decimal("10.94")
+    assert stop.structure_ref == "support=low_5d_raw:10.94"
     assert float(stop.r_value) == 0.36
     assert stop.stop_distance_pct == pytest.approx(0.36 / 11.3)
+
+
+@pytest.mark.parametrize(
+    ("template", "features", "entry_price", "expected_stop", "nudge"),
+    [
+        (
+            Template.A,
+            {"low_10d_raw": 1.01, "ma20_raw": 1.2, "atr14_raw": 0.001},
+            1.03,
+            0.99,
+            "nudged down to min stop",
+        ),
+        (
+            Template.B,
+            {
+                "low_5d_raw": 1.01,
+                "ma5_raw": 1.2,
+                "ma10_raw": 1.3,
+                "atr14_raw": 0.001,
+            },
+            1.03,
+            0.99,
+            "nudged down to min stop",
+        ),
+        (
+            Template.A,
+            {"low_10d_raw": 0.985, "ma20_raw": 1.2, "atr14_raw": 0.001},
+            1.07,
+            0.99,
+            "nudged up to max stop",
+        ),
+        (
+            Template.B,
+            {
+                "low_5d_raw": 1.0551,
+                "ma5_raw": 1.2,
+                "ma10_raw": 1.3,
+                "atr14_raw": 0.001,
+            },
+            1.11,
+            1.06,
+            "nudged up to max stop",
+        ),
+    ],
+)
+def test_final_stop_is_nudged_into_band(
+    template: Template,
+    features: dict,
+    entry_price: float,
+    expected_stop: float,
+    nudge: str,
+) -> None:
+    stop = _plan(template, features, entry_price=entry_price)
+    assert float(stop.initial_stop) == expected_stop
+    assert nudge in stop.structure_ref
+    high = 0.08 if template == Template.A else 0.05
+    assert 0.03 <= stop.stop_distance_pct <= high
+    assert stop.stop_distance_pct == pytest.approx(
+        (entry_price - expected_stop) / entry_price
+    )
+
+
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+def test_impossible_cent_grid_stop_is_rejected(template: Template) -> None:
+    # At an entry of 0.02 no cent-aligned stop sits 3%-8%/3%-5% below: 0.02
+    # is 0% away and 0.01 is 50% away.
+    candidate = _candidate(template, {"atr14_raw": 0.001})
+    with pytest.raises(StopTooWideError, match="outside"):
+        StopPlanner().plan(
+            candidate, _entry(0.02), candidate.features, load_strategy_config()
+        )
 
 
 def test_support_must_be_strictly_below_entry():
@@ -294,6 +411,48 @@ def test_support_must_be_strictly_below_entry():
     )
     assert stop.structure_ref == "ATR fallback"
     assert float(stop.initial_stop) == 9.25
+
+
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+@pytest.mark.parametrize("support", [9.9999, 10.0])
+def test_support_rounding_to_entry_is_excluded(
+    template: Template, support: float
+) -> None:
+    # 9.9999 is below entry in raw terms but rounds to 10.00 on the price
+    # grid, so it is not a tradable support, just like an exact 10.00 level.
+    if template == Template.A:
+        features = {"low_10d_raw": support, "ma20_raw": 10.5, "atr14_raw": 0.5}
+        expected_stop = 9.25
+    else:
+        features = {
+            "low_5d_raw": support,
+            "ma5_raw": 10.5,
+            "ma10_raw": 10.6,
+            "atr14_raw": 0.3,
+        }
+        expected_stop = 9.55
+    stop = _plan(template, features)
+    assert stop.structure_ref == "ATR fallback"
+    assert float(stop.initial_stop) == expected_stop
+
+
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+def test_zero_and_negative_supports_fall_back(template: Template) -> None:
+    if template == Template.A:
+        features = {"low_10d_raw": 0.0, "ma20_raw": -1.0, "atr14_raw": 0.5}
+        expected_stop = 9.25
+    else:
+        features = {
+            "low_5d_raw": 0.0,
+            "ma5_raw": -1.0,
+            "ma10_raw": -0.5,
+            "atr14_raw": 0.3,
+        }
+        expected_stop = 9.55
+    stop = _plan(template, features)
+    assert stop.structure_ref == "ATR fallback"
+    assert float(stop.initial_stop) == expected_stop
+    assert stop.initial_stop > 0
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
@@ -312,14 +471,36 @@ def test_non_finite_supports_are_ignored(
     assert float(stop.initial_stop) == expected
 
 
-def test_null_supports_are_ignored():
-    candidate = _candidate(Template.A, {"atr14_raw": 0.5})
-    features = {"low_10d_raw": None, "ma20_raw": None, "atr14_raw": 0.5}
+@pytest.mark.parametrize(
+    ("template", "features", "expected_stop"),
+    [
+        (
+            Template.A,
+            {"low_10d_raw": None, "ma20_raw": None, "atr14_raw": 0.5},
+            9.25,
+        ),
+        (
+            Template.B,
+            {
+                "low_5d_raw": None,
+                "ma5_raw": None,
+                "ma10_raw": None,
+                "atr14_raw": 0.3,
+            },
+            9.55,
+        ),
+    ],
+)
+def test_null_supports_are_ignored(
+    template: Template, features: dict, expected_stop: float
+) -> None:
+    candidate = _candidate(template, {"atr14_raw": features["atr14_raw"]})
     stop = StopPlanner().plan(
         candidate, _entry(), features, load_strategy_config()
     )
     assert stop.structure_ref == "ATR fallback"
-    assert float(stop.initial_stop) == 9.25
+    assert float(stop.initial_stop) == expected_stop
+    assert float(stop.initial_stop) > 0
 
 
 @pytest.mark.parametrize("template", [Template.A, Template.B])
@@ -386,14 +567,41 @@ def test_non_positive_final_stop_is_rejected():
 
 
 def test_non_positive_r_is_rejected():
+    # The pre-round stop is 0.09; rounding it from 0.093 puts the distance at
+    # 10%, so it is nudged up to the entry price and R becomes zero.
     candidate = _candidate(
         Template.A,
-        {"low_10d_raw": 0.098, "ma20_raw": 0.12, "atr14_raw": 0.002},
+        {"low_10d_raw": 0.0935, "ma20_raw": 0.12, "atr14_raw": 0.001},
     )
     with pytest.raises(StopTooWideError, match="non-positive R"):
         StopPlanner().plan(
             candidate, _entry(0.10), candidate.features, load_strategy_config()
         )
+
+
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+def test_non_positive_time_stop_days_is_rejected_by_planner(
+    template: Template,
+) -> None:
+    # model_copy bypasses config validation, so the planner must guard too.
+    if template == Template.A:
+        config = _config_a(time_stop_days=0)
+        features = {"low_10d_raw": 9.5, "ma20_raw": 10.5, "atr14_raw": 0.5}
+    else:
+        config = _config_b(time_stop_days=0)
+        features = {
+            "low_5d_raw": 9.8,
+            "ma5_raw": 10.2,
+            "ma10_raw": 10.1,
+            "atr14_raw": 0.3,
+        }
+    candidate = _candidate(template, features)
+    with pytest.raises(StopTooWideError) as excinfo:
+        StopPlanner().plan(candidate, _entry(), candidate.features, config)
+    message = str(excinfo.value)
+    assert candidate.ts_code in message
+    assert f"({template.value})" in message
+    assert "time stop" in message
 
 
 def test_time_stop_and_trailing_rules_follow_template():

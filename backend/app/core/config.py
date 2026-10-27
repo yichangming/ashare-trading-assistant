@@ -210,7 +210,7 @@ class TemplateAConfig(StrictModel):
     stop_min_pct: float = Field(default=0.03, ge=0, le=1)
     stop_max_pct: float = Field(default=0.08, ge=0, le=1)
     atr_buffer: float = Field(default=0.5, ge=0)
-    time_stop_days: int = Field(default=10, ge=0)
+    time_stop_days: int = Field(default=10, gt=0)
     risk_pct: float = Field(default=0.025, ge=0, le=1)
     take_profit: TakeProfitAConfig
     score: ScoreWeights
@@ -248,7 +248,8 @@ class TemplateBConfig(StrictModel):
     max_gap_pct: float = Field(default=0.03, ge=0, le=1)
     stop_min_pct: float = Field(default=0.03, ge=0, le=1)
     stop_max_pct: float = Field(default=0.05, ge=0, le=1)
-    time_stop_days: int = Field(default=3, ge=0)
+    atr_buffer: float = Field(default=0.5, ge=0)
+    time_stop_days: int = Field(default=3, gt=0)
     risk_pct: float = Field(default=0.02, ge=0, le=1)
     take_profit: TakeProfitBConfig
     score: ScoreWeights
