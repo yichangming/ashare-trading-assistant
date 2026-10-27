@@ -15,6 +15,7 @@ from app.domain.models import (
     RegimeIndicators,
     TemplatePolicy,
 )
+from app.domain.money import price
 from app.planning.entry import EntryPlanner
 from app.planning.errors import EntryInvalidError
 
@@ -207,6 +208,26 @@ def test_a_zone_rounds_to_cents():
     assert plan.entry_zone_low <= plan.entry_zone_high
 
 
+def test_a_half_cent_zone_uses_decimal_rounding():
+    plan = _plan(_candidate(Template.A, {"ma20_raw": 7.25}))
+
+    assert plan.entry_zone_low == Decimal("7.11")
+    assert plan.entry_zone_high == Decimal("7.40")
+    assert plan.trigger_price == Decimal("7.25")
+    assert plan.entry_zone_low <= plan.trigger_price <= plan.entry_zone_high
+    assert plan.entry_price == price(
+        (plan.entry_zone_low + plan.entry_zone_high) / 2
+    )
+    assert plan.entry_price == Decimal("7.26")
+
+
+def test_a_rejects_zone_that_rounds_to_zero():
+    candidate = _candidate(Template.A, {"ma20_raw": 0.001})
+
+    with pytest.raises(EntryInvalidError, match="zone"):
+        _plan(candidate)
+
+
 @pytest.mark.parametrize("ma20", [None, 0.0, -1.0, float("nan"), float("inf")])
 def test_a_rejects_invalid_ma20(ma20: float | None) -> None:
     features = {} if ma20 is None else {"ma20_raw": ma20}
@@ -219,6 +240,14 @@ def test_a_rejects_over_extended_reference_price():
     candidate = _candidate(Template.A, {"ma20_raw": 10.0, "close": 10.81})
 
     with pytest.raises(EntryInvalidError, match="extension"):
+        _plan(candidate)
+
+
+@pytest.mark.parametrize("close", [float("nan"), float("inf"), 0.0, -1.0])
+def test_a_rejects_non_finite_or_non_positive_close(close: float) -> None:
+    candidate = _candidate(Template.A, {"ma20_raw": 10.0, "close": close})
+
+    with pytest.raises(EntryInvalidError, match="close"):
         _plan(candidate)
 
 
@@ -252,6 +281,17 @@ def test_a_rejects_calendar_coverage_shortfall():
         _plan(candidate, as_of=date(2024, 1, 5))
 
 
+def test_a_rejects_validity_exhausting_calendar():
+    candidate = _candidate(Template.A, {"ma20_raw": 10.0})
+
+    with pytest.raises(EntryInvalidError, match="calendar coverage"):
+        _plan(
+            candidate,
+            as_of=date(2024, 1, 7),
+            config=_config_a(entry_valid_days=1),
+        )
+
+
 def test_b_divergence_plan_metadata():
     candidate = _candidate(Template.B, _b_features())
     plan = _plan(candidate)
@@ -280,6 +320,35 @@ def test_b_confirmation_plan_metadata():
     assert plan.expires_on == date(2024, 1, 4)
 
 
+def test_b_confirmation_half_cent_zone_uses_decimal_rounding():
+    candidate = _candidate(
+        Template.B,
+        _b_features(ma5_raw=20.5, ma10_raw=20.0, board_height=2),
+    )
+    plan = _plan(candidate)
+
+    assert plan.type == EntryType.CONFIRMATION
+    assert plan.trigger_price == Decimal("20.50")
+    assert plan.entry_zone_low == Decimal("20.30")
+    assert plan.entry_zone_high == Decimal("20.71")
+    assert plan.entry_zone_low <= plan.trigger_price <= plan.entry_zone_high
+    assert plan.entry_price == Decimal("20.51")
+
+
+def test_b_divergence_half_cent_zone_uses_decimal_rounding():
+    candidate = _candidate(
+        Template.B,
+        _b_features(ma5_raw=8.75, ma10_raw=8.25, board_height=1),
+    )
+    plan = _plan(candidate)
+
+    assert plan.type == EntryType.DIVERGENCE_LOW
+    assert plan.trigger_price is None
+    assert plan.entry_zone_low == Decimal("8.09")
+    assert plan.entry_zone_high == Decimal("8.93")
+    assert plan.entry_price == Decimal("8.51")
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -304,8 +373,13 @@ def test_b_rejects_invalid_mas(overrides: dict[str, float | None]) -> None:
         _plan(candidate)
 
 
-@pytest.mark.parametrize("board_height", [None, 0.0, -1.0, float("nan")])
-def test_b_rejects_invalid_board_height(board_height: float | None) -> None:
+@pytest.mark.parametrize(
+    "board_height",
+    [None, 0.0, -1.0, 1.5, 3.0, float("nan")],
+)
+def test_b_rejects_invalid_board_height(
+    board_height: float | None,
+) -> None:
     features = _b_features()
     if board_height is None:
         features.pop("board_height")
@@ -348,3 +422,21 @@ def test_b_rejects_calendar_coverage_shortfall():
 
     with pytest.raises(EntryInvalidError, match="calendar coverage"):
         _plan(candidate, as_of=date(2024, 1, 6))
+
+
+@pytest.mark.parametrize(
+    ("template", "features"),
+    [(Template.A, {}), (Template.B, {})],
+)
+def test_entry_errors_identify_candidate_and_template(
+    template: Template,
+    features: dict[str, float],
+) -> None:
+    candidate = _candidate(template, features)
+
+    with pytest.raises(EntryInvalidError) as excinfo:
+        _plan(candidate)
+
+    message = str(excinfo.value)
+    assert "000001.SZ" in message
+    assert f"({template.value})" in message
