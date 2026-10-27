@@ -15,8 +15,6 @@ from app.domain.models import (
 from app.domain.money import price
 from app.planning.errors import PoorRiskRewardError
 
-_TWO = Decimal("2")
-_THREE = Decimal("3")
 _RESISTANCE_MIN_R = Decimal("1.5")
 
 
@@ -32,22 +30,39 @@ def _fraction(candidate: Candidate, name: str, value: float) -> float:
     return value
 
 
+def _format_r(value: float) -> str:
+    return f"{value:g}"
+
+
 class TakeProfitPlanner:
     """Build take-profit targets and exit rules from the entry and stop plans.
 
     ``EntryPlan.entry_price`` (the zone midpoint when a full zone exists) and
     ``StopPlan.r_value`` are authoritative and must be finite and positive.
     Target prices are computed in :class:`~decimal.Decimal` as
-    ``entry + multiple * R`` and rounded half-up exactly once by ``price()``.
+    ``entry + rN * R`` and rounded half-up exactly once by ``price()``.  The
+    configured ``r1``/``r2``/``r3`` levels drive both prices and rule text, so
+    strategy overrides are reflected in the emitted plan.
 
-    Template A sells ``first_fraction`` at +2R and ``second_fraction`` at +3R,
-    leaving the remainder for the trailing rule.  A known ``high_60d_raw``
-    resistance above entry must sit at least 1.5R away; resistance at or below
-    entry, or non-finite resistance, is ignored.
+    Template A sells ``first_fraction`` at ``r2``R and ``second_fraction`` at
+    ``r3``R, leaving the remainder for the trend/trailing rule.  A known
+    ``high_60d_raw`` resistance above entry must sit at least 1.5R away,
+    otherwise the plan is rejected.  When it is far enough away, targets are
+    capped at that level and their ``r_multiple`` reports the capped distance.
+    Resistance at or below entry, or non-finite resistance, is ignored.
 
-    Template B sells ``second_fraction`` at +2R and trails the remainder by
-    MA5/ATR with no fixed percentage target.  The time-exit text reflects
-    ``StopPlan.time_stop_days`` so configuration changes flow through.
+    Template B sells ``second_fraction`` at ``r2``R and trails the remainder by
+    MA5/ATR with no fixed percentage target; it does not apply the resistance
+    gate.  The time-exit text reflects ``StopPlan.time_stop_days`` so
+    configuration changes flow through.
+
+    ``high_60d_raw`` includes the current bar, so it is only a proxy for
+    overhead supply rather than a true swing-high level.  Proper swing-high
+    resistance detection is a follow-up task.
+
+    All R and target arithmetic is guarded: decimal overflow or invalid
+    operations are converted to :class:`PoorRiskRewardError` so callers never
+    see a bare :class:`ArithmeticError`.
     """
 
     def plan(
@@ -70,10 +85,18 @@ class TakeProfitPlanner:
         r_value = stop.r_value
         if not r_value.is_finite() or r_value <= 0:
             raise _reject(candidate, f"R must be finite and positive, got {r_value}")
+        if stop.initial_stop >= entry_price:
+            raise _reject(
+                candidate,
+                f"initial stop {stop.initial_stop} must be below entry {entry_price}",
+            )
 
-        if candidate.template == Template.A:
-            return self._plan_a(candidate, entry_price, r_value, stop, config)
-        return self._plan_b(candidate, entry_price, r_value, stop, config)
+        try:
+            if candidate.template == Template.A:
+                return self._plan_a(candidate, entry_price, r_value, stop, config)
+            return self._plan_b(candidate, entry_price, r_value, stop, config)
+        except ArithmeticError as exc:
+            raise _reject(candidate, f"target arithmetic failed: {exc}") from exc
 
     def _plan_a(
         self,
@@ -90,24 +113,38 @@ class TakeProfitPlanner:
         second_fraction = _fraction(
             candidate, "A second fraction", take_profit.second_fraction
         )
-        self._check_resistance(candidate, entry_price, r_value)
+        resistance = self._resistance_above_entry(candidate, entry_price)
+        if (
+            resistance is not None
+            and resistance - entry_price < _RESISTANCE_MIN_R * r_value
+        ):
+            raise _reject(
+                candidate,
+                f"nearest resistance {resistance} is {resistance - entry_price} "
+                f"above entry, closer than 1.5R ({_RESISTANCE_MIN_R * r_value})",
+            )
+
+        r1, r2, r3 = take_profit.r1, take_profit.r2, take_profit.r3
         targets = [
-            TakeProfitTarget(
-                r_multiple=2.0,
-                price=price(entry_price + _TWO * r_value),
-                fraction=first_fraction,
+            self._target(
+                candidate, entry_price, r_value, r2, first_fraction, resistance
             ),
-            TakeProfitTarget(
-                r_multiple=3.0,
-                price=price(entry_price + _THREE * r_value),
-                fraction=second_fraction,
+            self._target(
+                candidate, entry_price, r_value, r3, second_fraction, resistance
             ),
         ]
+        if targets[1].price < targets[0].price:
+            raise _reject(
+                candidate,
+                f"A targets are not ordered: {targets[0].price}, {targets[1].price}",
+            )
         return TakeProfitPlan(
             targets=targets,
             trailing_rule=(
-                "+1R move stop to breakeven; +2R move stop to +1R; "
-                "trail by close - 1.5*ATR14"
+                f"+{_format_r(r1)}R move stop to breakeven; "
+                f"+{_format_r(r2)}R sell {first_fraction:.0%}; "
+                f"+{_format_r(r3)}R sell {second_fraction:.0%}; "
+                "remainder trend; trail by close - 1.5*ATR14"
             ),
             time_exit_rule=(
                 f"exit after {stop.time_stop_days} trading days "
@@ -116,22 +153,47 @@ class TakeProfitPlanner:
         )
 
     @staticmethod
-    def _check_resistance(
+    def _resistance_above_entry(
+        candidate: Candidate,
+        entry_price: Decimal,
+    ) -> Decimal | None:
+        raw_resistance = candidate.features.get("high_60d_raw")
+        if raw_resistance is None or not math.isfinite(raw_resistance):
+            return None
+        resistance = Decimal(str(raw_resistance))
+        if resistance <= entry_price:
+            return None
+        return resistance
+
+    @staticmethod
+    def _target(
         candidate: Candidate,
         entry_price: Decimal,
         r_value: Decimal,
-    ) -> None:
-        raw_resistance = candidate.features.get("high_60d_raw")
-        if raw_resistance is None or not math.isfinite(raw_resistance):
-            return
-        resistance = Decimal(str(raw_resistance))
-        distance = resistance - entry_price
-        if 0 < distance < _RESISTANCE_MIN_R * r_value:
+        multiple: float,
+        fraction: float,
+        resistance: Decimal | None,
+    ) -> TakeProfitTarget:
+        raw_price = entry_price + Decimal(str(multiple)) * r_value
+        if resistance is not None:
+            raw_price = min(raw_price, resistance)
+        target_price = price(raw_price)
+        if target_price <= entry_price:
             raise _reject(
                 candidate,
-                f"nearest resistance {resistance} is {distance} above entry, "
-                f"closer than 1.5R ({_RESISTANCE_MIN_R * r_value})",
+                f"target {target_price} must be above entry {entry_price}",
             )
+        r_multiple = float((target_price - entry_price) / r_value)
+        if not math.isfinite(r_multiple) or r_multiple <= 0:
+            raise _reject(
+                candidate,
+                f"target {target_price} has invalid R multiple {r_multiple}",
+            )
+        return TakeProfitTarget(
+            r_multiple=r_multiple,
+            price=target_price,
+            fraction=fraction,
+        )
 
     def _plan_b(
         self,
@@ -145,18 +207,18 @@ class TakeProfitPlanner:
         second_fraction = _fraction(
             candidate, "B second fraction", take_profit.second_fraction
         )
+        r1, r2 = take_profit.r1, take_profit.r2
         targets = [
-            TakeProfitTarget(
-                r_multiple=2.0,
-                price=price(entry_price + _TWO * r_value),
-                fraction=second_fraction,
+            self._target(
+                candidate, entry_price, r_value, r2, second_fraction, resistance=None
             )
         ]
         return TakeProfitPlan(
             targets=targets,
             trailing_rule=(
-                "+1R move stop to breakeven; +2R sell half; "
-                "trail remainder by MA5/1.5*ATR14"
+                f"+{_format_r(r1)}R move stop to breakeven; "
+                f"+{_format_r(r2)}R sell {second_fraction:.0%}; "
+                "remainder trail by MA5/1.5*ATR14"
             ),
             time_exit_rule=(
                 f"exit after {stop.time_stop_days} trading days "

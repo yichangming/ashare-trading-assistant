@@ -128,3 +128,28 @@ def test_disabled_stage_policy_requires_zero_positions(tmp_path):
     path = _modified_strategy(tmp_path, ("switching", "freeze", "a"), "max_positions", 1)
     with pytest.raises(ValidationError, match="must be 0 when disabled"):
         load_strategy_config(path)
+
+
+@pytest.mark.parametrize(
+    ("first_fraction", "second_fraction"),
+    [(0.5, 0.5), (0.6, 0.6)],
+)
+def test_a_take_profit_fractions_must_leave_remainder(
+    tmp_path: Path, first_fraction: float, second_fraction: float
+) -> None:
+    payload = load_strategy_config().model_dump()
+    take_profit = payload["template_a"]["take_profit"]
+    take_profit["first_fraction"] = first_fraction
+    take_profit["second_fraction"] = second_fraction
+    path = tmp_path / "bad_take_profit.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    with pytest.raises(ValidationError, match="sum to less than 1.0"):
+        load_strategy_config(path)
+
+
+def test_b_take_profit_fraction_must_leave_remainder(tmp_path: Path) -> None:
+    path = _modified_strategy(
+        tmp_path, ("template_b", "take_profit"), "second_fraction", 1.0
+    )
+    with pytest.raises(ValidationError, match="less than 1.0"):
+        load_strategy_config(path)

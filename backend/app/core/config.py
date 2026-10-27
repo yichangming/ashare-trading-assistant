@@ -170,8 +170,10 @@ class TakeProfitAConfig(StrictModel):
     def _check_levels_and_fractions(self) -> TakeProfitAConfig:
         if not self.r1 < self.r2 < self.r3:
             raise ValueError("take-profit levels must satisfy r1 < r2 < r3")
-        if self.first_fraction + self.second_fraction > 1.0:
-            raise ValueError("take-profit fractions must sum to at most 1.0")
+        if self.first_fraction + self.second_fraction >= 1.0:
+            raise ValueError(
+                "take-profit fractions must sum to less than 1.0 to leave a remainder"
+            )
         return self
 
 
@@ -184,6 +186,10 @@ class TakeProfitBConfig(StrictModel):
     def _check_levels(self) -> TakeProfitBConfig:
         if not self.r1 < self.r2:
             raise ValueError("take-profit levels must satisfy r1 < r2")
+        if self.second_fraction >= 1.0:
+            raise ValueError(
+                "second_fraction must be less than 1.0 to leave a remainder"
+            )
         return self
 
 

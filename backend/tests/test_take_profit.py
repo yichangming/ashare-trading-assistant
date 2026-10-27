@@ -155,9 +155,28 @@ def test_a_resistance_at_or_below_entry_is_ignored(resistance):
     assert [float(target.price) for target in plan.targets] == [22.80, 24.20]
 
 
-def test_a_resistance_exactly_one_and_a_half_r_passes():
+def test_a_resistance_exactly_one_and_a_half_r_passes_and_caps():
     plan = _plan(Template.A, resistance=22.1)
+    assert [float(target.price) for target in plan.targets] == [22.10, 22.10]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx([1.5, 1.5])
+
+
+def test_a_targets_cap_at_resistance_inside_second_target():
+    plan = _plan(Template.A, resistance=22.24)  # 1.6R above entry
+    assert [float(target.price) for target in plan.targets] == [22.24, 22.24]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx([1.6, 1.6])
+
+
+def test_a_first_target_caps_at_resistance_between_r2_and_r3():
+    plan = _plan(Template.A, resistance=23.50)  # 2.5R above entry
+    assert [float(target.price) for target in plan.targets] == [22.80, 23.50]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx([2.0, 2.5])
+
+
+def test_a_resistance_beyond_r3_does_not_cap():
+    plan = _plan(Template.A, resistance=24.90)  # 3.5R above entry
     assert [float(target.price) for target in plan.targets] == [22.80, 24.20]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx([2.0, 3.0])
 
 
 def test_a_resistance_just_below_one_and_a_half_r_rejected():
@@ -169,11 +188,43 @@ def test_a_fractions_and_r_multiples():
     config = load_strategy_config()
     plan = _plan(Template.A, config=config)
     take_profit = config.template_a.take_profit
-    assert [target.r_multiple for target in plan.targets] == [2.0, 3.0]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx(
+        [take_profit.r2, take_profit.r3]
+    )
     assert plan.targets[0].fraction == pytest.approx(take_profit.first_fraction)
     assert plan.targets[1].fraction == pytest.approx(take_profit.second_fraction)
     assert all(0 < target.fraction <= 1 for target in plan.targets)
     assert all(target.price > 0 for target in plan.targets)
+
+
+def test_a_configured_r_levels_drive_targets_and_text():
+    config = _config_a(r1=1.5, r2=2.5, r3=4.0)
+    plan = _plan(Template.A, config=config)
+    assert [float(target.price) for target in plan.targets] == [23.50, 25.60]
+    assert [target.r_multiple for target in plan.targets] == pytest.approx([2.5, 4.0])
+    assert "+1.5R move stop to breakeven" in plan.trailing_rule
+    assert "+2.5R sell 33%" in plan.trailing_rule
+    assert "+4R sell 33%" in plan.trailing_rule
+
+
+def test_b_configured_r_level_drives_target_and_text():
+    config = _config_b(r2=3.0)
+    plan = _plan(Template.B, entry_price=10.0, stop_price=9.5, config=config)
+    assert float(plan.targets[0].price) == 11.50
+    assert plan.targets[0].r_multiple == pytest.approx(3.0)
+    assert "+3R sell 50%" in plan.trailing_rule
+
+
+def test_b_configured_fraction_drives_fraction_and_text():
+    config = _config_b(second_fraction=0.4)
+    plan = _plan(Template.B, entry_price=10.0, stop_price=9.5, config=config)
+    assert plan.targets[0].fraction == 0.4
+    assert "+2R sell 40%" in plan.trailing_rule
+
+
+def test_unordered_targets_rejected():
+    with pytest.raises(PoorRiskRewardError):
+        _plan(Template.A, config=_config_a(r2=3.0, r3=2.0))
 
 
 def test_b_fraction_r_multiple_and_trailing_remainder():
@@ -181,15 +232,21 @@ def test_b_fraction_r_multiple_and_trailing_remainder():
     assert len(plan.targets) == 1
     assert plan.targets[0].r_multiple == 2.0
     assert plan.targets[0].fraction == 0.5
-    assert "%" not in plan.trailing_rule
-    assert "trail remainder by MA5/1.5*ATR14" in plan.trailing_rule
+    assert "+2R sell 50%" in plan.trailing_rule
+    assert "remainder trail by MA5/1.5*ATR14" in plan.trailing_rule
+
+
+def test_b_ignores_resistance_gate():
+    plan = _plan(Template.B, resistance=10.2, entry_price=10.0, stop_price=9.5)
+    assert float(plan.targets[0].price) == 11.00
+    assert plan.targets[0].r_multiple == pytest.approx(2.0)
 
 
 def test_a_trailing_rule():
     plan = _plan(Template.A)
     assert plan.trailing_rule == (
-        "+1R move stop to breakeven; +2R move stop to +1R; "
-        "trail by close - 1.5*ATR14"
+        "+1R move stop to breakeven; +2R sell 33%; +3R sell 33%; "
+        "remainder trend; trail by close - 1.5*ATR14"
     )
 
 
@@ -301,4 +358,49 @@ def test_b_invalid_fraction_rejected():
             entry_price=10.0,
             stop_price=9.5,
             config=_config_b(second_fraction=0.0),
+        )
+
+
+@pytest.mark.parametrize("r_value", [Decimal("1e100"), Decimal("1e999999")])
+def test_huge_r_rejected_as_planning_error(r_value):
+    stop = _stop(20.0, 18.6).model_copy(update={"r_value": r_value})
+    with pytest.raises(PoorRiskRewardError):
+        TakeProfitPlanner().plan(
+            _candidate(Template.A, resistance=None),
+            _entry(20.0),
+            stop,
+            load_strategy_config(),
+        )
+
+
+def test_huge_r_overflow_in_resistance_gate_is_planning_error():
+    stop = _stop(20.0, 18.6).model_copy(update={"r_value": Decimal("9e999999")})
+    with pytest.raises(PoorRiskRewardError):
+        TakeProfitPlanner().plan(
+            _candidate(Template.A, resistance=30.0),
+            _entry(20.0),
+            stop,
+            load_strategy_config(),
+        )
+
+
+def test_sub_cent_r_rejected_when_target_not_above_entry():
+    stop = _stop(10.0, 9.5).model_copy(update={"r_value": Decimal("0.001")})
+    with pytest.raises(PoorRiskRewardError):
+        TakeProfitPlanner().plan(
+            _candidate(Template.A, resistance=None),
+            _entry(10.0),
+            stop,
+            load_strategy_config(),
+        )
+
+
+def test_stop_above_entry_rejected():
+    stop = _stop(10.0, 9.5).model_copy(update={"initial_stop": price(10.5)})
+    with pytest.raises(PoorRiskRewardError):
+        TakeProfitPlanner().plan(
+            _candidate(Template.A, resistance=None),
+            _entry(10.0),
+            stop,
+            load_strategy_config(),
         )
