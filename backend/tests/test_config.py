@@ -153,3 +153,24 @@ def test_b_take_profit_fraction_must_leave_remainder(tmp_path: Path) -> None:
     )
     with pytest.raises(ValidationError, match="less than 1.0"):
         load_strategy_config(path)
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("template_a", "r1"),
+        ("template_a", "r2"),
+        ("template_a", "r3"),
+        ("template_a", "first_fraction"),
+        ("template_a", "second_fraction"),
+        ("template_b", "r1"),
+        ("template_b", "r2"),
+        ("template_b", "second_fraction"),
+    ],
+)
+def test_take_profit_zero_values_rejected(
+    tmp_path: Path, section: str, key: str
+) -> None:
+    path = _modified_strategy(tmp_path, (section, "take_profit"), key, 0.0)
+    with pytest.raises(ValidationError, match="greater than 0"):
+        load_strategy_config(path)

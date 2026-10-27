@@ -25,13 +25,21 @@ def _reject(candidate: Candidate, detail: str) -> PoorRiskRewardError:
 
 
 def _fraction(candidate: Candidate, name: str, value: float) -> float:
-    if not math.isfinite(value) or not 0 < value <= 1:
-        raise _reject(candidate, f"{name} must be in (0, 1], got {value}")
+    if not math.isfinite(value) or not 0 < value < 1:
+        raise _reject(candidate, f"{name} must be in (0, 1), got {value}")
     return value
 
 
 def _format_r(value: float) -> str:
     return f"{value:g}"
+
+
+def _format_multiple(value: float) -> str:
+    """Render an actual R multiple with three decimals, keeping one for integers."""
+    text = f"{value:.3f}".rstrip("0")
+    if text.endswith("."):
+        text += "0"
+    return text
 
 
 class TakeProfitPlanner:
@@ -60,6 +68,12 @@ class TakeProfitPlanner:
     overhead supply rather than a true swing-high level.  Proper swing-high
     resistance detection is a follow-up task.
 
+    The trailing rule is rendered from the emitted targets (their prices,
+    fractions, and actual R multiples), not from the uncapped configured
+    levels.  When both A targets cap at the same resistance price, the rule
+    lists both sells at that level separately; the structured targets stay as
+    two entries rather than being merged into one.
+
     All R and target arithmetic is guarded: decimal overflow or invalid
     operations are converted to :class:`PoorRiskRewardError` so callers never
     see a bare :class:`ArithmeticError`.
@@ -85,13 +99,19 @@ class TakeProfitPlanner:
         r_value = stop.r_value
         if not r_value.is_finite() or r_value <= 0:
             raise _reject(candidate, f"R must be finite and positive, got {r_value}")
-        if stop.initial_stop >= entry_price:
-            raise _reject(
-                candidate,
-                f"initial stop {stop.initial_stop} must be below entry {entry_price}",
-            )
 
         try:
+            if not stop.initial_stop.is_finite():
+                raise _reject(
+                    candidate,
+                    f"initial stop must be finite, got {stop.initial_stop}",
+                )
+            if stop.initial_stop >= entry_price:
+                raise _reject(
+                    candidate,
+                    f"initial stop {stop.initial_stop} must be below entry "
+                    f"{entry_price}",
+                )
             if candidate.template == Template.A:
                 return self._plan_a(candidate, entry_price, r_value, stop, config)
             return self._plan_b(candidate, entry_price, r_value, stop, config)
@@ -138,17 +158,22 @@ class TakeProfitPlanner:
                 candidate,
                 f"A targets are not ordered: {targets[0].price}, {targets[1].price}",
             )
+        sell_rules = "; ".join(
+            f"sell {target.fraction:.0%} at {target.price} "
+            f"(+{_format_multiple(target.r_multiple)}R)"
+            for target in targets
+        )
         return TakeProfitPlan(
             targets=targets,
             trailing_rule=(
+                f"{sell_rules}; remainder trend; "
                 f"+{_format_r(r1)}R move stop to breakeven; "
-                f"+{_format_r(r2)}R sell {first_fraction:.0%}; "
-                f"+{_format_r(r3)}R sell {second_fraction:.0%}; "
-                "remainder trend; trail by close - 1.5*ATR14"
+                f"+{_format_r(r2)}R move stop to +{_format_r(r1)}R; "
+                "trail by close - 1.5*ATR14"
             ),
             time_exit_rule=(
                 f"exit after {stop.time_stop_days} trading days "
-                "without +1R and below entry"
+                f"without +{_format_r(r1)}R and below entry"
             ),
         )
 
@@ -213,12 +238,15 @@ class TakeProfitPlanner:
                 candidate, entry_price, r_value, r2, second_fraction, resistance=None
             )
         ]
+        target = targets[0]
         return TakeProfitPlan(
             targets=targets,
             trailing_rule=(
+                f"sell {target.fraction:.0%} at {target.price} "
+                f"(+{_format_multiple(target.r_multiple)}R); remainder trail; "
                 f"+{_format_r(r1)}R move stop to breakeven; "
-                f"+{_format_r(r2)}R sell {second_fraction:.0%}; "
-                "remainder trail by MA5/1.5*ATR14"
+                f"+{_format_r(r2)}R move stop to +{_format_r(r1)}R; "
+                "trail remainder by MA5/1.5*ATR14"
             ),
             time_exit_rule=(
                 f"exit after {stop.time_stop_days} trading days "

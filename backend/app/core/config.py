@@ -160,11 +160,11 @@ class ScoreWeights(StrictModel):
 
 
 class TakeProfitAConfig(StrictModel):
-    r1: float = Field(default=1.0, ge=0)
-    r2: float = Field(default=2.0, ge=0)
-    r3: float = Field(default=3.0, ge=0)
-    first_fraction: float = Field(default=1 / 3, ge=0, le=1)
-    second_fraction: float = Field(default=1 / 3, ge=0, le=1)
+    r1: float = Field(default=1.0, gt=0)
+    r2: float = Field(default=2.0, gt=0)
+    r3: float = Field(default=3.0, gt=0)
+    first_fraction: float = Field(default=1 / 3, gt=0, le=1)
+    second_fraction: float = Field(default=1 / 3, gt=0, le=1)
 
     @model_validator(mode="after")
     def _check_levels_and_fractions(self) -> TakeProfitAConfig:
@@ -178,9 +178,9 @@ class TakeProfitAConfig(StrictModel):
 
 
 class TakeProfitBConfig(StrictModel):
-    r1: float = Field(default=1.0, ge=0)
-    r2: float = Field(default=2.0, ge=0)
-    second_fraction: float = Field(default=0.5, ge=0, le=1)
+    r1: float = Field(default=1.0, gt=0)
+    r2: float = Field(default=2.0, gt=0)
+    second_fraction: float = Field(default=0.5, gt=0, le=1)
 
     @model_validator(mode="after")
     def _check_levels(self) -> TakeProfitBConfig:

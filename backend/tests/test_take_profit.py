@@ -202,9 +202,14 @@ def test_a_configured_r_levels_drive_targets_and_text():
     plan = _plan(Template.A, config=config)
     assert [float(target.price) for target in plan.targets] == [23.50, 25.60]
     assert [target.r_multiple for target in plan.targets] == pytest.approx([2.5, 4.0])
-    assert "+1.5R move stop to breakeven" in plan.trailing_rule
-    assert "+2.5R sell 33%" in plan.trailing_rule
-    assert "+4R sell 33%" in plan.trailing_rule
+    assert plan.trailing_rule == (
+        "sell 33% at 23.50 (+2.5R); sell 33% at 25.60 (+4.0R); "
+        "remainder trend; +1.5R move stop to breakeven; "
+        "+2.5R move stop to +1.5R; trail by close - 1.5*ATR14"
+    )
+    assert plan.time_exit_rule == (
+        "exit after 10 trading days without +1.5R and below entry"
+    )
 
 
 def test_b_configured_r_level_drives_target_and_text():
@@ -212,14 +217,18 @@ def test_b_configured_r_level_drives_target_and_text():
     plan = _plan(Template.B, entry_price=10.0, stop_price=9.5, config=config)
     assert float(plan.targets[0].price) == 11.50
     assert plan.targets[0].r_multiple == pytest.approx(3.0)
-    assert "+3R sell 50%" in plan.trailing_rule
+    assert plan.trailing_rule == (
+        "sell 50% at 11.50 (+3.0R); remainder trail; "
+        "+1R move stop to breakeven; +3R move stop to +1R; "
+        "trail remainder by MA5/1.5*ATR14"
+    )
 
 
 def test_b_configured_fraction_drives_fraction_and_text():
     config = _config_b(second_fraction=0.4)
     plan = _plan(Template.B, entry_price=10.0, stop_price=9.5, config=config)
     assert plan.targets[0].fraction == 0.4
-    assert "+2R sell 40%" in plan.trailing_rule
+    assert "sell 40% at 11.00 (+2.0R)" in plan.trailing_rule
 
 
 def test_unordered_targets_rejected():
@@ -232,8 +241,8 @@ def test_b_fraction_r_multiple_and_trailing_remainder():
     assert len(plan.targets) == 1
     assert plan.targets[0].r_multiple == 2.0
     assert plan.targets[0].fraction == 0.5
-    assert "+2R sell 50%" in plan.trailing_rule
-    assert "remainder trail by MA5/1.5*ATR14" in plan.trailing_rule
+    assert "sell 50% at 11.00 (+2.0R)" in plan.trailing_rule
+    assert "trail remainder by MA5/1.5*ATR14" in plan.trailing_rule
 
 
 def test_b_ignores_resistance_gate():
@@ -245,8 +254,52 @@ def test_b_ignores_resistance_gate():
 def test_a_trailing_rule():
     plan = _plan(Template.A)
     assert plan.trailing_rule == (
-        "+1R move stop to breakeven; +2R sell 33%; +3R sell 33%; "
-        "remainder trend; trail by close - 1.5*ATR14"
+        "sell 33% at 22.80 (+2.0R); sell 33% at 24.20 (+3.0R); "
+        "remainder trend; +1R move stop to breakeven; "
+        "+2R move stop to +1R; trail by close - 1.5*ATR14"
+    )
+
+
+@pytest.mark.parametrize(
+    ("resistance", "expected_sells"),
+    [
+        (22.1, "sell 33% at 22.10 (+1.5R); sell 33% at 22.10 (+1.5R)"),
+        (22.24, "sell 33% at 22.24 (+1.6R); sell 33% at 22.24 (+1.6R)"),
+        (23.5, "sell 33% at 22.80 (+2.0R); sell 33% at 23.50 (+2.5R)"),
+    ],
+)
+def test_a_trailing_rule_uses_capped_targets(resistance, expected_sells):
+    plan = _plan(Template.A, resistance=resistance)
+    assert plan.trailing_rule == (
+        f"{expected_sells}; remainder trend; "
+        "+1R move stop to breakeven; +2R move stop to +1R; "
+        "trail by close - 1.5*ATR14"
+    )
+    assert plan.time_exit_rule == (
+        "exit after 10 trading days without +1R and below entry"
+    )
+
+
+def test_a_text_uses_configured_r1():
+    config = _config_a(r1=1.5)
+    plan = _plan(Template.A, config=config)
+    assert plan.trailing_rule == (
+        "sell 33% at 22.80 (+2.0R); sell 33% at 24.20 (+3.0R); "
+        "remainder trend; +1.5R move stop to breakeven; "
+        "+2R move stop to +1.5R; trail by close - 1.5*ATR14"
+    )
+    assert plan.time_exit_rule == (
+        "exit after 10 trading days without +1.5R and below entry"
+    )
+
+
+def test_b_text_uses_configured_r1():
+    config = _config_b(r1=1.5)
+    plan = _plan(Template.B, entry_price=10.0, stop_price=9.5, config=config)
+    assert plan.trailing_rule == (
+        "sell 50% at 11.00 (+2.0R); remainder trail; "
+        "+1.5R move stop to breakeven; +2R move stop to +1.5R; "
+        "trail remainder by MA5/1.5*ATR14"
     )
 
 
@@ -345,19 +398,20 @@ def test_non_finite_entry_price_rejected(trigger_price):
         )
 
 
-@pytest.mark.parametrize("fraction", [0.0, 1.5])
+@pytest.mark.parametrize("fraction", [0.0, 1.0, 1.5])
 def test_a_invalid_fraction_rejected(fraction):
     with pytest.raises(PoorRiskRewardError):
         _plan(Template.A, config=_config_a(first_fraction=fraction))
 
 
-def test_b_invalid_fraction_rejected():
+@pytest.mark.parametrize("fraction", [0.0, 1.0])
+def test_b_invalid_fraction_rejected(fraction):
     with pytest.raises(PoorRiskRewardError):
         _plan(
             Template.B,
             entry_price=10.0,
             stop_price=9.5,
-            config=_config_b(second_fraction=0.0),
+            config=_config_b(second_fraction=fraction),
         )
 
 
@@ -397,6 +451,20 @@ def test_sub_cent_r_rejected_when_target_not_above_entry():
 
 def test_stop_above_entry_rejected():
     stop = _stop(10.0, 9.5).model_copy(update={"initial_stop": price(10.5)})
+    with pytest.raises(PoorRiskRewardError):
+        TakeProfitPlanner().plan(
+            _candidate(Template.A, resistance=None),
+            _entry(10.0),
+            stop,
+            load_strategy_config(),
+        )
+
+
+@pytest.mark.parametrize(
+    "initial_stop", [Decimal("NaN"), Decimal("Infinity")]
+)
+def test_non_finite_initial_stop_rejected(initial_stop):
+    stop = _stop(10.0, 9.5).model_copy(update={"initial_stop": initial_stop})
     with pytest.raises(PoorRiskRewardError):
         TakeProfitPlanner().plan(
             _candidate(Template.A, resistance=None),
