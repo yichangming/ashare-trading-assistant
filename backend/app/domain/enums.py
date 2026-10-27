@@ -1,18 +1,18 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class Template(str, Enum):
+class Template(StrEnum):
     A = "A"
     B = "B"
 
 
-class TrendRegime(str, Enum):
+class TrendRegime(StrEnum):
     ATTACK = "attack"
     NEUTRAL = "neutral"
     DEFENSIVE = "defensive"
 
 
-class SentimentStage(str, Enum):
+class SentimentStage(StrEnum):
     FREEZE = "freeze"
     START = "start"
     FERMENT = "ferment"
@@ -20,7 +20,7 @@ class SentimentStage(str, Enum):
     EBB = "ebb"
 
 
-class PlanStatus(str, Enum):
+class PlanStatus(StrEnum):
     DRAFT = "DRAFT"
     REJECTED = "REJECTED"
     PENDING_ENTRY = "PENDING_ENTRY"
@@ -30,13 +30,13 @@ class PlanStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
-class EntryType(str, Enum):
+class EntryType(StrEnum):
     PULLBACK = "pullback"
     DIVERGENCE_LOW = "divergence_low"
     CONFIRMATION = "confirmation"
 
 
-class RiskOutcome(str, Enum):
+class RiskOutcome(StrEnum):
     APPROVE = "approve"
     REDUCE = "reduce"
     REJECT = "reject"

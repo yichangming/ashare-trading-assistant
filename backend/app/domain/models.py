@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from typing import Literal
 from uuid import uuid4
@@ -108,9 +108,12 @@ class EntryPlan(DomainModel):
             self.entry_zone_low is None or self.entry_zone_high is None
         ):
             raise ValueError("trigger_price or a full entry zone is required")
-        if self.entry_zone_low is not None and self.entry_zone_high is not None:
-            if self.entry_zone_low > self.entry_zone_high:
-                raise ValueError("entry_zone_low must be <= entry_zone_high")
+        if (
+            self.entry_zone_low is not None
+            and self.entry_zone_high is not None
+            and self.entry_zone_low > self.entry_zone_high
+        ):
+            raise ValueError("entry_zone_low must be <= entry_zone_high")
         return self
 
     @property
@@ -230,7 +233,7 @@ class TradePlan(DomainModel):
     take_profit_plan: TakeProfitPlan
     risk_decision: RiskDecision | None = None
     status: PlanStatus = PlanStatus.DRAFT
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     expires_on: date
     strategy_version: str
     data_version: str
