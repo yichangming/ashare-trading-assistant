@@ -94,9 +94,9 @@ class Candidate(DomainModel):
 
 class EntryPlan(DomainModel):
     type: EntryType
-    trigger_price: Decimal | None = None
-    entry_zone_low: Decimal | None = None
-    entry_zone_high: Decimal | None = None
+    trigger_price: Decimal | None = Field(default=None, gt=0)
+    entry_zone_low: Decimal | None = Field(default=None, gt=0)
+    entry_zone_high: Decimal | None = Field(default=None, gt=0)
     validity_days: int = Field(gt=0)
     max_chase_pct: float = Field(ge=0)
     cancel_conditions: list[str] = Field(default_factory=list)
@@ -104,9 +104,9 @@ class EntryPlan(DomainModel):
 
     @model_validator(mode="after")
     def _prices_present(self) -> EntryPlan:
-        if self.trigger_price is None and (
-            self.entry_zone_low is None or self.entry_zone_high is None
-        ):
+        if (self.entry_zone_low is None) != (self.entry_zone_high is None):
+            raise ValueError("both entry_zone_low and entry_zone_high are required")
+        if self.trigger_price is None and self.entry_zone_low is None:
             raise ValueError("trigger_price or a full entry zone is required")
         if (
             self.entry_zone_low is not None
@@ -120,12 +120,13 @@ class EntryPlan(DomainModel):
     def entry_price(self) -> Decimal:
         if self.entry_zone_low is not None and self.entry_zone_high is not None:
             return price((self.entry_zone_low + self.entry_zone_high) / 2)
-        assert self.trigger_price is not None
-        return self.trigger_price
+        if self.trigger_price is None:
+            raise ValueError("entry price is unavailable")
+        return price(self.trigger_price)
 
 
 class StopPlan(DomainModel):
-    initial_stop: Decimal
+    initial_stop: Decimal = Field(gt=0)
     stop_distance_pct: float = Field(gt=0)
     atr14: float = Field(gt=0)
     structure_ref: str
@@ -173,6 +174,12 @@ class PendingExposure(DomainModel):
     shares: int = Field(ge=0)
     template: Template
 
+    @model_validator(mode="after")
+    def _stop_below_entry(self) -> PendingExposure:
+        if self.stop_price >= self.entry_price:
+            raise ValueError("stop_price must be below entry_price")
+        return self
+
 
 class PositionState(DomainModel):
     ts_code: str
@@ -209,13 +216,11 @@ class AccountState(DomainModel):
         if equity <= 0:
             return 0.0
         open_risk = sum(
-            max(0.0, float(position.current_price - position.current_stop))
-            * position.shares
+            max(0.0, float(position.current_price - position.current_stop)) * position.shares
             for position in self.positions
         )
         pending_risk = sum(
-            max(0.0, float(exposure.entry_price - exposure.stop_price))
-            * exposure.shares
+            max(0.0, float(exposure.entry_price - exposure.stop_price)) * exposure.shares
             for exposure in self.pending_plans
         )
         return (open_risk + pending_risk) / equity
@@ -239,3 +244,9 @@ class TradePlan(DomainModel):
     data_version: str
     code_version: str
     reasons: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _entry_above_stop(self) -> TradePlan:
+        if self.entry_plan.entry_price <= self.stop_plan.initial_stop:
+            raise ValueError("entry price must be above initial stop")
+        return self
