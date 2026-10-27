@@ -20,7 +20,7 @@ _REFERENCE_NAMES = (
     "index_classify",
     "index_member",
 )
-_MAX_REFRESH_LOOKBACK = timedelta(days=365 * 5)
+_MAX_RE_PULL_DAYS = 365 * 10
 
 
 class SyncError(RuntimeError):
@@ -77,22 +77,35 @@ class SyncService:
         self.store = store
         self.reference_degraded: list[str] = []
 
-    def sync_reference(self, start: date, end: date) -> dict[str, int]:
+    def sync_reference(
+        self, start: date, end: date, strict_calendar: bool = False
+    ) -> dict[str, int]:
+        if start > end:
+            raise ValueError("start must be on or before end")
         self.reference_degraded = []
         existing_calendar = self.store.read_reference("trade_cal")
+        fetch_failed = False
         try:
             fresh_calendar = self._fetch_trade_cal(start, end)
         except Exception as exc:
-            if existing_calendar.is_empty():
+            if strict_calendar or existing_calendar.is_empty():
                 raise SyncError(
                     f"critical endpoint trade_cal failed: {exc}"
                 ) from exc
             self.reference_degraded.append(f"trade_cal unavailable: {exc}")
             fresh_calendar = pl.DataFrame()
+            fetch_failed = True
+
+        if not fetch_failed and fresh_calendar.is_empty():
+            if strict_calendar:
+                raise SyncError("critical endpoint trade_cal returned no rows")
+            self.reference_degraded.append("trade_cal returned no rows")
 
         calendar = _merge_trade_cal(existing_calendar, fresh_calendar)
         if calendar.is_empty():
             raise SyncError("critical endpoint trade_cal returned no rows")
+        if strict_calendar:
+            self._check_calendar_coverage(calendar, start, end)
 
         try:
             stock_basic = self._fetch_stock_basic()
@@ -174,15 +187,17 @@ class SyncService:
     def backfill(
         self, start: date, end: date, force: bool = False
     ) -> list[SyncResult]:
-        self.sync_reference(start, end)
+        if start > end:
+            raise ValueError("start must be on or before end")
+        self.sync_reference(start, end, strict_calendar=True)
         calendar = self.store.read_reference("trade_cal")
         if calendar.is_empty():
             raise SyncError("trade_cal is empty; cannot backfill")
-        open_dates = sorted(
+        open_dates = [
             trade_date
             for trade_date in self._calendar_open_dates(calendar)
             if start <= trade_date <= end
-        )
+        ]
         results: list[SyncResult] = []
         for trade_date in open_dates:
             if not force and self.store.read_manifest(trade_date) is not None:
@@ -193,8 +208,19 @@ class SyncService:
     def sync_incremental(
         self, as_of: date, re_pull_days: int = 5
     ) -> list[SyncResult]:
-        if re_pull_days < 0:
-            raise ValueError("re_pull_days must be non-negative")
+        """Refresh references and sync missing/recent open days up to as_of.
+
+        The calendar refresh starts the day after the last stored open date
+        (or ``as_of - re_pull_days`` when earlier), fetched in yearly chunks so
+        long gaps are filled rather than truncated. After a large gap this can
+        serially sync many missing days; run a full backfill instead when
+        bootstrapping a long history.
+        """
+        if not 0 <= re_pull_days <= _MAX_RE_PULL_DAYS:
+            raise ValueError(
+                f"re_pull_days must be between 0 and {_MAX_RE_PULL_DAYS}; "
+                "use backfill for longer history"
+            )
         self.reference_degraded = []
         stored_calendar = self.store.read_reference("trade_cal")
         if stored_calendar.is_empty():
@@ -207,8 +233,6 @@ class SyncService:
         refresh_start = as_of - timedelta(days=re_pull_days)
         if last_open_date is not None:
             refresh_start = min(refresh_start, last_open_date + timedelta(days=1))
-        refresh_start = max(refresh_start, as_of - _MAX_REFRESH_LOOKBACK)
-        refresh_start = min(refresh_start, as_of)
 
         self.sync_reference(refresh_start, as_of)
 
@@ -217,11 +241,11 @@ class SyncService:
             raise SyncError(
                 "trade_cal is empty; run sync_reference/backfill first"
             )
-        open_dates = sorted(
+        open_dates = [
             trade_date
             for trade_date in self._calendar_open_dates(calendar)
             if trade_date <= as_of
-        )
+        ]
         missing_days = [
             trade_date
             for trade_date in open_dates
@@ -240,7 +264,23 @@ class SyncService:
             raise SyncError(
                 "trade_cal contains null cal_date values for open days"
             )
-        return open_calendar["cal_date"].to_list()
+        return sorted(set(open_calendar["cal_date"].to_list()))
+
+    def _check_calendar_coverage(
+        self, calendar: pl.DataFrame, start: date, end: date
+    ) -> None:
+        if "cal_date" not in calendar.columns:
+            raise SyncError("trade_cal is missing cal_date")
+        earliest = calendar["cal_date"].min()
+        latest = calendar["cal_date"].max()
+        if not isinstance(earliest, date) or earliest > start:
+            raise SyncError(
+                f"trade_cal does not cover start boundary {start.isoformat()}"
+            )
+        if not isinstance(latest, date) or latest < end:
+            raise SyncError(
+                f"trade_cal does not cover end boundary {end.isoformat()}"
+            )
 
     def _fetch_trade_cal(self, start: date, end: date) -> pl.DataFrame:
         frames: list[pl.DataFrame] = []

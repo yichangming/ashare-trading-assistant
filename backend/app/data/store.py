@@ -117,8 +117,12 @@ class ParquetStore:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 return None
-            DataManifest.model_validate(payload)
+            manifest = DataManifest.model_validate(payload)
         except (OSError, ValueError):
+            return None
+        if not manifest.data_version:
+            return None
+        if manifest.trade_date != trade_date:
             return None
         return payload
 
