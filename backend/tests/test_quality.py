@@ -153,3 +153,229 @@ def test_invalid_values_fail(column: str, values: list[float | None], message: s
     report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
     assert not report.passed
     assert any(message in item for item in report.failures)
+
+
+def test_missing_required_columns_fail():
+    report = DataQualityGate().check(
+        date(2024, 1, 2), _bars().drop("adj_factor"), expected_count=2
+    )
+    assert not report.passed
+    assert any(
+        "missing required columns: adj_factor" in item for item in report.failures
+    )
+    assert "missing_required_columns" in report.failure_codes
+
+
+def test_zero_column_empty_frame_fails_without_crashing():
+    report = DataQualityGate().check(
+        date(2024, 1, 2), pl.DataFrame(), expected_count=2
+    )
+    assert not report.passed
+    assert report.coverage == 0.0
+    assert "bars_empty" in report.failure_codes
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close", "vol", "amount"])
+def test_null_market_data_fails(column: str):
+    values = _bars()[column].to_list()
+    values[1] = None
+    bars = _bars().with_columns(pl.Series(column, values))
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("null OHLCV rows: 1" in item for item in report.failures)
+    assert "null_ohlcv" in report.failure_codes
+
+
+@pytest.mark.parametrize("column", ["adj_factor", "vol", "amount"])
+def test_non_finite_market_data_fails(column: str):
+    values = _bars()[column].to_list()
+    values[1] = float("nan")
+    bars = _bars().with_columns(pl.Series(column, values))
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("non-finite OHLCV rows: 1" in item for item in report.failures)
+    assert "non_finite_ohlcv" in report.failure_codes
+
+
+@pytest.mark.parametrize("column", ["open", "high", "low", "close"])
+@pytest.mark.parametrize("value", [0.0, -1.0])
+def test_non_positive_prices_fail(column: str, value: float):
+    values = _bars()[column].to_list()
+    values[0] = value
+    bars = _bars().with_columns(pl.Series(column, values))
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("non-positive prices: 1" in item for item in report.failures)
+    assert "non_positive_price" in report.failure_codes
+
+
+def test_zero_volume_and_amount_allowed():
+    bars = _bars().with_columns(
+        pl.Series("vol", [0.0, 0.0]), pl.Series("amount", [0.0, 0.0])
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert report.passed
+    assert "negative_volume_amount" not in report.failure_codes
+
+
+def test_multiple_trade_dates_fail():
+    bars = _bars().with_columns(
+        pl.Series("trade_date", [date(2024, 1, 2), date(2024, 1, 3)])
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("multiple trade dates" in item for item in report.failures)
+    assert "multiple_trade_dates" in report.failure_codes
+    assert report.coverage == 1.0
+
+
+def test_wrong_trade_date_fails():
+    bars = _bars().with_columns(pl.Series("trade_date", [date(2024, 1, 3)] * 2))
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("trade_date mismatch" in item for item in report.failures)
+    assert "trade_date_mismatch" in report.failure_codes
+
+
+def test_duplicate_rows_fail_and_coverage_uses_unique_codes():
+    bars = pl.concat([_bars(), _bars().head(1)])
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert "duplicate_rows" in report.failure_codes
+    # Raw row height would give 1.5; unique ts_code coverage is 1.0.
+    assert report.coverage == 1.0
+
+
+def test_expected_count_unavailable_fails():
+    report = DataQualityGate().check(date(2024, 1, 2), _bars(), expected_count=0)
+    assert not report.passed
+    assert "expected_universe_unavailable" in report.failure_codes
+    assert report.coverage == 0.0
+
+
+def test_coverage_above_one_fails():
+    report = DataQualityGate().check(date(2024, 1, 2), _bars(), expected_count=1)
+    assert not report.passed
+    assert "coverage_exceeds_one" in report.failure_codes
+
+
+def test_suspended_rows_exempt_from_null_limit_failure():
+    partly_suspended = _bars().with_columns(
+        pl.Series("up_limit", [None, None]),
+        pl.Series("is_suspended", [True, False]),
+    )
+    report = DataQualityGate().check(
+        date(2024, 1, 2), partly_suspended, expected_count=2
+    )
+    assert not report.passed
+    assert any("null limit prices: 1" in item for item in report.failures)
+    assert "null_limit_prices" in report.failure_codes
+
+    fully_suspended = _bars().with_columns(
+        pl.Series("up_limit", [None, None]),
+        pl.Series("is_suspended", [True, True]),
+    )
+    assert DataQualityGate().check(
+        date(2024, 1, 2), fully_suspended, expected_count=2
+    ).passed
+
+
+def test_partial_limit_columns_fail_and_remaining_column_checked():
+    bars = _bars().drop("down_limit").with_columns(
+        pl.Series("up_limit", [9.0, None])
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("partial limit columns" in item for item in report.failures)
+    assert "partial_limit_columns" in report.failure_codes
+    assert any("null limit prices: 1" in item for item in report.failures)
+    assert any("limit price mismatches: 1/2" in item for item in report.failures)
+    assert "limit_price_mismatch" in report.failure_codes
+
+
+def test_integer_limit_derived_column_warns():
+    bars = _bars().with_columns(
+        pl.Series("limit_derived", [1, None], dtype=pl.Int64)
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert report.passed
+    assert any("limit prices derived for 1 rows" in item for item in report.warnings)
+    assert "limit_prices_derived" in report.warning_codes
+
+
+def _sentiment() -> dict:
+    return {
+        "trade_date": date(2024, 1, 2),
+        "limit_up_count": 10,
+        "limit_down_count": 2,
+        "max_board_height": 3,
+        "promotion_rate": 0.5,
+        "blow_rate": 0.1,
+        "red_rate": 0.6,
+        "limit_up_premium": 0.02,
+    }
+
+
+def test_sentiment_missing_trade_date_fails():
+    snapshot = _sentiment()
+    snapshot.pop("trade_date")
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("trade_date" in item for item in report.failures)
+    assert "missing_sentiment_field" in report.failure_codes
+    assert report.coverage == 1.0
+
+
+def test_sentiment_invalid_trade_date_fails():
+    snapshot = _sentiment()
+    snapshot["trade_date"] = "2024-01-02"
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("trade_date" in item for item in report.failures)
+    assert "invalid_sentiment_field" in report.failure_codes
+
+
+def test_sentiment_invalid_values_fail():
+    snapshot = _sentiment()
+    snapshot.update(
+        {
+            "limit_up_count": "10",
+            "promotion_rate": float("nan"),
+            "red_rate": 1.5,
+        }
+    )
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("limit_up_count" in item for item in report.failures)
+    assert any("promotion_rate" in item for item in report.failures)
+    assert any("red_rate" in item for item in report.failures)
+    assert "invalid_sentiment_field" in report.failure_codes
+    assert report.coverage == 4 / 7
+
+
+def test_sentiment_out_of_range_values_fail():
+    snapshot = _sentiment()
+    snapshot.update(
+        {"limit_down_count": -1, "max_board_height": -2, "blow_rate": 1.2}
+    )
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("limit_down_count" in item for item in report.failures)
+    assert any("max_board_height" in item for item in report.failures)
+    assert any("blow_rate" in item for item in report.failures)
+    assert report.coverage == 4 / 7
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "field"),
+    [
+        ({"min_coverage": 1.1}, "min_coverage"),
+        ({"min_coverage": -0.01}, "min_coverage"),
+        ({"min_coverage": float("nan")}, "min_coverage"),
+        ({"max_limit_mismatch_pct": 2.0}, "max_limit_mismatch_pct"),
+        ({"max_limit_mismatch_pct": -1.0}, "max_limit_mismatch_pct"),
+    ],
+)
+def test_invalid_thresholds_raise(kwargs: dict, field: str):
+    with pytest.raises(ValueError, match=field):
+        DataQualityGate(**kwargs)
