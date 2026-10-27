@@ -51,9 +51,17 @@ class RiskGovernor:
     A plan correlated above ``config.risk.correlation_threshold`` with an
     existing position, a pending plan, or an already-approved plan in the
     batch is rejected, so the higher-priority plan is retained.  Correlation
-    is symmetric; a value supplied in either direction is honoured.
+    is symmetric; a value supplied in either direction is honoured.  In the
+    START stage Template B priority wins over the general higher-score rule,
+    so a B plan is retained over a correlated A plan even when the A plan
+    scores higher.  Pairwise correlation values must be supplied by the
+    caller; the governor never computes them (Task 17).  Durable latch
+    persistence and the manual-restart surface are also out of scope here
+    (Task 18).
 
-    Size reductions name the binding cap in ``RiskDecision.reasons``.
+    Size reductions name the binding cap in ``RiskDecision.reasons``.  When
+    ``correlations`` is not supplied, an approval is labelled
+    ``"correlation unavailable"`` rather than claiming every check passed.
     """
 
     def apply(
@@ -70,19 +78,20 @@ class RiskGovernor:
         ordered = sorted(plans, key=lambda plan: self._priority(plan, regime))
         working = account
         approved_codes: set[str] = set()
-        seen_codes: set[str] = {
-            item.ts_code for item in account.positions
-        } | {item.ts_code for item in account.pending_plans}
         output: list[TradePlan] = []
 
         for plan in ordered:
             code = plan.candidate.ts_code
-            if code in seen_codes:
+            held_codes = (
+                {item.ts_code for item in working.positions}
+                | {item.ts_code for item in working.pending_plans}
+                | approved_codes
+            )
+            if code in held_codes:
                 output.append(self._reject(plan, f"duplicate plan for {code}"))
                 continue
-            seen_codes.add(code)
 
-            invalid = self._invalid_plan_reason(plan)
+            invalid = self._invalid_plan_reason(plan, regime)
             if invalid is not None:
                 output.append(self._reject(plan, invalid))
                 continue
@@ -102,6 +111,11 @@ class RiskGovernor:
                 continue
             if not policy.enabled:
                 output.append(self._reject(plan, "template disabled"))
+                continue
+            if policy.mode == "observe":
+                output.append(
+                    self._reject(plan, "template in observe mode")
+                )
                 continue
 
             positions = working.positions
@@ -128,12 +142,19 @@ class RiskGovernor:
                 ) + sum(
                     1 for item in pending if item.template == Template.B
                 )
-                b_limit = min(
-                    config.risk.max_b_positions, policy.max_positions
-                )
+                config_limit = config.risk.max_b_positions
+                policy_limit = policy.max_positions
+                b_limit = min(config_limit, policy_limit)
                 if b_count >= b_limit:
+                    binding_source = (
+                        "config" if config_limit <= policy_limit else "policy"
+                    )
                     output.append(
-                        self._reject(plan, "max B policy positions reached")
+                        self._reject(
+                            plan,
+                            f"max B positions reached: config {config_limit}, "
+                            f"policy {policy_limit} ({binding_source} binds)",
+                        )
                     )
                     continue
             else:
@@ -171,8 +192,13 @@ class RiskGovernor:
                 continue
             shares, binding_caps = capped
             if shares < 100:
+                caps = ", ".join(binding_caps) if binding_caps else "none"
                 output.append(
-                    self._reject(plan, "position below one lot after caps")
+                    self._reject(
+                        plan,
+                        f"position below one lot after caps: {shares} shares "
+                        f"remaining; binding caps: {caps}",
+                    )
                 )
                 continue
 
@@ -183,6 +209,11 @@ class RiskGovernor:
                         f"{name} reduced size" for name in binding_caps
                     ],
                     adjusted_shares=shares,
+                )
+            elif correlations is None:
+                decision = RiskDecision(
+                    outcome=RiskOutcome.APPROVE,
+                    reasons=["correlation unavailable"],
                 )
             else:
                 decision = RiskDecision(
@@ -200,6 +231,7 @@ class RiskGovernor:
                     "shares": shares,
                     "position_value": position_value,
                     "position_pct": float(position_value) / float(equity),
+                    "heat_before": working.heat,
                     "heat_after": heat_after,
                 }
             )
@@ -299,9 +331,22 @@ class RiskGovernor:
         return proposed
 
     @staticmethod
-    def _invalid_plan_reason(plan: TradePlan) -> str | None:
+    def _invalid_plan_reason(
+        plan: TradePlan, regime: MarketRegime
+    ) -> str | None:
+        if plan.status != PlanStatus.DRAFT:
+            return f"invalid plan: status {plan.status} is not DRAFT"
+        if plan.expires_on < regime.trade_date:
+            return f"invalid plan: expired on {plan.expires_on}"
+        if plan.position_plan.template != plan.candidate.template:
+            return (
+                "invalid plan: position template does not match "
+                "candidate template"
+            )
         if plan.position_plan.shares <= 0:
             return "invalid plan: shares must be positive"
+        if plan.position_plan.shares % 100 != 0:
+            return "invalid plan: shares must be a multiple of 100"
         position_value = plan.position_plan.position_value
         if not position_value.is_finite() or position_value <= 0:
             return "invalid plan: position value must be positive"
@@ -367,14 +412,16 @@ class RiskGovernor:
         return drawdown >= _dec(config.risk.drawdown_stop_at)
 
     @staticmethod
-    def _priority(plan: TradePlan, regime: MarketRegime) -> tuple[int, float]:
+    def _priority(
+        plan: TradePlan, regime: MarketRegime
+    ) -> tuple[int, float, str]:
         score = -plan.candidate.score
         if (
             regime.sentiment_stage == SentimentStage.START
             and plan.candidate.template == Template.B
         ):
-            return (0, score)
-        return (1, score)
+            return (0, score, plan.candidate.ts_code)
+        return (1, score, plan.candidate.ts_code)
 
     @staticmethod
     def _reject(plan: TradePlan, reason: str) -> TradePlan:

@@ -58,7 +58,9 @@ class PositionSizer:
     global slots, template slots, industry slots, cash, exposure, and heat.
     Global slots are bounded by ``config.risk.max_positions``; Template A is
     bounded by its regime policy, while Template B is bounded by
-    ``min(config.risk.max_b_positions, policy.max_positions)``.  A drawdown of
+    ``min(config.risk.max_b_positions, policy.max_positions)``.  Policies
+    whose mode is ``"observe"`` reject even when ``enabled`` is true.  A
+    drawdown of
     at least ``drawdown_stop_at`` rejects; one of at least
     ``drawdown_half_at`` halves the risk budget.  A set
     ``AccountState.trading_halted`` latch rejects even when the instantaneous
@@ -136,6 +138,10 @@ class PositionSizer:
         if not policy.enabled:
             raise PositionRejectedError(
                 f"{candidate.template} template is disabled by regime policy"
+            )
+        if policy.mode == "observe":
+            raise PositionRejectedError(
+                f"{candidate.template} template is in observe mode"
             )
 
         factor_value = regime.risk_factor

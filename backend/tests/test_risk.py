@@ -559,7 +559,31 @@ def test_b_policy_cap_below_config_max_applies_across_batch():
     assert len(approved) == 1
     assert approved[0].candidate.ts_code == "000100.SZ"
     assert len(rejected) == 1
-    assert "max B policy" in _reasons(rejected[0])[0]
+    reason = _reasons(rejected[0])[0]
+    assert "max B positions" in reason
+    assert "config 2" in reason
+    assert "policy 1" in reason
+    assert "policy binds" in reason
+
+
+def test_b_cap_reason_names_config_binding_source():
+    config = load_strategy_config()
+    regime = _regime(
+        b=TemplatePolicy(enabled=True, mode="normal", max_positions=3)
+    )
+    plans = [
+        _plan(f"00012{i}.SZ", f"行业{i}", template=Template.B, score=90 - i)
+        for i in range(3)
+    ]
+    result = _apply(plans, regime=regime, config=config)
+    rejected = [
+        plan for plan in result if plan.status == PlanStatus.REJECTED
+    ]
+    assert len(rejected) == 1
+    reason = _reasons(rejected[0])[0]
+    assert "config 2" in reason
+    assert "policy 3" in reason
+    assert "config binds" in reason
 
 
 def test_b_config_cap_applies_when_policy_allows_more():
@@ -622,6 +646,29 @@ def test_missing_template_policy_rejects():
     assert "policy" in _reasons(result[0])[0]
 
 
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+def test_governor_rejects_observe_mode(template: Template):
+    observe = TemplatePolicy(enabled=True, mode="observe", max_positions=3)
+    regime = (
+        _regime(a=observe) if template == Template.A else _regime(b=observe)
+    )
+    result = _apply(
+        [_plan("000001.SZ", "银行", template=template)], regime=regime
+    )
+    assert result[0].status == PlanStatus.REJECTED
+    assert "observe" in _reasons(result[0])[0]
+
+
+@pytest.mark.parametrize("template", [Template.A, Template.B])
+def test_sizer_rejects_observe_mode(template: Template):
+    observe = TemplatePolicy(enabled=True, mode="observe", max_positions=3)
+    regime = (
+        _regime(a=observe) if template == Template.A else _regime(b=observe)
+    )
+    with pytest.raises(PositionRejectedError, match="observe"):
+        _size(_account(), regime=regime, template=template)
+
+
 def test_start_stage_gives_template_b_priority():
     config = _config_with_risk(max_positions=1)
     regime = _regime(sentiment_stage=SentimentStage.START)
@@ -633,6 +680,23 @@ def test_start_stage_gives_template_b_priority():
     by_code = {plan.candidate.ts_code: plan for plan in result}
     assert by_code["000002.SZ"].status == PlanStatus.PENDING_ENTRY
     assert by_code["000001.SZ"].status == PlanStatus.REJECTED
+
+
+def test_equal_scores_tie_break_by_ts_code():
+    config = _config_with_risk(max_positions=1)
+    # Reversed input order: deterministic priority must still prefer the
+    # lexicographically smaller ts_code.
+    plans = [
+        _plan("000002.SZ", "科技", score=90.0),
+        _plan("000001.SZ", "银行", score=90.0),
+    ]
+    result = _apply(plans, config=config)
+    assert [plan.candidate.ts_code for plan in result] == [
+        "000001.SZ",
+        "000002.SZ",
+    ]
+    assert result[0].status == PlanStatus.PENDING_ENTRY
+    assert result[1].status == PlanStatus.REJECTED
 
 
 # --- correlation -------------------------------------------------------------
@@ -678,6 +742,37 @@ def test_correlation_keeps_higher_scoring_approved_plan(
     assert by_code["000001.SZ"].status == PlanStatus.PENDING_ENTRY
     assert by_code["000002.SZ"].status == PlanStatus.REJECTED
     assert "correlation" in _reasons(by_code["000002.SZ"])[0]
+
+
+def test_start_template_priority_wins_over_score_for_correlations():
+    # Template B is processed first in START, so it wins the correlated pair
+    # even though the Template A plan scores higher.
+    regime = _regime(sentiment_stage=SentimentStage.START)
+    plans = [
+        _plan("000001.SZ", "银行", template=Template.A, score=99.0),
+        _plan("000002.SZ", "科技", template=Template.B, score=80.0),
+    ]
+    result = _apply(
+        plans,
+        regime=regime,
+        correlations={"000001.SZ": {"000002.SZ": 0.90}},
+    )
+    by_code = {plan.candidate.ts_code: plan for plan in result}
+    assert by_code["000002.SZ"].status == PlanStatus.PENDING_ENTRY
+    assert by_code["000001.SZ"].status == PlanStatus.REJECTED
+    assert "correlation" in _reasons(by_code["000001.SZ"])[0]
+
+
+def test_approval_reason_marks_correlation_unavailable():
+    result = _apply([_plan("000001.SZ", "银行")])
+    assert result[0].status == PlanStatus.PENDING_ENTRY
+    assert result[0].risk_decision.outcome == RiskOutcome.APPROVE
+    assert _reasons(result[0]) == ["correlation unavailable"]
+
+    with_correlations = _apply(
+        [_plan("000001.SZ", "银行")], correlations={}
+    )
+    assert _reasons(with_correlations[0]) == ["all checks passed"]
 
 
 def test_correlation_threshold_is_exclusive():
@@ -763,6 +858,33 @@ def test_reduce_reason_names_every_binding_cap():
         "single-position cap reduced size",
         "cash reserve reduced size",
     ]
+
+
+def test_batch_heat_before_chains_approved_plans():
+    plans = [
+        _plan("000001.SZ", "行业1", score=95.0),
+        _plan("000002.SZ", "行业2", score=90.0),
+    ]
+    result = _apply(plans)
+    assert all(plan.status == PlanStatus.PENDING_ENTRY for plan in result)
+    first, second = result
+    assert first.position_plan.heat_before == 0.0
+    assert second.position_plan.heat_before == pytest.approx(
+        first.position_plan.heat_after
+    )
+    assert second.position_plan.heat_after == pytest.approx(0.02)
+
+
+def test_below_one_lot_reason_names_caps_and_shares():
+    result = _apply(
+        [_plan("000001.SZ", "银行", shares=10_000)],
+        account=_account(cash=100_050),
+    )
+    assert result[0].status == PlanStatus.REJECTED
+    reason = _reasons(result[0])[0]
+    assert "below one lot" in reason
+    assert "0 shares remaining" in reason
+    assert "cash reserve" in reason
 
 
 # --- drawdown halt at governor level ----------------------------------------
@@ -880,6 +1002,42 @@ def test_plan_with_non_positive_prices_rejects(
     assert reason in _reasons(result[0])[0]
 
 
+def test_non_lot_aligned_shares_reject():
+    result = _apply([_plan("000001.SZ", "银行", shares=10_050)])
+    assert result[0].status == PlanStatus.REJECTED
+    assert "multiple of 100" in _reasons(result[0])[0]
+
+
+def test_position_template_mismatch_rejects():
+    plan = _plan("000001.SZ", "银行")
+    bad = plan.model_copy(
+        update={
+            "position_plan": plan.position_plan.model_copy(
+                update={"template": Template.B}
+            )
+        }
+    )
+    result = _apply([bad])
+    assert result[0].status == PlanStatus.REJECTED
+    assert "template" in _reasons(result[0])[0]
+
+
+def test_non_draft_status_rejects():
+    plan = _plan("000001.SZ", "银行")
+    bad = plan.model_copy(update={"status": PlanStatus.PENDING_ENTRY})
+    result = _apply([bad])
+    assert result[0].status == PlanStatus.REJECTED
+    assert "DRAFT" in _reasons(result[0])[0]
+
+
+def test_expired_plan_rejects():
+    plan = _plan("000001.SZ", "银行")
+    bad = plan.model_copy(update={"expires_on": date(2024, 1, 1)})
+    result = _apply([bad])
+    assert result[0].status == PlanStatus.REJECTED
+    assert "expired" in _reasons(result[0])[0]
+
+
 def test_duplicate_code_within_batch_rejects_later_plan():
     plans = [
         _plan("000001.SZ", "银行", score=95.0),
@@ -899,3 +1057,27 @@ def test_duplicate_code_with_existing_position_rejects():
     )
     assert result[0].status == PlanStatus.REJECTED
     assert "duplicate" in _reasons(result[0])[0]
+
+
+def test_disabled_first_plan_does_not_block_later_valid_plan():
+    regime = _regime(
+        a=TemplatePolicy(enabled=False, mode="observe", max_positions=0)
+    )
+    plans = [
+        _plan("000001.SZ", "银行", template=Template.A),
+        _plan("000001.SZ", "银行", template=Template.B),
+    ]
+    result = _apply(plans, regime=regime)
+    by_template = {plan.candidate.template: plan for plan in result}
+    assert by_template[Template.A].status == PlanStatus.REJECTED
+    assert by_template[Template.B].status == PlanStatus.PENDING_ENTRY
+
+
+def test_invalid_first_plan_does_not_block_later_valid_plan():
+    plans = [
+        _plan("000001.SZ", "银行", shares=0),
+        _plan("000001.SZ", "银行", shares=10_000),
+    ]
+    result = _apply(plans)
+    assert result[0].status == PlanStatus.REJECTED
+    assert result[1].status == PlanStatus.PENDING_ENTRY
