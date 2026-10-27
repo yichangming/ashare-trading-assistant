@@ -1,9 +1,11 @@
 from datetime import date, timedelta
 
 import polars as pl
+import pytest
 
 from app.core.calendar import TradingCalendar
 from app.core.config import load_strategy_config
+from app.core.errors import DataNotReadyError
 from app.data.universe import UniverseBuilder
 
 
@@ -42,6 +44,65 @@ def test_universe_excludes_st_new_and_suspended():
 def _calendar() -> TradingCalendar:
     return TradingCalendar(
         [date(2023, 1, 1) + timedelta(days=i) for i in range(400)]
+    )
+
+
+def _weekday_calendar(days: int) -> tuple[TradingCalendar, list[date]]:
+    dates: list[date] = []
+    current = date(2023, 1, 2)
+    while len(dates) < days:
+        if current.weekday() < 5:
+            dates.append(current)
+        current += timedelta(days=1)
+    return TradingCalendar(dates), dates
+
+
+def _features_frame(
+    codes: list[str],
+    *,
+    trade_date: date,
+    close: list[float] | None = None,
+    amount: list[float] | None = None,
+    suspended: list[bool] | None = None,
+) -> pl.DataFrame:
+    size = len(codes)
+    return pl.DataFrame(
+        {
+            "ts_code": codes,
+            "trade_date": [trade_date] * size,
+            "close": close if close is not None else [10.0] * size,
+            "amount_20d_avg": amount if amount is not None else [2e8] * size,
+            "is_suspended": (
+                suspended if suspended is not None else [False] * size
+            ),
+        }
+    )
+
+
+def _stocks_frame(
+    codes: list[str],
+    *,
+    names: list[str] | None = None,
+    markets: list[str] | None = None,
+    list_dates: list[date] | None = None,
+    delist_dates: list[date | None] | None = None,
+) -> pl.DataFrame:
+    size = len(codes)
+    return pl.DataFrame(
+        {
+            "ts_code": codes,
+            "name": names if names is not None else ["正常公司"] * size,
+            "market": markets if markets is not None else ["主板"] * size,
+            "industry": ["银行"] * size,
+            "list_date": (
+                list_dates
+                if list_dates is not None
+                else [date(2000, 1, 1)] * size
+            ),
+            "delist_date": (
+                delist_dates if delist_dates is not None else [None] * size
+            ),
+        }
     )
 
 
@@ -112,3 +173,177 @@ def test_universe_falls_back_to_current_name_without_namechange():
         as_of, features, stocks, pl.DataFrame(), config
     )
     assert universe.is_empty()
+
+
+def test_universe_board_amount_and_price_filters():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    codes = [
+        "600030.SH",
+        "600031.SH",
+        "600032.SH",
+        "600033.SH",
+        "600034.SH",
+        "600035.SH",
+    ]
+    features = _features_frame(
+        codes,
+        trade_date=as_of,
+        close=[10.0, 10.0, 10.0, 10.0, 2.99, 3.00],
+        amount=[2e8, 2e8, 99_999_999.99, 100_000_000.0, 2e8, 2e8],
+    )
+    stocks = _stocks_frame(
+        codes,
+        markets=["创业板", "科创板", "主板", "主板", "主板", "主板"],
+    )
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, pl.DataFrame(), config
+    )
+    assert universe["ts_code"].to_list() == [
+        "600030.SH",
+        "600033.SH",
+        "600035.SH",
+    ]
+
+
+def test_universe_ignores_namechange_starting_after_as_of():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600040.SH"], trade_date=as_of)
+    stocks = _stocks_frame(["600040.SH"], names=["ST某某"])
+    namechange = pl.DataFrame(
+        {
+            "ts_code": ["600040.SH"],
+            "name": ["ST某某"],
+            "start_date": [as_of + timedelta(days=1)],
+            "end_date": [None],
+        }
+    )
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, namechange, config
+    )
+    assert universe["ts_code"].to_list() == ["600040.SH"]
+
+
+def test_universe_dedupes_stock_rows():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600001.SH"], trade_date=as_of)
+    stocks = _stocks_frame(["600001.SH"])
+    duplicated = pl.concat([stocks, stocks])
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, duplicated, pl.DataFrame(), config
+    )
+    assert universe.height == 1
+
+
+def test_universe_empty_features_preserves_schema():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600001.SH"], trade_date=as_of).head(0)
+    stocks = _stocks_frame(["600001.SH"])
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, pl.DataFrame(), config
+    )
+    assert universe.is_empty()
+    assert universe.columns == [*features.columns, "listing_days", "is_st"]
+    assert universe.schema["listing_days"] == pl.Int64
+    assert universe.schema["is_st"] == pl.Boolean
+
+
+def test_universe_filters_features_to_as_of():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    stale = _features_frame(
+        ["600001.SH"], trade_date=as_of - timedelta(days=1)
+    )
+    current = _features_frame(["600001.SH"], trade_date=as_of)
+    features = pl.concat([stale, current])
+    stocks = _stocks_frame(["600001.SH"])
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, pl.DataFrame(), config
+    )
+    assert universe.height == 1
+    assert universe["trade_date"].to_list() == [as_of]
+
+
+def test_universe_respects_delist_date():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    codes = ["600010.SH", "600011.SH", "600012.SH"]
+    features = _features_frame(codes, trade_date=as_of)
+    stocks = _stocks_frame(
+        codes,
+        delist_dates=[as_of, as_of + timedelta(days=1), None],
+    )
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, pl.DataFrame(), config
+    )
+    assert universe["ts_code"].to_list() == ["600011.SH", "600012.SH"]
+
+
+def test_universe_listing_day_boundary():
+    config = load_strategy_config()
+    calendar, dates = _weekday_calendar(130)
+    as_of = dates[-1]
+    codes = ["600020.SH", "600021.SH"]
+    features = _features_frame(codes, trade_date=as_of)
+    stocks = _stocks_frame(
+        codes, list_dates=[dates[-120], dates[-119]]
+    )
+    universe = UniverseBuilder(calendar).build(
+        as_of, features, stocks, pl.DataFrame(), config
+    )
+    assert universe["ts_code"].to_list() == ["600020.SH"]
+
+
+def test_universe_requires_calendar_coverage():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600001.SH"], trade_date=as_of)
+    stocks = _stocks_frame(["600001.SH"])
+    with pytest.raises(DataNotReadyError, match="calendar"):
+        UniverseBuilder(TradingCalendar([as_of])).build(
+            as_of, features, stocks, pl.DataFrame(), config
+        )
+    with pytest.raises(DataNotReadyError, match="calendar"):
+        UniverseBuilder(TradingCalendar([])).build(
+            as_of, features, stocks, pl.DataFrame(), config
+        )
+
+
+def test_universe_parses_string_namechange_dates():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600050.SH"], trade_date=as_of)
+    stocks = _stocks_frame(["600050.SH"])
+    namechange = pl.DataFrame(
+        {
+            "ts_code": ["600050.SH"],
+            "name": ["ST某某"],
+            "start_date": ["20220101"],
+            "end_date": ["20241231"],
+        }
+    )
+    universe = UniverseBuilder(_calendar()).build(
+        as_of, features, stocks, namechange, config
+    )
+    assert universe.is_empty()
+
+
+def test_universe_rejects_namechange_missing_end_date():
+    config = load_strategy_config()
+    as_of = date(2024, 1, 2)
+    features = _features_frame(["600050.SH"], trade_date=as_of)
+    stocks = _stocks_frame(["600050.SH"])
+    namechange = pl.DataFrame(
+        {
+            "ts_code": ["600050.SH"],
+            "name": ["ST某某"],
+            "start_date": [date(2022, 1, 1)],
+        }
+    )
+    with pytest.raises(ValueError, match="end_date"):
+        UniverseBuilder(_calendar()).build(
+            as_of, features, stocks, namechange, config
+        )

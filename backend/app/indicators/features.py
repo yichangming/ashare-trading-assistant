@@ -4,6 +4,19 @@ from datetime import date
 
 import polars as pl
 
+_HELPER_COLUMNS = [
+    "_row_idx",
+    "tr1",
+    "tr2",
+    "tr3",
+    "true_range",
+    "lu_reset",
+    "last_limit_up_idx",
+    "last_high_idx",
+    "hfq_open",
+    "high_20d",
+]
+
 
 class FeatureBuilder:
     def __init__(self, atr_window: int = 14):
@@ -133,18 +146,32 @@ class FeatureBuilder:
         )
 
         frame = frame.with_columns(
-            (pl.col("close") >= pl.col("up_limit") - 0.001).alias(
-                "is_limit_up"
-            ),
-            (pl.col("close") <= pl.col("down_limit") + 0.001).alias(
-                "is_limit_down"
-            ),
-            (pl.col("high") >= pl.col("up_limit") - 0.001).alias(
-                "touched_limit_up"
-            ),
+            (
+                (pl.col("up_limit") > 0)
+                & (pl.col("close") >= pl.col("up_limit") - 0.001)
+            )
+            .fill_null(False)
+            .alias("is_limit_up"),
+            (
+                (pl.col("down_limit") > 0)
+                & (pl.col("close") <= pl.col("down_limit") + 0.001)
+            )
+            .fill_null(False)
+            .alias("is_limit_down"),
+            (
+                (pl.col("up_limit") > 0)
+                & (pl.col("high") >= pl.col("up_limit") - 0.001)
+            )
+            .fill_null(False)
+            .alias("touched_limit_up"),
+        )
+        prev_close = (
+            pl.col("pre_close")
+            if "pre_close" in frame.columns
+            else pl.col("close").shift(1).over("ts_code")
         )
         frame = frame.with_columns(
-            pl.col("close").shift(1).over("ts_code").alias("prev_close"),
+            prev_close.alias("prev_close"),
             pl.col("is_limit_up").shift(1).over("ts_code").alias(
                 "prev_is_limit_up"
             ),
@@ -195,10 +222,15 @@ class FeatureBuilder:
         day_range = pl.col("high") - pl.col("low")
         frame = frame.with_columns(
             (
-                (pl.col("close") > pl.col("open"))
-                | (lower_shadow >= body)
-                | (pl.col("close") >= pl.col("low") + 0.5 * day_range)
-            ).alias("stabilization"),
+                (pl.col("high") != pl.col("low"))
+                & (
+                    (pl.col("close") > pl.col("open"))
+                    | (lower_shadow >= body)
+                    | (pl.col("close") >= pl.col("low") + 0.5 * day_range)
+                )
+            )
+            .fill_null(False)
+            .alias("stabilization"),
             (pl.col("high") == pl.col("low")).alias("one_word"),
             (pl.col("ma20") - pl.col("ma20").shift(10).over("ts_code")).alias(
                 "ma20_slope"
@@ -206,11 +238,10 @@ class FeatureBuilder:
         )
 
         asof = frame.filter(pl.col("trade_date") == as_of)
-        if asof.is_empty():
-            return asof
         asof = asof.with_columns(
-            (pl.col("ret_20d").rank("average") / pl.len()).alias(
-                "rs_20d_market"
-            )
+            (
+                pl.col("ret_20d").rank("average")
+                / pl.col("ret_20d").count()
+            ).alias("rs_20d_market")
         )
-        return asof
+        return asof.drop(_HELPER_COLUMNS)
