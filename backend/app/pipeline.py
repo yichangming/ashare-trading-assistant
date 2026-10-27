@@ -187,21 +187,25 @@ class TradingPipeline:
         degraded: list[str] = []
         as_of_bars = bars.filter(pl.col("trade_date") == as_of)
         # A suspended stock is legitimately absent from Tushare ``daily``.
-        # When ``suspend_d`` partitions are available, remove exactly those
-        # codes from the expected universe so the exact-code check neither
-        # reports them missing nor rejects their absence.  When the optional
-        # suspend endpoint is unavailable or empty, do not fabricate an exact
-        # universe: fall back to count-based coverage against all listed
-        # names, where the 99% threshold tolerates a small suspended cohort.
+        # ``load_suspend`` returns ``None`` only when no raw ``suspend_d``
+        # partition exists at all; that means the optional endpoint has not
+        # been synced, so fall back to count-based coverage against all listed
+        # names where the 99% threshold tolerates a small suspended cohort.
+        # A typed empty frame instead means a partition exists but has no S
+        # rows (R-only or a zero-suspension day): the exact expected universe
+        # is known and the exact-code check stays active.
         suspend = self.provider.load_suspend(as_of, as_of)
-        if not suspend.is_empty() and "ts_code" in suspend.columns:
-            suspended_codes = set(suspend["ts_code"].drop_nulls().to_list())
-            exact_codes = set(stocks["ts_code"].to_list()) - suspended_codes
-            expected_codes: set[str] | None = exact_codes
-            expected_count = len(exact_codes)
-        else:
-            expected_codes = None
+        if suspend is None:
+            expected_codes: set[str] | None = None
             expected_count = len(stocks)
+        else:
+            suspended_codes = (
+                set(suspend["ts_code"].drop_nulls().to_list())
+                if "ts_code" in suspend.columns
+                else set()
+            )
+            expected_codes = set(stocks["ts_code"].to_list()) - suspended_codes
+            expected_count = len(expected_codes)
         quality = DataQualityGate().check(
             as_of,
             as_of_bars,

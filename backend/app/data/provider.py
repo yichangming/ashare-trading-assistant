@@ -53,29 +53,36 @@ class ParquetMarketDataProvider:
     def load_bars(self, start: date, end: date) -> pl.DataFrame:
         return self.store.read_processed("bars", start, end)
 
-    def load_suspend(self, start: date, end: date) -> pl.DataFrame:
+    def load_suspend(self, start: date, end: date) -> pl.DataFrame | None:
         """Load ``suspend_d`` raw partitions for ``[start, end]``.
 
-        Returns only ``suspend_type == "S"`` rows when the column is present,
-        with ``trade_date`` normalized to :class:`polars.Date`.  An empty,
-        typed frame signals that the optional endpoint is unavailable or has
-        no usable rows, which lets callers fall back to count-based coverage.
+        Returns ``None`` only when no raw partition exists anywhere in the
+        requested range, which signals that the optional endpoint has not been
+        synced.  When at least one partition exists, returns a typed frame
+        containing only ``suspend_type == "S"`` rows; the result may be empty
+        (for example an R-only or zero-suspension day), which means the exact
+        expected universe is known and has no suspended names.  ``trade_date``
+        is normalized to :class:`polars.Date`.
         """
         if start > end:
-            return _empty_suspend()
+            return None
+        partition_exists = False
         frames: list[pl.DataFrame] = []
         current = start
         while current <= end:
-            frame = self.store.read_raw(
-                "suspend_d", current.strftime("%Y%m%d")
-            )
-            if not frame.is_empty():
-                frames.append(frame)
+            key = current.strftime("%Y%m%d")
+            if self.store.raw_path("suspend_d", key).exists():
+                partition_exists = True
+                frame = self.store.read_raw("suspend_d", key)
+                if not frame.is_empty():
+                    frames.append(frame)
             current += timedelta(days=1)
+        if not partition_exists:
+            return None
         if not frames:
             return _empty_suspend()
         merged = pl.concat(frames, how="vertical_relaxed")
-        if "trade_date" not in merged.columns:
+        if "trade_date" not in merged.columns or "ts_code" not in merged.columns:
             return _empty_suspend()
         merged = _normalize_date_columns(merged, ("trade_date",))
         merged = merged.filter(

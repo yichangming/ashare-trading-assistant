@@ -525,3 +525,18 @@ def test_expected_codes_same_count_swap_fails():
     assert any("unexpected codes: 1" in item for item in report.failures)
     assert "missing_expected_codes" in report.failure_codes
     assert "unexpected_codes" in report.failure_codes
+
+
+def test_expected_codes_extra_code_reports_unexpected_not_coverage():
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        _bars(),
+        expected_count=1,
+        expected_codes={"000001.SZ"},
+    )
+    assert not report.passed
+    assert "unexpected_codes" in report.failure_codes
+    # Exact expected codes identify the stray code; the generic coverage
+    # failure would only duplicate that diagnosis.
+    assert "coverage_exceeds_one" not in report.failure_codes
+    assert not any("coverage" in item for item in report.failures)

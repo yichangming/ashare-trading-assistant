@@ -499,6 +499,7 @@ def _background_closes() -> list[float]:
 def _real_bars(
     bad_quality: bool = False,
     suspended_codes: tuple[str, ...] = (),
+    missing_daily_codes: tuple[str, ...] = (),
     extra_bar_code: str | None = None,
 ) -> pl.DataFrame:
     rows: list[dict] = []
@@ -559,14 +560,17 @@ def _real_bars(
                 }
             )
             previous = close
-    if suspended_codes:
-        # Tushare ``daily`` omits suspended names for the day.
+    omitted_codes = set(suspended_codes) | set(missing_daily_codes)
+    if omitted_codes:
+        # Tushare ``daily`` omits suspended names for the day.  Missing codes
+        # model a reference name absent from daily without a matching suspend
+        # row, which the exact expected-code check must catch.
         rows = [
             row
             for row in rows
             if not (
                 row["trade_date"] == _AS_OF
-                and row["ts_code"] in suspended_codes
+                and row["ts_code"] in omitted_codes
             )
         ]
     if extra_bar_code is not None:
@@ -603,6 +607,8 @@ class RealPathProvider:
         degraded: bool = False,
         bad_quality: bool = False,
         suspended_codes: tuple[str, ...] = (),
+        suspend_resume_codes: tuple[str, ...] = (),
+        missing_daily_codes: tuple[str, ...] = (),
         suspend_available: bool = True,
         extra_bar_code: str | None = None,
         empty_index: bool = False,
@@ -613,6 +619,7 @@ class RealPathProvider:
         )
         self.degraded = degraded
         self.suspended_codes = suspended_codes
+        self.suspend_resume_codes = suspend_resume_codes
         self.suspend_available = suspend_available
         self.empty_index = empty_index
         self.empty_trade_cal = empty_trade_cal
@@ -620,6 +627,7 @@ class RealPathProvider:
         self.bars = _real_bars(
             bad_quality=bad_quality,
             suspended_codes=suspended_codes,
+            missing_daily_codes=missing_daily_codes,
             extra_bar_code=extra_bar_code,
         )
 
@@ -629,14 +637,14 @@ class RealPathProvider:
             & (pl.col("trade_date") <= end)
         )
 
-    def load_suspend(self, start: date, end: date) -> pl.DataFrame:
+    def load_suspend(self, start: date, end: date) -> pl.DataFrame | None:
         schema = {
             "trade_date": pl.Date,
             "ts_code": pl.String,
             "suspend_type": pl.String,
         }
-        if not self.suspend_available:
-            return pl.DataFrame(schema=schema)
+        if not self.suspend_available or not (start <= _AS_OF <= end):
+            return None
         rows = [
             {
                 "trade_date": _AS_OF,
@@ -644,9 +652,17 @@ class RealPathProvider:
                 "suspend_type": "S",
             }
             for code in self.suspended_codes
-            if start <= _AS_OF <= end
+        ] + [
+            {
+                "trade_date": _AS_OF,
+                "ts_code": code,
+                "suspend_type": "R",
+            }
+            for code in self.suspend_resume_codes
         ]
-        return pl.DataFrame(rows, schema=schema)
+        return pl.DataFrame(rows, schema=schema).filter(
+            pl.col("suspend_type") == "S"
+        )
 
     def load_index_bars(
         self, index_code: str, start: date, end: date
@@ -853,18 +869,56 @@ def test_pipeline_suspended_reference_code_absent_from_daily_passes():
     assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
 
 
-def test_pipeline_unexpected_bar_code_fails_with_exact_expected_universe():
+def test_pipeline_present_empty_suspend_partition_uses_exact_codes():
+    # A partition exists but has no S rows, so a reference code missing from
+    # daily must fail the exact-code check.
     provider = RealPathProvider(
-        suspended_codes=(_BACKGROUND_CODES[0],),
-        extra_bar_code="699999.SH",
+        missing_daily_codes=(_BACKGROUND_CODES[0],)
     )
-    with pytest.raises(DataQualityError, match="unexpected codes"):
+    with pytest.raises(DataQualityError, match="missing expected codes"):
         _run_real_path(provider)
 
 
-def test_pipeline_suspend_unavailable_falls_back_to_count_coverage():
+def test_pipeline_present_empty_suspend_partition_same_count_swap_fails():
     provider = RealPathProvider(
-        suspended_codes=(_BACKGROUND_CODES[0],),
+        missing_daily_codes=(_BACKGROUND_CODES[0],),
+        extra_bar_code="699999.SH",
+    )
+    with pytest.raises(DataQualityError) as excinfo:
+        _run_real_path(provider)
+    message = str(excinfo.value)
+    assert "missing expected codes" in message
+    assert "unexpected codes" in message
+
+
+def test_pipeline_pure_extra_bar_fails_unexpected_codes_on_zero_suspension_day():
+    provider = RealPathProvider(extra_bar_code="699999.SH")
+    with pytest.raises(DataQualityError) as excinfo:
+        _run_real_path(provider)
+    message = str(excinfo.value)
+    assert "unexpected codes" in message
+    assert "coverage" not in message
+
+
+def test_pipeline_resume_only_suspend_partition_uses_exact_codes():
+    # An R-only partition is a present-but-empty suspend day: no suspensions.
+    result = _run_real_path(
+        RealPathProvider(suspend_resume_codes=(_BACKGROUND_CODES[0],))
+    )
+    assert any(plan.status == PlanStatus.PENDING_ENTRY for plan in result.plans)
+
+    with pytest.raises(DataQualityError, match="missing expected codes"):
+        _run_real_path(
+            RealPathProvider(
+                suspend_resume_codes=(_BACKGROUND_CODES[0],),
+                missing_daily_codes=(_BACKGROUND_CODES[1],),
+            )
+        )
+
+
+def test_pipeline_no_suspend_partition_falls_back_to_count_coverage():
+    provider = RealPathProvider(
+        missing_daily_codes=(_BACKGROUND_CODES[0],),
         suspend_available=False,
     )
     result = _run_real_path(provider)

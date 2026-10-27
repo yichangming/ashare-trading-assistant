@@ -127,7 +127,10 @@ class DataQualityGate:
                     f"coverage {coverage:.2%} below {self.min_coverage:.2%}",
                     "coverage_below_min",
                 )
-            if coverage > 1.0:
+            # With exact expected codes, extra bar codes are reported below as
+            # unexpected_codes, so the generic coverage failure would only
+            # duplicate that diagnosis.
+            if coverage > 1.0 and expected_codes is None:
                 fail(
                     f"coverage {coverage:.2%} exceeds 100%",
                     "coverage_exceeds_one",

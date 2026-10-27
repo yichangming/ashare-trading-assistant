@@ -128,6 +128,7 @@ def test_provider_load_suspend_range(store: ParquetStore):
     )
     provider = ParquetMarketDataProvider(store)
     loaded = provider.load_suspend(date(2024, 1, 2), date(2024, 1, 3))
+    assert loaded is not None
     assert loaded.sort("ts_code")["ts_code"].to_list() == [
         "000001.SZ",
         "000003.SZ",
@@ -136,13 +137,57 @@ def test_provider_load_suspend_range(store: ParquetStore):
     assert (loaded["trade_date"] == date(2024, 1, 2)).sum() == 1
 
 
-def test_provider_load_suspend_missing_is_typed_empty(store: ParquetStore):
+def test_provider_load_suspend_no_partition_returns_none(store: ParquetStore):
     loaded = ParquetMarketDataProvider(store).load_suspend(
         date(2024, 1, 2), date(2024, 1, 2)
     )
+    assert loaded is None
+
+
+def test_provider_load_suspend_present_but_no_s_rows_is_typed_empty(
+    store: ParquetStore,
+):
+    # An R-only partition still proves the endpoint was synced.
+    store.write_raw(
+        "suspend_d",
+        "20240102",
+        pl.DataFrame(
+            {
+                "ts_code": ["000001.SZ"],
+                "trade_date": ["20240102"],
+                "suspend_type": ["R"],
+            }
+        ),
+    )
+    loaded = ParquetMarketDataProvider(store).load_suspend(
+        date(2024, 1, 2), date(2024, 1, 2)
+    )
+    assert loaded is not None
     assert loaded.is_empty()
     assert loaded.schema["trade_date"] == pl.Date
     assert loaded.schema["ts_code"] == pl.String
+
+
+def test_provider_load_suspend_empty_partition_is_typed_empty(
+    store: ParquetStore,
+):
+    store.write_raw(
+        "suspend_d",
+        "20240102",
+        pl.DataFrame(
+            schema={
+                "ts_code": pl.String,
+                "trade_date": pl.String,
+                "suspend_type": pl.String,
+            }
+        ),
+    )
+    loaded = ParquetMarketDataProvider(store).load_suspend(
+        date(2024, 1, 2), date(2024, 1, 2)
+    )
+    assert loaded is not None
+    assert loaded.is_empty()
+    assert loaded.schema["trade_date"] == pl.Date
 
 
 def test_processed_multi_partition_range(store: ParquetStore):
