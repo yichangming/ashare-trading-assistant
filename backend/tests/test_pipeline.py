@@ -1224,6 +1224,10 @@ def test_index_ready_requires_finite_trailing_window():
         bars.with_columns(pl.Series("close", non_finite)), as_of, 60
     )
 
+    assert not TradingPipeline._index_ready(
+        bars.with_columns(pl.col("close").cast(pl.String)), as_of, 60
+    )
+
 
 def test_pipeline_requested_windows_follow_config():
     config = load_strategy_config()

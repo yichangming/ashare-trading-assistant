@@ -12,7 +12,7 @@ from app.core.config import StrategyConfig
 from app.core.errors import DataNotReadyError, DataQualityError
 from app.data.industry_map import IndustryMap
 from app.data.interfaces import MarketDataProvider
-from app.data.quality import DataQualityGate
+from app.data.quality import DataQualityGate, resolve_quality_universe
 from app.data.universe import UniverseBuilder
 from app.domain.enums import SentimentStage, Template
 from app.domain.models import (
@@ -214,44 +214,23 @@ class TradingPipeline:
         as_of_bars = bars.filter(pl.col("trade_date") == as_of)
         # A suspended stock is legitimately absent from Tushare ``daily``.
         # ``load_suspend`` returns ``None`` only when no raw ``suspend_d``
-        # partition exists at all; that means the optional endpoint has not
-        # been synced, so fall back to count-based coverage against all listed
-        # names where the 99% threshold tolerates a small suspended cohort.
-        # A typed frame instead means a partition exists: full-day suspensions
-        # are excluded from the required set, while every listed code remains
-        # allowed so a legitimate bar for a suspended name is not "unexpected".
+        # partition exists at all, so the shared resolver uses count-based
+        # coverage against all listed names where the 99% threshold tolerates
+        # a small suspended cohort.  A typed frame instead means a partition
+        # exists: full-day suspensions are excluded from the required set,
+        # while every listed code remains allowed so a legitimate bar for a
+        # suspended name is not "unexpected".
         suspend = self.provider.load_suspend(as_of, as_of)
-        all_stock_codes = set(stocks["ts_code"].to_list())
-        if suspend is None:
-            _add_flag(degraded, "suspend_d_missing")
-            expected_codes: set[str] | None = None
-            allowed_codes: set[str] | None = all_stock_codes
-            expected_count = len(stocks)
-        else:
-            if "ts_code" not in suspend.columns:
-                # A malformed partition cannot identify suspensions; keep the
-                # exact universe at all listed names.
-                full_day_suspended: set[str] = set()
-            else:
-                suspended = suspend.drop_nulls(subset=["ts_code"])
-                if "suspend_timing" in suspended.columns:
-                    timing = (
-                        pl.col("suspend_timing")
-                        .cast(pl.String, strict=False)
-                        .str.strip_chars()
-                    )
-                    full_day = suspended.filter(
-                        pl.col("suspend_timing").is_null() | (timing == "")
-                    )
-                else:
-                    full_day = suspended
-                full_day_suspended = set(full_day["ts_code"].to_list())
-            required_codes = all_stock_codes - full_day_suspended
-            if not required_codes:
-                raise DataNotReadyError("all listed stocks are suspended")
-            expected_codes = required_codes
-            allowed_codes = all_stock_codes
-            expected_count = len(required_codes)
+        (
+            expected_codes,
+            allowed_codes,
+            expected_count,
+            universe_warnings,
+        ) = resolve_quality_universe(stocks, suspend)
+        for warning in universe_warnings:
+            _add_flag(degraded, warning)
+        if expected_codes is not None and not expected_codes:
+            raise DataNotReadyError("all listed stocks are suspended")
         quality = DataQualityGate().check(
             as_of,
             as_of_bars,
@@ -424,6 +403,8 @@ class TradingPipeline:
         if index_bars.is_empty():
             return False
         if not {"trade_date", "close"} <= set(index_bars.columns):
+            return False
+        if not index_bars.schema["close"].is_numeric():
             return False
         history = index_bars.filter(
             pl.col("trade_date") <= as_of

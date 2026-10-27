@@ -176,6 +176,7 @@ class PendingExposure(DomainModel):
     stop_price: Decimal = Field(gt=0)
     shares: int = Field(ge=0)
     template: Template
+    expires_on: date | None = None
 
     @model_validator(mode="after")
     def _stop_below_entry(self) -> PendingExposure:

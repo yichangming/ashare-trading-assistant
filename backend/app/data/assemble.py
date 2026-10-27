@@ -5,6 +5,7 @@ from datetime import date
 import polars as pl
 
 from app.core.errors import DataNotReadyError
+from app.data.quality import full_day_suspended_codes
 from app.data.store import ParquetStore
 
 _STOCK_REQUIRED = ("ts_code", "name", "market")
@@ -129,22 +130,7 @@ def _derive_limits(bars: pl.DataFrame, st_flags: pl.DataFrame) -> pl.DataFrame:
 
 
 def _apply_suspension(bars: pl.DataFrame, suspend: pl.DataFrame) -> pl.DataFrame:
-    suspended_codes: set[str] = set()
-    if not suspend.is_empty() and "ts_code" in suspend.columns:
-        if "suspend_type" in suspend.columns:
-            suspend = suspend.filter(pl.col("suspend_type") == "S")
-        if "suspend_timing" in suspend.columns:
-            # Partial-day suspensions still trade for part of the session;
-            # only null/empty timing denotes a full-day suspension.
-            timing = (
-                pl.col("suspend_timing")
-                .cast(pl.String, strict=False)
-                .str.strip_chars()
-            )
-            suspend = suspend.filter(
-                pl.col("suspend_timing").is_null() | (timing == "")
-            )
-        suspended_codes = set(suspend["ts_code"].to_list())
+    suspended_codes = full_day_suspended_codes(suspend)
     return bars.with_columns(
         (
             pl.col("ts_code").is_in(sorted(suspended_codes))

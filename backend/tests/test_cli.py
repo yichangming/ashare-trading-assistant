@@ -14,13 +14,26 @@ from app.cli import (
     app,
     build_account,
     load_account,
+    merge_pending_plans,
+    prune_expired_pending,
     quality_report,
     restart_account,
     save_account,
 )
 from app.core.calendar import TradingCalendar
+from app.core.config import load_strategy_config
+from app.core.errors import DataNotReadyError
+from app.data.provider import ParquetMarketDataProvider
+from app.data.quality import resolve_quality_universe
 from app.data.store import ParquetStore
-from app.domain.enums import SentimentStage, Template, TrendRegime
+from app.data.sync import SyncService
+from app.data.tushare_client import TushareClient
+from app.domain.enums import (
+    PlanStatus,
+    SentimentStage,
+    Template,
+    TrendRegime,
+)
 from app.domain.models import (
     AccountState,
     Candidate,
@@ -28,8 +41,10 @@ from app.domain.models import (
     PendingExposure,
     RegimeIndicators,
     TemplatePolicy,
+    TradePlan,
 )
 from app.pipeline import TradingPipeline
+from tests.fixtures.fake_tushare import FakePro, RangeAwareFakePro
 
 _DAY = date(2024, 1, 2)
 
@@ -40,6 +55,7 @@ _COMMANDS = (
     "assemble-range",
     "quality",
     "run",
+    "account",
 )
 
 
@@ -227,6 +243,35 @@ def test_quality_empty_bars_fails_cleanly(store: ParquetStore):
     assert "bars_empty" in report.failure_codes
 
 
+def test_quality_report_parity_with_shared_universe(store: ParquetStore):
+    _write_stocks(store, ["000001.SZ", "000002.SZ", "000003.SZ"])
+    store.write_processed("bars", _DAY, _bars("000001.SZ", "000002.SZ"))
+    _write_suspend(
+        store,
+        [
+            {
+                "trade_date": _DAY,
+                "ts_code": "000003.SZ",
+                "suspend_type": "S",
+                "suspend_timing": None,
+            }
+        ],
+    )
+    provider = ParquetMarketDataProvider(store)
+    required, allowed, expected_count, warnings = resolve_quality_universe(
+        provider.load_stock_basic(_DAY),
+        provider.load_suspend(_DAY, _DAY),
+    )
+
+    report = quality_report(store, _DAY)
+
+    assert required == {"000001.SZ", "000002.SZ"}
+    assert allowed == {"000001.SZ", "000002.SZ", "000003.SZ"}
+    assert expected_count == 2
+    assert warnings == []
+    assert report.passed, report.failures
+
+
 def test_quality_command_exits_one_on_failure(
     monkeypatch: pytest.MonkeyPatch, store: ParquetStore
 ):
@@ -277,16 +322,24 @@ def _account(
     )
 
 
-def test_account_file_round_trip(tmp_path: Path):
-    path = tmp_path / "state" / "account.json"
-    pending = PendingExposure(
-        ts_code="000001.SZ",
+def _pending(
+    code: str = "000003.SZ",
+    expires_on: date | None = None,
+) -> PendingExposure:
+    return PendingExposure(
+        ts_code=code,
         sector="银行",
         entry_price=Decimal("10"),
         stop_price=Decimal("9"),
         shares=100,
         template=Template.A,
+        expires_on=expires_on,
     )
+
+
+def test_account_file_round_trip(tmp_path: Path):
+    path = tmp_path / "state" / "account.json"
+    pending = _pending(expires_on=date(2024, 1, 5))
     account = _account(
         trading_halted=True,
         drawdown_half_latched=True,
@@ -298,6 +351,7 @@ def test_account_file_round_trip(tmp_path: Path):
 
     assert loaded == account
     assert loaded.pending_plans == [pending]
+    assert loaded.pending_plans[0].expires_on == date(2024, 1, 5)
 
 
 def test_restart_account_clears_halt_only():
@@ -458,12 +512,13 @@ def test_assemble_range_rejects_malformed_trade_cal(
 def test_assemble_range_does_not_visit_future_dates(
     monkeypatch: pytest.MonkeyPatch, store: ParquetStore
 ):
-    today = date.today()
+    today = date(2024, 1, 2)
     future = today + timedelta(days=1)
     _write_stocks(store, ["000001.SZ"])
     _write_raw_day(store, future.strftime("%Y%m%d"))
     _write_trade_cal(store, [today, future])
     monkeypatch.setattr(cli_module, "_store", lambda: store)
+    monkeypatch.setattr(cli_module, "_today", lambda: today)
 
     result = CliRunner().invoke(
         cli_module.app,
@@ -480,6 +535,60 @@ def test_assemble_range_does_not_visit_future_dates(
     assert "assembled 0/1" in result.output
     assert "skipped 1" in result.output
     assert store.read_processed("bars", future, future).is_empty()
+
+
+def test_assemble_range_rejects_fully_future_range(
+    monkeypatch: pytest.MonkeyPatch, store: ParquetStore
+):
+    today = date(2024, 1, 2)
+    _write_trade_cal(store, [date(2024, 1, 3), date(2024, 1, 4)])
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+    monkeypatch.setattr(cli_module, "_today", lambda: today)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["assemble-range", "--start", "2024-01-03", "--end", "2024-01-04"],
+    )
+
+    assert result.exit_code == 1
+    assert "entirely in the future" in result.stderr
+    assert "2024-01-02" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("calendar_days", "start", "end", "message"),
+    [
+        (
+            [date(2024, 1, 3), date(2024, 1, 4)],
+            "2024-01-02",
+            "2024-01-04",
+            "after requested start",
+        ),
+        (
+            [date(2024, 1, 2), date(2024, 1, 3)],
+            "2024-01-02",
+            "2024-01-04",
+            "before requested end",
+        ),
+    ],
+)
+def test_assemble_range_requires_calendar_coverage(
+    monkeypatch: pytest.MonkeyPatch,
+    store: ParquetStore,
+    calendar_days: list[date],
+    start: str,
+    end: str,
+    message: str,
+):
+    _write_trade_cal(store, calendar_days)
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+
+    result = CliRunner().invoke(
+        cli_module.app, ["assemble-range", "--start", start, "--end", end]
+    )
+
+    assert result.exit_code == 1
+    assert message in result.stderr
 
 
 def _calendar() -> TradingCalendar:
@@ -586,6 +695,23 @@ class _FakePipeline:
         )
 
 
+def _approved_plan() -> TradePlan:
+    result = TradingPipeline(
+        provider=object(), config=load_strategy_config()
+    ).run(
+        as_of=_DAY,
+        account=_account(),
+        regime_override=_regime(),
+        candidates_override=[_candidate()],
+        calendar_override=_calendar(),
+    )
+    return next(
+        plan
+        for plan in result.plans
+        if plan.status == PlanStatus.PENDING_ENTRY
+    )
+
+
 def test_run_cli_restarts_merges_pending_and_uses_manifest_version(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -598,7 +724,11 @@ def test_run_cli_restarts_merges_pending_and_uses_manifest_version(
     account_path = tmp_path / "account.json"
     save_account(
         account_path,
-        _account(trading_halted=True, drawdown_half_latched=True),
+        _account(
+            trading_halted=True,
+            drawdown_half_latched=True,
+            pending_plans=[_pending("000009.SZ", date(2023, 1, 1))],
+        ),
     )
     output_path = tmp_path / "result.json"
 
@@ -620,10 +750,12 @@ def test_run_cli_restarts_merges_pending_and_uses_manifest_version(
     pipeline = _FakePipeline.instances[-1]
     assert pipeline.calls[0]["data_version"] == "dv_manifest"
     assert pipeline.calls[0]["account"].trading_halted is False
+    assert "pruned 1 expired pending plans" in result.stderr
 
     saved = load_account(account_path)
     assert saved.trading_halted is False
     assert [plan.ts_code for plan in saved.pending_plans] == ["000001.SZ"]
+    assert saved.pending_plans[0].expires_on is not None
 
     payload = json.loads(output_path.read_text(encoding="utf-8"))
     assert payload["as_of"] == "2024-01-02"
@@ -641,3 +773,397 @@ def test_run_restart_requires_an_account_file(monkeypatch: pytest.MonkeyPatch):
 
     assert result.exit_code != 0
     assert "--restart requires" in result.output
+
+
+def test_invalid_date_has_clean_error():
+    result = CliRunner().invoke(
+        cli_module.app, ["assemble", "--day", "not-a-date"]
+    )
+
+    assert result.exit_code == 1
+    assert "ERROR:" in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_missing_bars_has_clean_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+    output_path = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["run", "--day", "2024-01-02", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 1
+    assert "bars missing for 2024-01-02" in result.stderr
+    assert "Traceback" not in result.output
+    assert not output_path.exists()
+
+
+class _ForwardCalendarPipeline:
+    def __init__(self, provider, config):
+        pass
+
+    def run(self, **kwargs):
+        raise DataNotReadyError(
+            "trade_cal does not cover a forward window through 2024-02-16"
+        )
+
+
+def test_forward_calendar_error_is_clean(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(
+        cli_module, "TradingPipeline", _ForwardCalendarPipeline
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app, ["run", "--day", "2024-01-02"]
+    )
+
+    assert result.exit_code == 1
+    assert "forward window" in result.stderr
+    assert "Traceback" not in result.output
+
+
+class _InvalidTemplatePipeline:
+    def __init__(self, provider, config):
+        pass
+
+    def run(self, **kwargs):
+        raise ValueError("unknown template_mode: bogus")
+
+
+def test_invalid_template_mode_is_clean(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(
+        cli_module, "TradingPipeline", _InvalidTemplatePipeline
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["run", "--day", "2024-01-02", "--template-mode", "bogus"],
+    )
+
+    assert result.exit_code == 1
+    assert "unknown template_mode" in result.stderr
+    assert "Traceback" not in result.output
+
+
+class _RecordingClient:
+    def __init__(self, token, **kwargs):
+        self.token = token
+
+
+def _prepare_dotenv_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import os
+
+    backend = tmp_path / "backend"
+    backend.mkdir()
+    (tmp_path / ".env").write_text(
+        "TUSHARE_TOKEN=dotenv-token\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(cli_module, "BACKEND_ROOT", backend)
+    monkeypatch.setattr(cli_module, "_store", lambda: object())
+    monkeypatch.setattr(cli_module, "TushareClient", _RecordingClient)
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+
+
+def test_sync_service_loads_token_from_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import os
+
+    _prepare_dotenv_test(monkeypatch, tmp_path)
+    os.environ.pop("TUSHARE_TOKEN", None)
+
+    service = cli_module._sync_service()
+
+    assert service.client.token == "dotenv-token"
+
+
+def test_exported_token_wins_over_dotenv(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    import os
+
+    _prepare_dotenv_test(monkeypatch, tmp_path)
+    os.environ["TUSHARE_TOKEN"] = "exported-token"
+
+    service = cli_module._sync_service()
+
+    assert service.client.token == "exported-token"
+
+
+def test_merge_pending_plans_sets_expiry_and_deduplicates():
+    plan = _approved_plan()
+
+    merged = merge_pending_plans(_account(), [plan])
+
+    assert len(merged.pending_plans) == 1
+    exposure = merged.pending_plans[0]
+    assert exposure.ts_code == plan.candidate.ts_code
+    assert exposure.sector == plan.candidate.sector
+    assert exposure.entry_price == plan.entry_plan.entry_price
+    assert exposure.stop_price == plan.stop_plan.initial_stop
+    assert exposure.shares == plan.position_plan.shares
+    assert exposure.template == plan.candidate.template
+    assert exposure.expires_on == plan.expires_on
+
+    again = merge_pending_plans(merged, [plan])
+    assert again.pending_plans == merged.pending_plans
+
+
+def test_prune_expired_pending_plans():
+    as_of = date(2024, 1, 10)
+    expired = _pending("000001.SZ", date(2024, 1, 9))
+    current = _pending("000002.SZ", as_of)
+    unknown = _pending("000003.SZ", None)
+    account = _account(pending_plans=[expired, current, unknown])
+
+    pruned, count = prune_expired_pending(account, as_of)
+
+    assert count == 1
+    assert [item.ts_code for item in pruned.pending_plans] == [
+        "000002.SZ",
+        "000003.SZ",
+    ]
+    assert account.pending_plans == [expired, current, unknown]
+
+
+def test_account_command_clears_pending(tmp_path: Path):
+    path = tmp_path / "account.json"
+    save_account(
+        path,
+        _account(pending_plans=[_pending("000001.SZ", date(2024, 2, 1))]),
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["account", "--account-file", str(path), "--clear-pending"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "cleared 1 pending plans" in result.output
+    assert "pending=0" in result.output
+    assert load_account(path).pending_plans == []
+
+
+def test_run_requires_init_account_for_missing_file(tmp_path: Path):
+    path = tmp_path / "account.json"
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["run", "--day", "2024-01-02", "--account-file", str(path)],
+    )
+
+    assert result.exit_code == 1
+    assert "does not exist" in result.stderr
+    assert "--init-account" in result.stderr
+    assert not path.exists()
+
+
+def test_run_init_account_creates_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(cli_module, "TradingPipeline", _FakePipeline)
+    path = tmp_path / "account.json"
+    output_path = tmp_path / "result.json"
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "run",
+            "--day",
+            "2024-01-02",
+            "--account-file",
+            str(path),
+            "--init-account",
+            "--equity",
+            "2500000",
+            "--cash",
+            "1000000",
+            "--peak-equity",
+            "2500000",
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    saved = load_account(path)
+    assert saved.equity == Decimal("2500000")
+    assert saved.cash == Decimal("1000000")
+    assert saved.peak_equity == Decimal("2500000")
+    assert [item.ts_code for item in saved.pending_plans] == ["000001.SZ"]
+
+
+def test_run_warns_when_account_file_is_authoritative(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(cli_module, "TradingPipeline", _FakePipeline)
+    path = tmp_path / "account.json"
+    save_account(
+        path,
+        _account(
+            equity="2000000", cash="1000000", peak_equity="2000000"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "run",
+            "--day",
+            "2024-01-02",
+            "--account-file",
+            str(path),
+            "--equity",
+            "1000000",
+            "--cash",
+            "500000",
+            "--peak-equity",
+            "1500000",
+            "--output",
+            str(tmp_path / "result.json"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "authoritative" in result.stderr
+    assert load_account(path).equity == Decimal("2000000")
+
+
+def test_run_rejects_output_equal_to_account_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(cli_module, "TradingPipeline", _FakePipeline)
+    path = tmp_path / "account.json"
+    save_account(path, _account())
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "run",
+            "--day",
+            "2024-01-02",
+            "--account-file",
+            str(path),
+            "--output",
+            str(path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must be different" in result.stderr
+
+
+def _fake_service(store: ParquetStore, pro) -> SyncService:
+    return SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+
+def test_sync_command_backfills_with_fake_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    service = _fake_service(store, FakePro())
+    monkeypatch.setattr(cli_module, "_sync_service", lambda: service)
+
+    result = CliRunner().invoke(
+        cli_module.app, ["sync", "--start", "2024-01-01", "--end", "2024-01-03"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "synced 2 trading days" in result.output
+    assert store.raw_path("daily", "20240102").exists()
+    assert store.raw_path("daily", "20240103").exists()
+    assert store.read_manifest(date(2024, 1, 2)) is not None
+
+
+def test_calendar_command_refreshes_reference(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    service = _fake_service(store, FakePro())
+    monkeypatch.setattr(cli_module, "_sync_service", lambda: service)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["calendar", "--start", "2024-01-01", "--end", "2024-01-05"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "trade_cal=5" in result.output
+    assert store.read_reference("trade_cal").height == 5
+
+
+def test_calendar_command_warns_when_end_not_covered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    service = _fake_service(store, FakePro())
+    monkeypatch.setattr(cli_module, "_sync_service", lambda: service)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["calendar", "--start", "2024-01-01", "--end", "2024-01-06"],
+    )
+
+    assert result.exit_code == 1
+    assert "before requested end" in result.stderr
+
+
+def test_fresh_store_e2e_sync_calendar_assemble_quality(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    service = _fake_service(store, RangeAwareFakePro())
+    monkeypatch.setattr(cli_module, "_sync_service", lambda: service)
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+
+    synced = CliRunner().invoke(
+        cli_module.app, ["sync", "--start", "2024-01-01", "--end", "2024-01-03"]
+    )
+    assert synced.exit_code == 0, synced.output
+
+    refreshed = CliRunner().invoke(
+        cli_module.app,
+        ["calendar", "--start", "2024-01-01", "--end", "2024-01-10"],
+    )
+    assert refreshed.exit_code == 0, refreshed.output
+
+    assembled = CliRunner().invoke(
+        cli_module.app,
+        [
+            "assemble-range",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-03",
+        ],
+    )
+    assert assembled.exit_code == 0, assembled.output
+    assert "assembled 3/3" in assembled.output
+
+    quality = CliRunner().invoke(
+        cli_module.app, ["quality", "--day", "2024-01-02"]
+    )
+    assert quality.exit_code == 0, quality.output
+    assert "passed=True" in quality.output

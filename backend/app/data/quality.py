@@ -51,6 +51,55 @@ class QualityReport:
     warning_codes: list[str] = field(default_factory=list)
 
 
+def full_day_suspended_codes(suspend: pl.DataFrame) -> set[str]:
+    """Return codes with a full-day ``S`` suspension.
+
+    Only ``suspend_type == "S"`` rows are considered when that column is
+    present.  A row is full-day when ``suspend_timing`` is null or blank;
+    when the timing column is absent, every suspension row is full-day.
+    """
+    if suspend.is_empty() or "ts_code" not in suspend.columns:
+        return set()
+    suspended = suspend.drop_nulls(subset=["ts_code"])
+    if "suspend_type" in suspended.columns:
+        suspended = suspended.filter(pl.col("suspend_type") == "S")
+    if suspended.is_empty():
+        return set()
+    if "suspend_timing" not in suspended.columns:
+        return set(suspended["ts_code"].to_list())
+    timing = (
+        pl.col("suspend_timing").cast(pl.String, strict=False).str.strip_chars()
+    )
+    full_day = suspended.filter(
+        pl.col("suspend_timing").is_null() | (timing == "")
+    )
+    return set(full_day["ts_code"].to_list())
+
+
+def resolve_quality_universe(
+    stocks: pl.DataFrame, suspend: pl.DataFrame | None
+) -> tuple[set[str] | None, set[str] | None, int, list[str]]:
+    """Resolve required/allowed bar codes for one as-of day.
+
+    Returns ``(required_codes, allowed_codes, expected_count, warnings)``.
+    ``suspend is None`` means no ``suspend_d`` partition was synced: use the
+    count fallback against the full listed universe and return the
+    ``suspend_d_missing`` warning.  A typed frame (even an empty one) means
+    the exact universe is known: full-day suspended codes are removed from
+    ``required_codes`` but remain ``allowed_codes`` so a legitimate bar for a
+    suspended name is not unexpected.
+    """
+    stock_codes = (
+        set(stocks["ts_code"].to_list())
+        if not stocks.is_empty() and "ts_code" in stocks.columns
+        else set()
+    )
+    if suspend is None:
+        return None, stock_codes, stocks.height, ["suspend_d_missing"]
+    required_codes = stock_codes - full_day_suspended_codes(suspend)
+    return required_codes, stock_codes, len(required_codes), []
+
+
 class DataQualityGate:
     def __init__(
         self,
