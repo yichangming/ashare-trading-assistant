@@ -29,7 +29,7 @@ _A_CHECKS = [
     "max_a_policy",
     "industry_concentration",
     "duplicate",
-    "correlation",
+    "correlation_unavailable",
     "single_position_cap",
     "cash_reserve",
     "total_exposure",
@@ -231,7 +231,7 @@ def test_single_position_cap():
     assert plan.shares == 40000
     assert plan.position_pct == pytest.approx(0.40)
     assert plan.position_value == money(400000)
-    assert plan.adjustments
+    assert plan.adjustments == ["single_position_cap: 47100 -> 40000"]
 
 
 def test_heat_cap_reduces_size():
@@ -244,7 +244,11 @@ def test_heat_cap_reduces_size():
     assert plan.shares == 10000
     assert plan.heat_before == pytest.approx(0.07)
     assert plan.heat_after == pytest.approx(0.075)
-    assert plan.adjustments
+    assert plan.adjustments == [
+        "single_position_cap: 47100 -> 40000",
+        "total_exposure: 40000 -> 35000",
+        "portfolio_heat: 35000 -> 10000",
+    ]
 
 
 def test_drawdown_and_max_positions_reject():
@@ -401,16 +405,25 @@ def test_b_policy_zero_rejects_any_b():
         )
 
 
-def test_policy_sum_bounds_global_slots():
+def test_legacy_over_cap_holding_does_not_block_other_template():
+    # Both A holdings exceed the A policy cap (a legacy over-cap snapshot),
+    # but global config slots remain and the B template has capacity.
     account = _account(
         positions=[
             _position(ts_code="000009.SZ", sector="地产", template=Template.A),
-            _position(ts_code="000010.SZ", sector="科技", template=Template.B),
+            _position(ts_code="000010.SZ", sector="科技", template=Template.A),
         ]
     )
     regime = _regime(a=_policy(max_positions=1), b=_policy(max_positions=1))
-    with pytest.raises(PositionRejectedError, match="max positions"):
-        _size(account=account, regime=regime)
+    plan = _size(
+        candidate=_candidate(template=Template.B),
+        entry_price=10.0,
+        stop_price=9.5,
+        account=account,
+        regime=regime,
+    )
+    assert plan.shares == 37700
+    assert plan.adjustments == []
 
 
 def test_disabled_template_rejects():
@@ -475,6 +488,14 @@ def test_correlation_threshold_is_exclusive():
 def test_correlation_ignores_unheld_codes():
     plan = _size(correlations={"999999.SZ": 0.99})
     assert plan.shares == 17100
+    assert "correlation" in plan.constraints_checked
+    assert "correlation_unavailable" not in plan.constraints_checked
+
+
+def test_correlation_marker_when_not_supplied():
+    plan = _size()
+    assert "correlation_unavailable" in plan.constraints_checked
+    assert "correlation" not in plan.constraints_checked
 
 
 def test_correlation_includes_pending():
@@ -494,14 +515,11 @@ def test_invalid_correlation_rejects(correlation: float):
 
 
 def test_cash_reserve_reduces_size():
-    plan = _size(
-        entry_price=10.0,
-        stop_price=9.5,
-        account=_account(cash=200_000),
-    )
-    assert plan.shares == 10000
+    plan = _size(account=_account(cash=200_000))
+    assert plan.shares == 5000
     assert plan.position_value == money(100_000)
-    assert plan.adjustments
+    assert plan.position_pct == pytest.approx(0.10)
+    assert plan.adjustments == ["cash_reserve: 17100 -> 5000"]
 
 
 def test_cash_reserve_includes_pending():
@@ -513,7 +531,10 @@ def test_cash_reserve_includes_pending():
     )
     plan = _size(entry_price=10.0, stop_price=9.5, account=account)
     assert plan.shares == 5000
-    assert plan.adjustments
+    assert plan.adjustments == [
+        "single_position_cap: 47100 -> 40000",
+        "cash_reserve: 40000 -> 5000",
+    ]
 
 
 def test_cash_reserve_breach_rejects():
@@ -539,7 +560,29 @@ def test_total_exposure_reduces_size():
     assert plan.position_pct == pytest.approx(0.26)
     # positions 640k + new 260k = 900k = 90% of equity (the exact cap).
     assert float(plan.position_value) + 640_000 == pytest.approx(900_000)
-    assert plan.adjustments
+    assert plan.adjustments == ["total_exposure: 17100 -> 13000"]
+
+
+def test_exposure_guard_fires_for_inconsistent_snapshot():
+    # cash + positions exceed equity, so the cash check passes while the
+    # portfolio is already above the exposure cap.
+    account = _account(
+        cash=950_000,
+        positions=[
+            _position(
+                ts_code="000009.SZ",
+                sector="地产",
+                shares=50_000,
+                current_stop=9.0,
+                current_price=10.0,
+            )
+        ],
+        pending=[
+            _pending(entry_price=10.0, stop_price=9.9, shares=45_000)
+        ],
+    )
+    with pytest.raises(PositionRejectedError, match="exposure"):
+        _size(entry_price=10.0, stop_price=9.5, account=account)
 
 
 def test_total_exposure_includes_pending():
@@ -552,7 +595,17 @@ def test_total_exposure_includes_pending():
     plan = _size(entry_price=10.0, stop_price=8.0, account=account)
     assert plan.shares == 10000
     assert plan.position_value == money(100_000)
-    assert plan.adjustments
+    assert plan.adjustments == ["total_exposure: 12300 -> 10000"]
+
+
+def test_heat_only_adjustment_attribution():
+    # A small high-risk legacy position leaves only the heat budget binding.
+    position = _position(
+        shares=516, current_stop=1.0, current_price=100.0
+    )
+    plan = _size(account=_account(positions=[position]))
+    assert plan.shares == 17000
+    assert plan.adjustments == ["portfolio_heat: 17100 -> 17000"]
 
 
 def test_heat_cap_includes_pending():
@@ -565,7 +618,10 @@ def test_heat_cap_includes_pending():
     assert plan.heat_before == pytest.approx(0.06)
     assert plan.shares == 30000
     assert plan.heat_after == pytest.approx(0.075)
-    assert plan.adjustments
+    assert plan.adjustments == [
+        "single_position_cap: 47100 -> 40000",
+        "portfolio_heat: 40000 -> 30000",
+    ]
 
 
 def test_heat_at_cap_rejects():
@@ -594,6 +650,26 @@ def test_risk_amount_and_heat_accounting():
     assert plan.heat_after == pytest.approx(
         plan.heat_before + plan.shares * 2.0 / 1_000_000
     )
+
+
+def test_b_risk_budget():
+    plan = _size(
+        candidate=_candidate(template=Template.B),
+        entry_price=10.0,
+        stop_price=9.5,
+    )
+    assert plan.template == Template.B
+    assert plan.risk_pct == 0.02
+    assert plan.risk_amount == money(20000)
+    assert plan.shares == 37700
+
+
+def test_string_template_is_treated_as_a():
+    candidate = _candidate().model_copy(update={"template": "A"})
+    plan = _size(candidate=candidate)
+    assert plan.template == Template.A
+    assert plan.risk_pct == 0.025
+    assert plan.shares == 17100
 
 
 # --- input and config validation --------------------------------------------
@@ -691,6 +767,7 @@ def test_non_finite_entry_rejects():
     "risk_update",
     [
         {"max_positions": -1},
+        {"max_positions": 0},
         {"max_b_positions": -1},
         {"max_single_position_pct": 0.0},
         {"max_heat": 0.0},

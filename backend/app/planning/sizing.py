@@ -28,10 +28,23 @@ def _dec(value: float | int | str | Decimal) -> Decimal:
 
 
 def _lots(amount: Decimal, unit: Decimal) -> int:
-    """Largest whole 100-share lot count affordable by ``amount`` at ``unit``."""
+    """Largest 100-share-aligned share quantity affordable by ``amount`` at ``unit``."""
     if amount <= 0 or unit <= 0:
         return 0
     return int(amount / unit // _LOT) * 100
+
+
+def _apply_cap(
+    current: int,
+    proposed: int,
+    name: str,
+    adjustments: list[str],
+) -> int:
+    """Apply a size cap, recording the binding cap and its share change."""
+    if proposed >= current:
+        return current
+    adjustments.append(f"{name}: {current} -> {proposed}")
+    return proposed
 
 
 class PositionSizer:
@@ -43,18 +56,26 @@ class PositionSizer:
 
     Existing positions and approved-but-unfilled pending plans both consume
     global slots, template slots, industry slots, cash, exposure, and heat.
-    Global slots are bounded by ``config.risk.max_positions`` and by the sum
-    of the enabled regime policy caps; Template A is bounded by its regime
-    policy, while Template B is bounded by
+    Global slots are bounded by ``config.risk.max_positions``; Template A is
+    bounded by its regime policy, while Template B is bounded by
     ``min(config.risk.max_b_positions, policy.max_positions)``.  A drawdown of
     at least ``drawdown_stop_at`` rejects; one of at least
     ``drawdown_half_at`` halves the risk budget.
 
-    Caps that reduce size are reported in ``adjustments``.  Hard-constraint
-    failures, invalid inputs, and a result below one lot raise
+    When ``correlations`` is not supplied, ``correlation_unavailable`` is
+    recorded in ``constraints_checked`` instead of ``correlation``.
+
+    Caps that reduce size are reported in ``adjustments`` as
+    ``"<cap>: <before> -> <after>"``.  Hard-constraint failures, invalid
+    inputs, and a result below one lot raise
     :class:`~app.planning.errors.PositionRejectedError`.  Money and share
     arithmetic uses :class:`~decimal.Decimal`; floats appear only in ratio
     fields of the emitted plan.
+
+    ``PositionPlan.risk_pct`` is the raw template risk ratio, and
+    ``PositionPlan.risk_amount`` is the regime/drawdown-adjusted budget before
+    position caps and lot rounding.  Neither is the effective risk of the
+    final position.
     """
 
     def size(
@@ -79,13 +100,22 @@ class PositionSizer:
                 f"invalid entry price for {candidate.ts_code}: {exc}"
             ) from exc
         stop_price = _dec(stop.initial_stop)
-        if not entry_price.is_finite() or entry_price <= 0:
+        if not entry_price.is_finite():
             raise PositionRejectedError(
-                f"invalid entry price for {candidate.ts_code}: {entry_price}"
+                f"non-finite entry price for {candidate.ts_code}: {entry_price}"
             )
-        if not stop_price.is_finite() or stop_price <= 0:
+        if entry_price <= 0:
             raise PositionRejectedError(
-                f"invalid stop for {candidate.ts_code}: {stop_price}"
+                f"entry price must be positive for {candidate.ts_code}: "
+                f"{entry_price}"
+            )
+        if not stop_price.is_finite():
+            raise PositionRejectedError(
+                f"non-finite stop for {candidate.ts_code}: {stop_price}"
+            )
+        if stop_price <= 0:
+            raise PositionRejectedError(
+                f"stop must be positive for {candidate.ts_code}: {stop_price}"
             )
         if stop_price >= entry_price:
             raise PositionRejectedError(
@@ -94,11 +124,15 @@ class PositionSizer:
             )
 
         self._validate_config(config)
+        if candidate.template not in (Template.A, Template.B):
+            raise PositionRejectedError(
+                f"unsupported template {candidate.template!r}"
+            )
         policy_a, policy_b = self._policies(regime)
-        policy = policy_a if candidate.template is Template.A else policy_b
+        policy = policy_a if candidate.template == Template.A else policy_b
         if not policy.enabled:
             raise PositionRejectedError(
-                f"{candidate.template.value} template is disabled by regime policy"
+                f"{candidate.template} template is disabled by regime policy"
             )
 
         factor_value = regime.risk_factor
@@ -120,7 +154,7 @@ class PositionSizer:
 
         risk_pct_value = (
             config.template_a.risk_pct
-            if candidate.template is Template.A
+            if candidate.template == Template.A
             else config.template_b.risk_pct
         )
         risk_pct = _dec(risk_pct_value)
@@ -142,23 +176,20 @@ class PositionSizer:
         pending = account.pending_plans
 
         occupied = len(positions) + len(pending)
-        policy_slots = sum(
-            item.max_positions for item in (policy_a, policy_b) if item.enabled
-        )
-        global_cap = min(config.risk.max_positions, policy_slots)
-        if occupied >= global_cap:
+        if occupied >= config.risk.max_positions:
             raise PositionRejectedError(
-                f"max positions reached: {occupied} occupied, cap {global_cap}"
+                f"max positions reached: {occupied} occupied, "
+                f"cap {config.risk.max_positions}"
             )
         checks.append("max_positions")
 
         a_count = sum(
-            1 for item in positions if item.template is Template.A
-        ) + sum(1 for item in pending if item.template is Template.A)
+            1 for item in positions if item.template == Template.A
+        ) + sum(1 for item in pending if item.template == Template.A)
         b_count = sum(
-            1 for item in positions if item.template is Template.B
-        ) + sum(1 for item in pending if item.template is Template.B)
-        if candidate.template is Template.A:
+            1 for item in positions if item.template == Template.B
+        ) + sum(1 for item in pending if item.template == Template.B)
+        if candidate.template == Template.A:
             if a_count >= policy_a.max_positions:
                 raise PositionRejectedError(
                     f"max A policy positions reached: {a_count} >= "
@@ -198,7 +229,9 @@ class PositionSizer:
             )
         checks.append("duplicate")
 
-        if correlations:
+        if correlations is None:
+            checks.append("correlation_unavailable")
+        else:
             threshold = config.risk.correlation_threshold
             for code, correlation in correlations.items():
                 if not math.isfinite(correlation) or not -1 <= correlation <= 1:
@@ -210,10 +243,15 @@ class PositionSizer:
                         f"correlation above threshold with {code}: "
                         f"{correlation} > {threshold}"
                     )
-        checks.append("correlation")
+            checks.append("correlation")
 
         max_position_value = equity * _dec(config.risk.max_single_position_pct)
-        shares = min(shares, _lots(max_position_value, entry_price))
+        shares = _apply_cap(
+            shares,
+            _lots(max_position_value, entry_price),
+            "single_position_cap",
+            adjustments,
+        )
         checks.append("single_position_cap")
 
         pending_notional = sum(
@@ -227,9 +265,18 @@ class PositionSizer:
                 f"cash reserve would be breached: available cash "
                 f"{available_cash}, reserve {min_cash}"
             )
-        shares = min(shares, _lots(max_cash_spend, entry_price))
+        shares = _apply_cap(
+            shares,
+            _lots(max_cash_spend, entry_price),
+            "cash_reserve",
+            adjustments,
+        )
         checks.append("cash_reserve")
 
+        # Defense in depth: for a consistent account snapshot the cash check
+        # binds first (positions above 90% of equity imply cash below the
+        # reserve).  This can only fire when cash, positions, and pending
+        # commitments do not reconcile.
         existing_exposure = account.positions_value + pending_notional
         max_exposure = equity - min_cash
         remaining_exposure = max_exposure - existing_exposure
@@ -238,7 +285,12 @@ class PositionSizer:
                 f"total exposure limit reached: existing exposure "
                 f"{existing_exposure}, cap {max_exposure}"
             )
-        shares = min(shares, _lots(remaining_exposure, entry_price))
+        shares = _apply_cap(
+            shares,
+            _lots(remaining_exposure, entry_price),
+            "total_exposure",
+            adjustments,
+        )
         checks.append("total_exposure")
 
         max_heat = equity * _dec(config.risk.max_heat)
@@ -249,10 +301,17 @@ class PositionSizer:
                 f"portfolio heat limit reached: heat {account.heat:.4f} >= "
                 f"{config.risk.max_heat:.4f}"
             )
-        shares = min(shares, _lots(max_new_risk, entry_price - stop_price))
+        shares = _apply_cap(
+            shares,
+            _lots(max_new_risk, entry_price - stop_price),
+            "portfolio_heat",
+            adjustments,
+        )
         checks.append("portfolio_heat")
 
-        if shares != original:
+        # Fallback for any future size reduction that is not attributable to
+        # one of the named caps above.
+        if shares != original and not adjustments:
             adjustments.append(f"shares reduced from {original} to {shares}")
         if shares < 100:
             raise PositionRejectedError(
@@ -262,6 +321,8 @@ class PositionSizer:
         position_value = money(entry_price * shares)
         new_risk = (entry_price - stop_price) * shares
         heat_after = float(_dec(account.heat) + new_risk / equity)
+        # risk_pct is the raw template ratio; risk_amount is the
+        # regime/drawdown-adjusted budget before caps and lot rounding.
         return PositionPlan(
             template=candidate.template,
             risk_pct=risk_pct_value,
