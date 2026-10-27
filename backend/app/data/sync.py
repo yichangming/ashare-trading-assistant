@@ -21,6 +21,8 @@ _REFERENCE_NAMES = (
     "index_member",
 )
 _MAX_RE_PULL_DAYS = 365 * 10
+_NAME_CHANGE_START = date(1990, 1, 1)
+_NAME_CHANGE_CHUNK_YEARS = 5
 
 
 class SyncError(RuntimeError):
@@ -123,22 +125,158 @@ class SyncService:
         self.store.write_reference("stock_basic", stock_basic)
         counts["stock_basic"] = stock_basic.height
 
-        optional: tuple[tuple[str, list[str]], ...] = (
-            ("namechange", ["start_date", "end_date"]),
-            ("index_classify", []),
-            ("index_member", ["in_date", "out_date"]),
-        )
-        for endpoint, date_columns in optional:
+        counts.update(self._sync_namechange())
+        counts.update(self._sync_industry_references())
+        return counts
+
+    def _sync_namechange(self) -> dict[str, int]:
+        try:
+            frame, failures = self._fetch_namechange()
+        except Exception as exc:
+            self.reference_degraded.append(f"namechange unavailable: {exc}")
+            self.store.remove_reference("namechange")
+            return {"namechange": 0}
+        self.reference_degraded.extend(failures)
+        if frame.is_empty():
+            if not failures:
+                self.reference_degraded.append("namechange returned no rows")
+            self.store.remove_reference("namechange")
+            return {"namechange": 0}
+        frame = _to_date(frame, ["start_date", "end_date"])
+        subset = [
+            column
+            for column in ("ts_code", "name", "start_date", "end_date")
+            if column in frame.columns
+        ]
+        if subset:
+            frame = frame.unique(subset=subset, keep="last")
+        sort_columns = [
+            column
+            for column in ("ts_code", "start_date")
+            if column in frame.columns
+        ]
+        if sort_columns:
+            frame = frame.sort(sort_columns)
+        self.store.write_reference("namechange", frame)
+        return {"namechange": frame.height}
+
+    def _fetch_namechange(self) -> tuple[pl.DataFrame, list[str]]:
+        """Fetch complete name-change history in bounded chunks.
+
+        A single unparameterised call is capped by Tushare; five-year windows
+        keep each response well below the cap while covering the whole history
+        needed for point-in-time ST checks.
+        """
+        frames: list[pl.DataFrame] = []
+        failures: list[str] = []
+        cursor = _NAME_CHANGE_START
+        today = date.today()
+        while cursor <= today:
+            chunk_end = min(
+                date(cursor.year + _NAME_CHANGE_CHUNK_YEARS - 1, 12, 31),
+                today,
+            )
             try:
-                frame = self.client.fetch(endpoint)
+                frame = self.client.fetch(
+                    "namechange",
+                    start_date=cursor.strftime("%Y%m%d"),
+                    end_date=chunk_end.strftime("%Y%m%d"),
+                )
             except Exception as exc:
-                self.reference_degraded.append(f"{endpoint} unavailable: {exc}")
-                self.store.remove_reference(endpoint)
-                counts[endpoint] = 0
+                failures.append(
+                    f"namechange {cursor.year}-{chunk_end.year} unavailable: {exc}"
+                )
+            else:
+                if not frame.is_empty():
+                    frames.append(frame)
+            cursor = date(chunk_end.year + 1, 1, 1)
+        if not frames:
+            return pl.DataFrame(), failures
+        merged = (
+            frames[0]
+            if len(frames) == 1
+            else pl.concat(frames, how="vertical_relaxed")
+        )
+        return merged, failures
+
+    def _sync_industry_references(self) -> dict[str, int]:
+        counts = {"index_classify": 0, "index_member": 0}
+        try:
+            classify = self.client.fetch("index_classify", level="L1")
+        except Exception as exc:
+            self.reference_degraded.append(f"index_classify unavailable: {exc}")
+            classify = pl.DataFrame()
+        if classify.is_empty() or "index_code" not in classify.columns:
+            if not any(
+                "index_classify unavailable" in item
+                for item in self.reference_degraded
+            ):
+                self.reference_degraded.append(
+                    "index_classify returned no usable rows"
+                )
+            self.store.remove_reference("index_classify")
+            try:
+                members = self.client.fetch("index_member")
+            except Exception as exc:
+                self.reference_degraded.append(
+                    f"index_member fallback unavailable: {exc}"
+                )
+                self.store.remove_reference("index_member")
+                return counts
+            members = _to_date(members, ["in_date", "out_date"])
+            self.store.write_reference("index_member", members)
+            counts["index_member"] = members.height
+            return counts
+
+        self.store.write_reference("index_classify", classify)
+        counts["index_classify"] = classify.height
+        codes = sorted(
+            {
+                str(code)
+                for code in classify["index_code"].to_list()
+                if code is not None
+            }
+        )
+        frames: list[pl.DataFrame] = []
+        failures: list[str] = []
+        for code in codes:
+            try:
+                frame = self.client.fetch("index_member", index_code=code)
+            except Exception as exc:
+                failures.append(
+                    f"index_member {code} unavailable: {exc}"
+                )
                 continue
-            frame = _to_date(frame, date_columns)
-            self.store.write_reference(endpoint, frame)
-            counts[endpoint] = frame.height
+            if not frame.is_empty():
+                frames.append(frame)
+        self.reference_degraded.extend(failures)
+        if not frames:
+            if not failures:
+                self.reference_degraded.append("index_member returned no rows")
+            self.store.remove_reference("index_member")
+            return counts
+        members = (
+            frames[0]
+            if len(frames) == 1
+            else pl.concat(frames, how="vertical_relaxed")
+        )
+        members = _to_date(members, ["in_date", "out_date"])
+        subset = [
+            column
+            for column in ("index_code", "con_code", "in_date", "out_date")
+            if column in members.columns
+        ]
+        if subset:
+            members = members.unique(subset=subset, keep="last")
+        sort_columns = [
+            column
+            for column in ("index_code", "con_code", "in_date")
+            if column in members.columns
+        ]
+        if sort_columns:
+            members = members.sort(sort_columns)
+        self.store.write_reference("index_member", members)
+        counts["index_member"] = members.height
         return counts
 
     def sync_day(self, trade_date: date) -> SyncResult:

@@ -552,6 +552,63 @@ def test_incremental_rejects_absurd_re_pull_days(store: ParquetStore):
         service.sync_incremental(date(2024, 1, 4), re_pull_days=10**9)
 
 
+def test_sync_reference_chunks_namechange(store: ParquetStore):
+    pro = FakePro()
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+    counts = service.sync_reference(date(2024, 1, 1), date(2024, 1, 5))
+
+    calls = [
+        kwargs for endpoint, kwargs in pro.calls if endpoint == "namechange"
+    ]
+    assert len(calls) >= 2
+    assert calls[0]["start_date"] == "19900101"
+    assert counts["namechange"] == 1
+    assert store.read_reference("namechange").height == 1
+
+
+class _MultiIndustryFakePro(FakePro):
+    def index_classify(self, **kwargs):
+        self.calls.append(("index_classify", kwargs))
+        return pl.DataFrame(
+            {
+                "index_code": ["801010.SI", "801020.SI"],
+                "industry_name": ["银行", "非银"],
+                "level": ["L1", "L1"],
+            }
+        ).to_pandas()
+
+    def index_member(self, **kwargs):
+        self.calls.append(("index_member", kwargs))
+        code = kwargs["index_code"]
+        return pl.DataFrame(
+            {
+                "index_code": [code],
+                "con_code": ["000001.SZ" if code == "801010.SI" else "600000.SH"],
+                "in_date": ["20000407"],
+                "out_date": [None],
+                "is_new": ["Y"],
+            }
+        ).to_pandas()
+
+
+def test_sync_reference_fetches_index_members_per_l1(store: ParquetStore):
+    pro = _MultiIndustryFakePro()
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+    counts = service.sync_reference(date(2024, 1, 1), date(2024, 1, 5))
+
+    codes = {
+        kwargs["index_code"]
+        for endpoint, kwargs in pro.calls
+        if endpoint == "index_member"
+    }
+    assert codes == {"801010.SI", "801020.SI"}
+    assert counts["index_classify"] == 2
+    assert counts["index_member"] == 2
+    assert store.read_reference("index_member").height == 2
+
+
 def test_duplicate_calendar_rows_sync_each_day_once(store: ParquetStore):
     store.write_reference(
         "trade_cal",
