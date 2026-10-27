@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 import polars as pl
 
 
@@ -221,3 +223,38 @@ class FakePro:
                 }
             ),
         )
+
+
+def _parse_tushare_date(value: str) -> date:
+    return date(int(value[:4]), int(value[4:6]), int(value[6:8]))
+
+
+class RangeAwareFakePro(FakePro):
+    """Fake source that honors start_date/end_date for trade_cal."""
+
+    def trade_cal(self, **kwargs):
+        self.calls.append(("trade_cal", kwargs))
+        self._maybe_fail("trade_cal")
+        start = _parse_tushare_date(kwargs["start_date"])
+        end = _parse_tushare_date(kwargs["end_date"])
+        rows: list[dict] = []
+        previous_open: date | None = None
+        current = start
+        while current <= end:
+            is_open = 1 if current.weekday() < 5 else 0
+            rows.append(
+                {
+                    "exchange": "SSE",
+                    "cal_date": current.strftime("%Y%m%d"),
+                    "is_open": is_open,
+                    "pretrade_date": (
+                        previous_open.strftime("%Y%m%d")
+                        if previous_open is not None
+                        else None
+                    ),
+                }
+            )
+            if is_open:
+                previous_open = current
+            current += timedelta(days=1)
+        return self._frame("trade_cal", pl.DataFrame(rows))

@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -10,7 +10,7 @@ from app.data.manifest import DataManifest
 from app.data.store import ParquetStore
 from app.data.sync import SyncError, SyncService
 from app.data.tushare_client import TushareClient
-from tests.fixtures.fake_tushare import FakePro
+from tests.fixtures.fake_tushare import FakePro, RangeAwareFakePro
 
 
 @pytest.fixture()
@@ -271,10 +271,20 @@ def test_sync_reference_chunks_trade_cal(store: ParquetStore):
 
     counts = service.sync_reference(date(2018, 1, 1), date(2024, 1, 5))
 
-    trade_cal_calls = [
-        kwargs for endpoint, kwargs in pro.calls if endpoint == "trade_cal"
+    boundaries = [
+        (kwargs["start_date"], kwargs["end_date"])
+        for endpoint, kwargs in pro.calls
+        if endpoint == "trade_cal"
     ]
-    assert len(trade_cal_calls) == 7
+    assert boundaries == [
+        ("20180101", "20181231"),
+        ("20190101", "20191231"),
+        ("20200101", "20201231"),
+        ("20210101", "20211231"),
+        ("20220101", "20221231"),
+        ("20230101", "20231231"),
+        ("20240101", "20240105"),
+    ]
     assert counts["trade_cal"] == 5
 
 
@@ -291,3 +301,126 @@ def test_sync_reference_fetches_stock_basic_per_status(store: ParquetStore):
     ]
     assert statuses == ["L", "D", "P"]
     assert store.read_reference("stock_basic").height == 2
+
+
+def test_sync_reference_preserves_calendar_history(store: ParquetStore):
+    service = SyncService(
+        TushareClient(pro=RangeAwareFakePro(), sleep=lambda _: None), store
+    )
+    service.sync_reference(date(2024, 1, 1), date(2024, 1, 31))
+    full_dates = set(store.read_reference("trade_cal")["cal_date"].to_list())
+    assert len(full_dates) == 31
+
+    counts = service.sync_reference(date(2024, 1, 15), date(2024, 1, 15))
+
+    assert counts["trade_cal"] == 31
+    assert set(store.read_reference("trade_cal")["cal_date"].to_list()) == full_dates
+
+    service.backfill(date(2024, 1, 16), date(2024, 1, 16))
+
+    assert set(store.read_reference("trade_cal")["cal_date"].to_list()) == full_dates
+
+
+def test_incremental_fills_long_calendar_gap(store: ParquetStore):
+    service = SyncService(
+        TushareClient(pro=RangeAwareFakePro(), sleep=lambda _: None), store
+    )
+    service.sync_reference(date(2024, 1, 2), date(2024, 1, 2))
+    assert set(store.read_reference("trade_cal")["cal_date"].to_list()) == {
+        date(2024, 1, 2)
+    }
+
+    results = service.sync_incremental(date(2024, 3, 8), re_pull_days=1)
+
+    expected_dates = {
+        date(2024, 1, 2) + timedelta(days=offset) for offset in range(67)
+    }
+    expected_open = sorted(
+        trade_date for trade_date in expected_dates if trade_date.weekday() < 5
+    )
+    calendar_dates = set(store.read_reference("trade_cal")["cal_date"].to_list())
+    assert calendar_dates == expected_dates
+    assert [result.trade_date for result in results] == expected_open
+    for sample in (date(2024, 1, 3), date(2024, 2, 1), date(2024, 3, 1)):
+        assert sample in calendar_dates
+        assert store.read_manifest(sample) is not None
+
+
+def test_incremental_refreshes_references_and_persists_degradation(
+    store: ParquetStore,
+):
+    pro = RangeAwareFakePro()
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+    service.sync_reference(date(2024, 1, 2), date(2024, 1, 5))
+    assert store.reference_path("index_member").exists()
+
+    pro.fail_endpoints.add("index_member")
+    results = service.sync_incremental(date(2024, 1, 4), re_pull_days=1)
+
+    assert not store.reference_path("index_member").exists()
+    assert any("index_member" in item for item in service.reference_degraded)
+    assert results
+    assert all(
+        any("index_member" in item for item in result.reference_degraded)
+        for result in results
+    )
+    manifest = store.read_manifest(date(2024, 1, 4))
+    assert manifest is not None
+    assert any("index_member" in item for item in manifest["reference_degraded"])
+
+
+def test_incremental_requires_existing_calendar(store: ParquetStore):
+    pro = FakePro()
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+    with pytest.raises(SyncError, match="run sync_reference/backfill first"):
+        service.sync_incremental(date(2024, 1, 4))
+
+    assert pro.calls == []
+
+
+def test_sync_reference_rejects_empty_stock_basic(store: ParquetStore):
+    pro = FakePro(empty_endpoints={"stock_basic"})
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+    with pytest.raises(SyncError, match="stock_basic returned no rows"):
+        service.sync_reference(date(2024, 1, 1), date(2024, 1, 5))
+
+    assert not store.reference_path("stock_basic").exists()
+    assert not store.reference_path("trade_cal").exists()
+
+
+def test_sync_reference_rejects_empty_trade_cal(store: ParquetStore):
+    pro = FakePro(empty_endpoints={"trade_cal"})
+    service = SyncService(TushareClient(pro=pro, sleep=lambda _: None), store)
+
+    with pytest.raises(SyncError, match="trade_cal returned no rows"):
+        service.sync_reference(date(2024, 1, 1), date(2024, 1, 5))
+
+    assert not store.reference_path("trade_cal").exists()
+
+
+def test_read_manifest_rejects_schema_invalid_payload(store: ParquetStore):
+    path = store.manifest_path(date(2024, 1, 2))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"nonsense": true}', encoding="utf-8")
+
+    assert store.read_manifest(date(2024, 1, 2)) is None
+
+
+def test_calendar_with_null_open_date_raises_clear_error(store: ParquetStore):
+    store.write_reference(
+        "trade_cal",
+        pl.DataFrame(
+            {
+                "exchange": ["SSE"],
+                "cal_date": [None],
+                "is_open": [1],
+                "pretrade_date": [None],
+            }
+        ),
+    )
+    service = SyncService(TushareClient(pro=FakePro(), sleep=lambda _: None), store)
+
+    with pytest.raises(SyncError, match="null cal_date"):
+        service.backfill(date(2024, 1, 2), date(2024, 1, 3))

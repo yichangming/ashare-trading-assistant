@@ -20,6 +20,7 @@ _REFERENCE_NAMES = (
     "index_classify",
     "index_member",
 )
+_MAX_REFRESH_LOOKBACK = timedelta(days=365 * 5)
 
 
 class SyncError(RuntimeError):
@@ -46,6 +47,30 @@ def _to_date(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
     return frame
 
 
+def _merge_trade_cal(existing: pl.DataFrame, fresh: pl.DataFrame) -> pl.DataFrame:
+    existing = _to_date(existing, ["cal_date", "pretrade_date"])
+    fresh = _to_date(fresh, ["cal_date", "pretrade_date"])
+    frames = [frame for frame in (existing, fresh) if not frame.is_empty()]
+    if not frames:
+        return pl.DataFrame()
+    merged = (
+        frames[0]
+        if len(frames) == 1
+        else pl.concat(frames, how="vertical_relaxed")
+    )
+    subset = [
+        column for column in ("exchange", "cal_date") if column in merged.columns
+    ]
+    if subset:
+        merged = merged.unique(subset=subset, keep="last")
+    sort_columns = [
+        column for column in ("exchange", "cal_date") if column in merged.columns
+    ]
+    if sort_columns:
+        merged = merged.sort(sort_columns)
+    return merged
+
+
 class SyncService:
     def __init__(self, client: DataSource, store: ParquetStore):
         self.client = client
@@ -54,19 +79,38 @@ class SyncService:
 
     def sync_reference(self, start: date, end: date) -> dict[str, int]:
         self.reference_degraded = []
+        existing_calendar = self.store.read_reference("trade_cal")
+        try:
+            fresh_calendar = self._fetch_trade_cal(start, end)
+        except Exception as exc:
+            if existing_calendar.is_empty():
+                raise SyncError(
+                    f"critical endpoint trade_cal failed: {exc}"
+                ) from exc
+            self.reference_degraded.append(f"trade_cal unavailable: {exc}")
+            fresh_calendar = pl.DataFrame()
+
+        calendar = _merge_trade_cal(existing_calendar, fresh_calendar)
+        if calendar.is_empty():
+            raise SyncError("critical endpoint trade_cal returned no rows")
+
+        try:
+            stock_basic = self._fetch_stock_basic()
+        except Exception as exc:
+            raise SyncError(
+                f"critical endpoint stock_basic failed: {exc}"
+            ) from exc
+        if stock_basic.is_empty():
+            raise SyncError("critical endpoint stock_basic returned no rows")
+
         counts: dict[str, int] = {}
-
-        trade_cal = self._fetch_trade_cal(start, end)
-        trade_cal = _to_date(trade_cal, ["cal_date", "pretrade_date"])
-        self.store.write_reference("trade_cal", trade_cal)
-        counts["trade_cal"] = trade_cal.height
-
-        stock_basic = self._fetch_stock_basic()
+        self.store.write_reference("trade_cal", calendar)
+        counts["trade_cal"] = calendar.height
         stock_basic = _to_date(stock_basic, ["list_date", "delist_date"])
         self.store.write_reference("stock_basic", stock_basic)
         counts["stock_basic"] = stock_basic.height
 
-        optional = (
+        optional: tuple[tuple[str, list[str]], ...] = (
             ("namechange", ["start_date", "end_date"]),
             ("index_classify", []),
             ("index_member", ["in_date", "out_date"]),
@@ -134,11 +178,11 @@ class SyncService:
         calendar = self.store.read_reference("trade_cal")
         if calendar.is_empty():
             raise SyncError("trade_cal is empty; cannot backfill")
-        open_dates = [
-            item
-            for item in calendar.filter(pl.col("is_open") == 1)["cal_date"].to_list()
-            if start <= item <= end
-        ]
+        open_dates = sorted(
+            trade_date
+            for trade_date in self._calendar_open_dates(calendar)
+            if start <= trade_date <= end
+        )
         results: list[SyncResult] = []
         for trade_date in open_dates:
             if not force and self.store.read_manifest(trade_date) is not None:
@@ -152,15 +196,32 @@ class SyncService:
         if re_pull_days < 0:
             raise ValueError("re_pull_days must be non-negative")
         self.reference_degraded = []
-        self._refresh_calendar(as_of)
+        stored_calendar = self.store.read_reference("trade_cal")
+        if stored_calendar.is_empty():
+            raise SyncError(
+                "trade_cal is empty; run sync_reference/backfill first"
+            )
+
+        stored_open_dates = self._calendar_open_dates(stored_calendar)
+        last_open_date = max(stored_open_dates) if stored_open_dates else None
+        refresh_start = as_of - timedelta(days=re_pull_days)
+        if last_open_date is not None:
+            refresh_start = min(refresh_start, last_open_date + timedelta(days=1))
+        refresh_start = max(refresh_start, as_of - _MAX_REFRESH_LOOKBACK)
+        refresh_start = min(refresh_start, as_of)
+
+        self.sync_reference(refresh_start, as_of)
+
         calendar = self.store.read_reference("trade_cal")
         if calendar.is_empty():
-            raise SyncError("trade_cal is empty; cannot sync incrementally")
-        open_dates = [
-            item
-            for item in calendar.filter(pl.col("is_open") == 1)["cal_date"].to_list()
-            if item <= as_of
-        ]
+            raise SyncError(
+                "trade_cal is empty; run sync_reference/backfill first"
+            )
+        open_dates = sorted(
+            trade_date
+            for trade_date in self._calendar_open_dates(calendar)
+            if trade_date <= as_of
+        )
         missing_days = [
             trade_date
             for trade_date in open_dates
@@ -169,6 +230,17 @@ class SyncService:
         recent_days = open_dates[-re_pull_days:] if re_pull_days > 0 else []
         selected = sorted(set(missing_days) | set(recent_days))
         return [self.sync_day(trade_date) for trade_date in selected]
+
+    def _calendar_open_dates(self, calendar: pl.DataFrame) -> list[date]:
+        if "cal_date" not in calendar.columns or "is_open" not in calendar.columns:
+            raise SyncError("trade_cal is missing cal_date or is_open")
+        calendar = _to_date(calendar, ["cal_date"])
+        open_calendar = calendar.filter(pl.col("is_open") == 1)
+        if open_calendar["cal_date"].null_count() > 0:
+            raise SyncError(
+                "trade_cal contains null cal_date values for open days"
+            )
+        return open_calendar["cal_date"].to_list()
 
     def _fetch_trade_cal(self, start: date, end: date) -> pl.DataFrame:
         frames: list[pl.DataFrame] = []
@@ -191,7 +263,11 @@ class SyncService:
             if len(frames) == 1
             else pl.concat(frames, how="vertical_relaxed")
         )
-        subset = [column for column in ("exchange", "cal_date") if column in merged.columns]
+        subset = [
+            column
+            for column in ("exchange", "cal_date")
+            if column in merged.columns
+        ]
         if subset:
             merged = merged.unique(subset=subset, keep="last")
         if "cal_date" in merged.columns:
@@ -223,36 +299,6 @@ class SyncService:
         if "ts_code" in merged.columns:
             merged = merged.unique(subset=["ts_code"], keep="last")
         return merged
-
-    def _refresh_calendar(self, as_of: date) -> None:
-        existing = self.store.read_reference("trade_cal")
-        try:
-            fresh = self._fetch_trade_cal(as_of - timedelta(days=60), as_of)
-        except Exception as exc:
-            if existing.is_empty():
-                raise SyncError(f"trade_cal refresh failed: {exc}") from exc
-            self.reference_degraded.append(f"trade_cal refresh failed: {exc}")
-            return
-
-        fresh = _to_date(fresh, ["cal_date", "pretrade_date"])
-        if existing.is_empty():
-            merged = fresh
-        else:
-            existing = _to_date(existing, ["cal_date", "pretrade_date"])
-            merged = (
-                existing
-                if fresh.is_empty()
-                else pl.concat([existing, fresh], how="vertical_relaxed")
-            )
-        subset = [column for column in ("exchange", "cal_date") if column in merged.columns]
-        if subset:
-            merged = merged.unique(subset=subset, keep="last")
-        sort_columns = [
-            column for column in ("exchange", "cal_date") if column in merged.columns
-        ]
-        if sort_columns:
-            merged = merged.sort(sort_columns)
-        self.store.write_reference("trade_cal", merged)
 
     def _write_manifest(self, result: SyncResult) -> None:
         key = result.trade_date.strftime("%Y%m%d")

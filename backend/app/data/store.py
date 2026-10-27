@@ -11,6 +11,8 @@ from pathlib import Path
 import duckdb
 import polars as pl
 
+from app.data.manifest import DataManifest
+
 _SAFE = re.compile(r"[^a-zA-Z0-9_\-]")
 
 
@@ -113,9 +115,12 @@ class ParquetStore:
             return None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            DataManifest.model_validate(payload)
         except (OSError, ValueError):
             return None
-        return payload if isinstance(payload, dict) else None
+        return payload
 
     def invalidate_manifest(self, trade_date: date) -> None:
         self.manifest_path(trade_date).unlink(missing_ok=True)
