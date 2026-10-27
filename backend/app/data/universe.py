@@ -83,7 +83,7 @@ class UniverseBuilder:
                 f"{as_of}; need at least {min_days}"
             )
 
-    def build(
+    def build_tradeable(
         self,
         as_of: date,
         features: pl.DataFrame,
@@ -91,6 +91,15 @@ class UniverseBuilder:
         namechange: pl.DataFrame,
         config: StrategyConfig,
     ) -> pl.DataFrame:
+        """Build the broad tradable universe as of ``as_of``.
+
+        Only the gates shared by every strategy consumer are applied: the
+        stock must be listed for at least ``template_a.min_listing_days``
+        trading days, non-ST, and non-suspended.  Board, liquidity, and price
+        filters are intentionally omitted so market-wide breadth, industry
+        aggregates, and leader percentiles are not narrowed to the Template-A
+        investment universe.  ``build`` layers the Template-A filters on top.
+        """
         template = config.template_a
         self._check_calendar(as_of, template.min_listing_days)
         if "trade_date" not in features.columns:
@@ -132,10 +141,27 @@ class UniverseBuilder:
             pl.Series("is_st", is_st, dtype=pl.Boolean),
         )
         return merged.filter(
-            pl.col("market").is_in(template.allowed_boards)
-            & (pl.col("listing_days") >= template.min_listing_days)
+            (pl.col("listing_days") >= template.min_listing_days)
             & (~pl.col("is_st"))
             & (~pl.col("is_suspended"))
+        )
+
+    def build(
+        self,
+        as_of: date,
+        features: pl.DataFrame,
+        stocks: pl.DataFrame,
+        namechange: pl.DataFrame,
+        config: StrategyConfig,
+    ) -> pl.DataFrame:
+        tradeable = self.build_tradeable(
+            as_of, features, stocks, namechange, config
+        )
+        if tradeable.is_empty():
+            return tradeable
+        template = config.template_a
+        return tradeable.filter(
+            pl.col("market").is_in(template.allowed_boards)
             & (pl.col("amount_20d_avg") >= template.min_avg_amount)
             & (pl.col("close") >= template.universe_min_price)
         )
