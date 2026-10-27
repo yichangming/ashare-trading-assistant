@@ -8,10 +8,15 @@ from app.core.calendar import TradingCalendar
 from app.core.config import StrategyConfig
 
 
-def _is_st_at(namechange: pl.DataFrame, ts_code: str, as_of: date) -> bool:
+def _is_st_at(
+    namechange: pl.DataFrame, ts_code: str, as_of: date
+) -> bool | None:
     if namechange.is_empty():
-        return False
+        return None
     rows = namechange.filter(pl.col("ts_code") == ts_code)
+    if rows.is_empty():
+        return None
+    active_st = False
     for row in rows.iter_rows(named=True):
         start = row.get("start_date")
         end = row.get("end_date")
@@ -19,9 +24,8 @@ def _is_st_at(namechange: pl.DataFrame, ts_code: str, as_of: date) -> bool:
             continue
         if start <= as_of and (end is None or end >= as_of):
             name = str(row.get("name", ""))
-            if "ST" in name or "退" in name:
-                return True
-    return False
+            active_st = active_st or "ST" in name or "退" in name
+    return active_st
 
 
 class UniverseBuilder:
@@ -61,11 +65,11 @@ class UniverseBuilder:
                 if list_date is not None
                 else 0
             )
-            name = str(row.get("name", ""))
-            name_is_st = "ST" in name or "退" in name
-            is_st.append(
-                _is_st_at(namechange, row["ts_code"], as_of) or name_is_st
-            )
+            historical_st = _is_st_at(namechange, row["ts_code"], as_of)
+            if historical_st is None:
+                name = str(row.get("name", ""))
+                historical_st = "ST" in name or "退" in name
+            is_st.append(historical_st)
         merged = merged.with_columns(
             pl.Series("listing_days", listing_days, dtype=pl.Int64),
             pl.Series("is_st", is_st, dtype=pl.Boolean),

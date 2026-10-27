@@ -14,6 +14,9 @@ class FeatureBuilder:
             ["ts_code", "trade_date"]
         )
         frame = frame.with_columns(
+            pl.int_range(0, pl.len()).over("ts_code").alias("_row_idx")
+        )
+        frame = frame.with_columns(
             (pl.col("close") * pl.col("adj_factor")).alias("hfq_close"),
             (pl.col("high") * pl.col("adj_factor")).alias("hfq_high"),
             (pl.col("low") * pl.col("adj_factor")).alias("hfq_low"),
@@ -163,27 +166,25 @@ class FeatureBuilder:
         )
         frame = frame.with_columns(
             pl.when(pl.col("is_limit_up"))
-            .then(pl.col("trade_date"))
+            .then(pl.col("_row_idx"))
             .otherwise(None)
             .forward_fill()
             .over("ts_code")
-            .alias("last_limit_up_date")
+            .alias("last_limit_up_idx")
         ).with_columns(
-            (pl.col("trade_date") - pl.col("last_limit_up_date"))
-            .dt.total_days()
+            (pl.col("_row_idx") - pl.col("last_limit_up_idx"))
             .fill_null(999)
             .alias("days_since_limit_up")
         )
         frame = frame.with_columns(
             pl.when(pl.col("hfq_close") == pl.col("close_20d_high"))
-            .then(pl.col("trade_date"))
+            .then(pl.col("_row_idx"))
             .otherwise(None)
             .forward_fill()
             .over("ts_code")
-            .alias("last_high_date")
+            .alias("last_high_idx")
         ).with_columns(
-            (pl.col("trade_date") - pl.col("last_high_date"))
-            .dt.total_days()
+            (pl.col("_row_idx") - pl.col("last_high_idx"))
             .fill_null(999)
             .alias("pullback_days")
         )
