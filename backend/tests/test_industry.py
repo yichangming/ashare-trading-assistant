@@ -57,7 +57,7 @@ def _history() -> pl.DataFrame:
     return pl.DataFrame(rows)
 
 
-def _feature_row(code: str, sector: str, **overrides: object) -> dict:
+def _feature_row(code: str, sector: str | None, **overrides: object) -> dict:
     row: dict = {
         "trade_date": date(2024, 1, 4),
         "ts_code": code,
@@ -94,45 +94,112 @@ def test_industry_strength_ranks_and_persists():
     assert sectors[0].red_rate == 0.5
 
 
-def test_industry_strength_excludes_suspended_rows():
-    config = _industry_config(top_n=3, min_stocks=2)
+def test_industry_strength_empty_input_returns_empty():
+    assert (
+        IndustryStrengthService().compute(
+            pl.DataFrame(), date(2024, 1, 4), _industry_config()
+        )
+        == []
+    )
+
+
+def test_industry_strength_handles_empty_industry_mapping():
+    config = _industry_config(top_n=3, min_stocks=1)
+    features = pl.DataFrame([_feature_row("A", "ignored")]).drop("sector")
+    features = features.join(
+        IndustryMap({}, "stock_basic", True).to_frame(),
+        on="ts_code",
+        how="left",
+    )
+    assert features["sector"].null_count() == features.height
+    assert (
+        IndustryStrengthService().compute(
+            features, date(2024, 1, 4), config
+        )
+        == []
+    )
+
+
+def test_industry_strength_drops_null_and_unknown_sectors():
+    config = _industry_config(top_n=1, min_stocks=1)
     frame = pl.DataFrame(
         [
-            _feature_row(
-                "A",
-                "X",
-                above_ma20=True,
-                amount_5d_avg=1.5e8,
-                is_limit_up=True,
-                prev_is_limit_up=True,
-                prev_close=9.9,
-                close=10.0,
-                is_suspended=False,
-            ),
-            _feature_row(
-                "B",
-                "X",
-                above_ma20=False,
-                prev_is_limit_up=True,
-                prev_close=10.0,
-                close=10.0,
-                is_suspended=None,
-            ),
-            _feature_row(
-                "C",
-                "X",
-                above_ma20=False,
-                amount_5d_avg=0.0,
-                is_limit_up=True,
-                prev_is_limit_up=True,
-                prev_close=9.9,
-                close=9.0,
-                is_suspended=True,
-            ),
+            _feature_row("A", None, ret_20d=0.10),
+            _feature_row("B", "", ret_20d=0.90),
+            _feature_row("C", "未知", ret_20d=0.90),
+            _feature_row("D", "银行", ret_20d=0.10),
         ]
     )
     sectors = IndustryStrengthService().compute(
         frame, date(2024, 1, 4), config
+    )
+    assert [strength.sector for strength in sectors] == ["银行"]
+    assert sectors[0].rank == 1
+    assert sectors[0].score == pytest.approx(100.0)
+
+
+def test_industry_strength_excludes_suspended_rows():
+    config = _industry_config(top_n=3, min_stocks=2)
+    prior = date(2024, 1, 3)
+    as_of = date(2024, 1, 4)
+    rows: list[dict] = []
+    for trade_date in (prior, as_of):
+        rows.extend(
+            [
+                _feature_row(
+                    "A",
+                    "X",
+                    trade_date=trade_date,
+                    above_ma20=True,
+                    amount_5d_avg=1.5e8,
+                    is_limit_up=True,
+                    prev_is_limit_up=True,
+                    prev_close=9.9,
+                    close=10.0,
+                    is_suspended=False,
+                ),
+                _feature_row(
+                    "B",
+                    "X",
+                    trade_date=trade_date,
+                    above_ma20=False,
+                    prev_is_limit_up=True,
+                    prev_close=10.0,
+                    close=10.0,
+                    is_suspended=False,
+                ),
+            ]
+        )
+    rows.append(
+        _feature_row(
+            "C",
+            "X",
+            trade_date=prior,
+            above_ma20=False,
+            amount_5d_avg=0.0,
+            is_limit_up=True,
+            prev_is_limit_up=True,
+            prev_close=9.9,
+            close=9.0,
+            is_suspended=False,
+        )
+    )
+    rows.append(
+        _feature_row(
+            "C",
+            "X",
+            trade_date=as_of,
+            above_ma20=False,
+            amount_5d_avg=0.0,
+            is_limit_up=True,
+            prev_is_limit_up=True,
+            prev_close=9.9,
+            close=9.0,
+            is_suspended=True,
+        )
+    )
+    sectors = IndustryStrengthService().compute(
+        pl.DataFrame(rows), as_of, config
     )
     assert len(sectors) == 1
     strength = sectors[0]
@@ -158,6 +225,39 @@ def test_industry_strength_excludes_sectors_below_min_stocks():
     )
     assert [strength.sector for strength in sectors] == ["big"]
     assert sectors[0].stock_count == 3
+
+
+def test_industry_strength_drops_sector_days_with_null_metrics():
+    config = _industry_config(top_n=1, min_stocks=1)
+    frame = pl.DataFrame(
+        [
+            _feature_row(
+                "O", "old", ret_20d=0.10, ret_5d=0.02, above_ma20=True
+            ),
+            _feature_row(
+                "N", "new", ret_20d=None, ret_5d=None, above_ma20=None
+            ),
+        ]
+    )
+    sectors = IndustryStrengthService().compute(
+        frame, date(2024, 1, 4), config
+    )
+    assert [strength.sector for strength in sectors] == ["old"]
+    assert sectors[0].rank == 1
+    assert sectors[0].score == pytest.approx(100.0)
+
+
+def test_industry_strength_returns_empty_when_as_of_absent():
+    config = _industry_config(top_n=3, min_stocks=1)
+    frame = pl.DataFrame([_feature_row("A", "银行")])
+    assert (
+        IndustryStrengthService().compute(frame, date(2024, 1, 1), config)
+        == []
+    )
+    assert (
+        IndustryStrengthService().compute(frame, date(2024, 1, 5), config)
+        == []
+    )
 
 
 def test_industry_strength_persistence_breaks_at_nonleader_day():
@@ -187,18 +287,21 @@ def test_industry_strength_persistence_breaks_at_nonleader_day():
     assert sectors[1].persistent_days == 0
 
 
-def test_industry_strength_handles_ranking_ties():
+def test_industry_strength_handles_ranking_ties_deterministically():
     config = _industry_config(top_n=3, min_stocks=1)
-    frame = pl.DataFrame(
+    forward = pl.DataFrame(
         [_feature_row("A", "A"), _feature_row("B", "B")]
     )
-    sectors = IndustryStrengthService().compute(
-        frame, date(2024, 1, 4), config
-    )
-    assert len(sectors) == 2
-    assert sectors[0].score == pytest.approx(sectors[1].score)
-    assert sectors[0].score == pytest.approx(75.0)
-    assert {strength.rank for strength in sectors} == {1, 2}
+    for frame in (forward, forward.reverse()):
+        sectors = IndustryStrengthService().compute(
+            frame, date(2024, 1, 4), config
+        )
+        assert [(strength.sector, strength.rank) for strength in sectors] == [
+            ("A", 1),
+            ("B", 2),
+        ]
+        assert sectors[0].score == pytest.approx(75.0)
+        assert sectors[1].score == pytest.approx(75.0)
 
 
 def test_industry_strength_respects_as_of():
@@ -224,23 +327,75 @@ def test_industry_strength_respects_as_of():
 
 def test_industry_strength_red_rate_guards_prev_close():
     config = _industry_config(top_n=3, min_stocks=3)
+    rows = []
+    for trade_date in (date(2024, 1, 3), date(2024, 1, 4)):
+        rows.extend(
+            [
+                _feature_row(
+                    "A",
+                    "X",
+                    trade_date=trade_date,
+                    prev_is_limit_up=True,
+                    prev_close=None,
+                    close=10.0,
+                ),
+                _feature_row(
+                    "B",
+                    "X",
+                    trade_date=trade_date,
+                    prev_is_limit_up=True,
+                    prev_close=0.0,
+                    close=10.0,
+                ),
+                _feature_row(
+                    "C",
+                    "X",
+                    trade_date=trade_date,
+                    prev_is_limit_up=True,
+                    prev_close=9.0,
+                    close=10.0,
+                ),
+            ]
+        )
+    sectors = IndustryStrengthService().compute(
+        pl.DataFrame(rows), date(2024, 1, 4), config
+    )
+    assert sectors[0].red_rate == pytest.approx(1 / 3)
+
+
+def test_industry_strength_red_rate_resets_after_missing_market_day():
+    config = _industry_config(top_n=3, min_stocks=1)
+    start = date(2024, 1, 2)
+    middle = date(2024, 1, 3)
+    as_of = date(2024, 1, 4)
     frame = pl.DataFrame(
         [
             _feature_row(
-                "A", "X", prev_is_limit_up=True, prev_close=None, close=10.0
+                "A",
+                "X",
+                trade_date=start,
+                is_limit_up=True,
+                prev_is_limit_up=False,
+                prev_close=9.9,
+                close=10.0,
             ),
+            _feature_row("B", "X", trade_date=start),
+            _feature_row("B", "X", trade_date=middle),
             _feature_row(
-                "B", "X", prev_is_limit_up=True, prev_close=0.0, close=10.0
+                "A",
+                "X",
+                trade_date=as_of,
+                prev_is_limit_up=True,
+                prev_close=9.9,
+                close=10.0,
             ),
-            _feature_row(
-                "C", "X", prev_is_limit_up=True, prev_close=9.0, close=10.0
-            ),
+            _feature_row("B", "X", trade_date=as_of),
         ]
     )
-    sectors = IndustryStrengthService().compute(
-        frame, date(2024, 1, 4), config
-    )
-    assert sectors[0].red_rate == pytest.approx(1 / 3)
+    sectors = IndustryStrengthService().compute(frame, as_of, config)
+    assert len(sectors) == 1
+    assert sectors[0].stock_count == 2
+    assert sectors[0].red_rate == 0.0
 
 
 def test_industry_strength_amount_change_guards_nonpositive_average():
@@ -256,6 +411,18 @@ def test_industry_strength_amount_change_guards_nonpositive_average():
         frame, date(2024, 1, 4), config
     )
     assert sectors[0].amount_change == pytest.approx(1 / 3)
+
+
+def test_industry_strength_validates_required_columns():
+    frame = pl.DataFrame(
+        {"trade_date": [date(2024, 1, 4)], "ts_code": ["A"]}
+    )
+    with pytest.raises(
+        ValueError, match="features_history missing required columns: sector"
+    ):
+        IndustryStrengthService().compute(
+            frame, date(2024, 1, 4), _industry_config()
+        )
 
 
 def test_industry_map_prefers_sw_membership():
@@ -406,6 +573,177 @@ def test_industry_map_parses_string_membership_dates():
     assert mapping.mapping["C"] == "煤炭原始"
 
 
+def test_industry_map_filters_l1_memberships():
+    stocks = pl.DataFrame(
+        {"ts_code": ["A", "B"], "industry": ["银行原始", "地产原始"]}
+    )
+    classify = pl.DataFrame(
+        {
+            "index_code": ["801010.SI", "801011.SI", "801012.SI"],
+            "industry_name": ["银行", "银行二级", "地产二级"],
+            "level": ["L1", "L2", "L2"],
+        }
+    )
+    members = pl.DataFrame(
+        {
+            "con_code": ["A", "A", "B"],
+            "index_code": ["801010.SI", "801011.SI", "801012.SI"],
+            "in_date": [
+                date(2000, 1, 1),
+                date(2023, 1, 1),
+                date(2000, 1, 1),
+            ],
+            "out_date": [None, None, None],
+        }
+    )
+    mapping = IndustryMap.from_sources(
+        stocks, members, classify, as_of=date(2024, 1, 2)
+    )
+    assert mapping.source == "sw"
+    assert not mapping.degraded
+    assert mapping.mapping["A"] == "银行"
+    assert mapping.mapping["B"] == "地产原始"
+
+
+def test_industry_map_filters_to_one_classification_source():
+    stocks = pl.DataFrame(
+        {"ts_code": ["A", "B"], "industry": ["银行原始", "地产原始"]}
+    )
+    classify = pl.DataFrame(
+        {
+            "index_code": ["801010.SI", "801020.SI"],
+            "industry_name": ["银行2021", "地产旧版"],
+            "level": ["L1", "L1"],
+            "src": ["SW2021", "SW"],
+        }
+    )
+    members = pl.DataFrame(
+        {
+            "con_code": ["A", "B"],
+            "index_code": ["801010.SI", "801020.SI"],
+            "in_date": [date(2000, 1, 1), date(2000, 1, 1)],
+            "out_date": [None, None],
+        }
+    )
+    mapping = IndustryMap.from_sources(
+        stocks, members, classify, as_of=date(2024, 1, 2)
+    )
+    assert mapping.source == "sw"
+    assert not mapping.degraded
+    assert mapping.mapping["A"] == "银行2021"
+    assert mapping.mapping["B"] == "地产原始"
+
+
+def test_industry_map_duplicate_memberships_are_deterministic():
+    stocks = pl.DataFrame({"ts_code": ["A"], "industry": ["银行原始"]})
+    classify = pl.DataFrame(
+        {
+            "index_code": ["801010.SI", "801020.SI", "801030.SI"],
+            "industry_name": ["银行", "地产", "煤炭"],
+            "level": ["L1", "L1", "L1"],
+        }
+    )
+    rows = [
+        {
+            "con_code": "A",
+            "index_code": "801020.SI",
+            "in_date": date(2020, 1, 1),
+            "out_date": None,
+        },
+        {
+            "con_code": "A",
+            "index_code": "801010.SI",
+            "in_date": date(2024, 1, 1),
+            "out_date": None,
+        },
+        {
+            "con_code": "A",
+            "index_code": "801030.SI",
+            "in_date": date(2024, 1, 1),
+            "out_date": None,
+        },
+        {
+            "con_code": "A",
+            "index_code": "801040.SI",
+            "in_date": date(2022, 1, 1),
+            "out_date": None,
+        },
+    ]
+    for member_rows in (rows, list(reversed(rows))):
+        mapping = IndustryMap.from_sources(
+            stocks,
+            pl.DataFrame(member_rows),
+            classify,
+            as_of=date(2024, 6, 1),
+        )
+        assert mapping.source == "sw"
+        assert not mapping.degraded
+        assert mapping.mapping["A"] == "银行"
+
+
+def test_industry_map_marks_bad_membership_dates_degraded():
+    stocks = pl.DataFrame(
+        {
+            "ts_code": ["A", "B", "C", "D"],
+            "industry": ["银行原始", "地产原始", "煤炭原始", "钢铁原始"],
+        }
+    )
+    classify = pl.DataFrame(
+        {
+            "index_code": [
+                "801010.SI",
+                "801020.SI",
+                "801030.SI",
+                "801040.SI",
+            ],
+            "industry_name": ["银行", "地产", "煤炭", "钢铁"],
+        }
+    )
+    members = pl.DataFrame(
+        {
+            "con_code": ["A", "B", "C", "D"],
+            "index_code": [
+                "801010.SI",
+                "801020.SI",
+                "801030.SI",
+                "801040.SI",
+            ],
+            "in_date": [
+                "20000101",
+                "not-a-date",
+                None,
+                "20000101",
+            ],
+            "out_date": [None, None, None, "not-a-date"],
+        }
+    )
+    mapping = IndustryMap.from_sources(
+        stocks, members, classify, as_of=date(2024, 1, 2)
+    )
+    assert mapping.source == "sw"
+    assert mapping.degraded
+    assert mapping.mapping["A"] == "银行"
+    assert mapping.mapping["B"] == "地产原始"
+    assert mapping.mapping["C"] == "煤炭原始"
+    assert mapping.mapping["D"] == "钢铁原始"
+
+
+def test_industry_map_raises_when_all_membership_dates_unusable():
+    stocks = pl.DataFrame({"ts_code": ["A"], "industry": ["银行"]})
+    members = pl.DataFrame(
+        {
+            "con_code": ["A"],
+            "index_code": ["801010.SI"],
+            "in_date": ["not-a-date"],
+            "out_date": [None],
+        }
+    )
+    with pytest.raises(ValueError, match="no usable membership rows"):
+        IndustryMap.from_sources(
+            stocks, members, None, as_of=date(2024, 1, 2)
+        )
+
+
 @pytest.mark.parametrize(
     "classify",
     [
@@ -441,6 +779,14 @@ def test_industry_map_uses_index_code_when_classify_name_missing(
 
 def test_industry_map_validates_required_columns():
     stocks = pl.DataFrame({"ts_code": ["A"], "industry": ["银行"]})
+    members = pl.DataFrame(
+        {
+            "con_code": ["A"],
+            "index_code": ["801010.SI"],
+            "in_date": [date(2000, 1, 1)],
+            "out_date": [None],
+        }
+    )
     with pytest.raises(
         ValueError, match="stock_basic missing required columns: ts_code"
     ):
@@ -448,33 +794,25 @@ def test_industry_map_validates_required_columns():
     with pytest.raises(
         ValueError, match="index_member missing required columns: index_code"
     ):
-        IndustryMap.from_sources(
-            stocks,
-            pl.DataFrame(
-                {"con_code": ["A"], "in_date": [date(2000, 1, 1)]}
-            ),
-        )
+        IndustryMap.from_sources(stocks, members.drop("index_code"))
+    with pytest.raises(
+        ValueError, match="index_member missing required columns: in_date"
+    ):
+        IndustryMap.from_sources(stocks, members.drop("in_date"))
+    with pytest.raises(
+        ValueError, match="index_member missing required columns: out_date"
+    ):
+        IndustryMap.from_sources(stocks, members.drop("out_date"))
     with pytest.raises(
         ValueError,
         match="index_member missing required columns: con_code or ts_code",
     ):
-        IndustryMap.from_sources(
-            stocks, pl.DataFrame({"index_code": ["801010.SI"]})
-        )
+        IndustryMap.from_sources(stocks, members.drop("con_code"))
     with pytest.raises(
         ValueError, match="index_classify missing required columns: index_code"
     ):
         IndustryMap.from_sources(
-            stocks,
-            pl.DataFrame(
-                {
-                    "con_code": ["A"],
-                    "index_code": ["801010.SI"],
-                    "in_date": [date(2000, 1, 1)],
-                    "out_date": [None],
-                }
-            ),
-            pl.DataFrame({"industry_name": ["银行"]}),
+            stocks, members, pl.DataFrame({"industry_name": ["银行"]})
         )
 
 

@@ -7,6 +7,28 @@ import polars as pl
 from app.core.config import IndustryConfig
 from app.domain.models import SectorStrength
 
+_REQUIRED_FEATURE_COLUMNS = (
+    "trade_date",
+    "ts_code",
+    "sector",
+    "ret_20d",
+    "ret_5d",
+    "above_ma20",
+    "amount_5d_avg",
+    "amount_20d_avg",
+    "is_limit_up",
+    "prev_is_limit_up",
+    "prev_close",
+    "close",
+)
+_RANKING_METRICS = (
+    "return_20d",
+    "return_5d",
+    "breadth",
+    "amount_change",
+    "limit_up_share",
+)
+
 
 class IndustryStrengthService:
     def compute(
@@ -17,11 +39,46 @@ class IndustryStrengthService:
     ) -> list[SectorStrength]:
         if features_history.is_empty():
             return []
+        missing = [
+            column
+            for column in _REQUIRED_FEATURE_COLUMNS
+            if column not in features_history.columns
+        ]
+        if missing:
+            raise ValueError(
+                "features_history missing required columns: "
+                + ", ".join(missing)
+            )
+
         frame = features_history.filter(pl.col("trade_date") <= as_of)
+        sector = pl.col("sector").cast(pl.String).str.strip_chars()
+        frame = frame.filter(
+            sector.is_not_null() & ~sector.is_in(["", "未知"])
+        )
         if "is_suspended" in frame.columns:
             frame = frame.filter(~pl.col("is_suspended").fill_null(False))
         if frame.is_empty():
             return []
+
+        market_dates = frame.select(
+            pl.col("trade_date").unique().sort()
+        ).with_columns(
+            pl.int_range(0, pl.len()).alias("_market_idx")
+        )
+        frame = frame.join(market_dates, on="trade_date", how="left").sort(
+            ["ts_code", "trade_date"]
+        )
+        previous_market_idx = pl.col("_market_idx").shift(1).over("ts_code")
+        date_gap = previous_market_idx.is_null() | (
+            pl.col("_market_idx") != previous_market_idx + 1
+        )
+        frame = frame.with_columns(
+            pl.when(date_gap)
+            .then(False)
+            .otherwise(pl.col("prev_is_limit_up"))
+            .fill_null(False)
+            .alias("prev_is_limit_up"),
+        )
 
         amount_20d = pl.col("amount_20d_avg")
         frame = frame.with_columns(
@@ -61,6 +118,7 @@ class IndustryStrengthService:
                 pl.col("ts_code").n_unique().alias("stock_count"),
             )
             .filter(pl.col("stock_count") >= config.min_stocks)
+            .drop_nulls(subset=list(_RANKING_METRICS))
         )
         if aggregated.is_empty():
             return []
@@ -111,9 +169,10 @@ class IndustryStrengthService:
             .alias("daily_rank")
         )
 
-        current = ranked.filter(pl.col("trade_date") == as_of).sort(
-            ["score", "sector"], descending=[True, False]
-        )
+        current = ranked.filter(
+            (pl.col("trade_date") == as_of)
+            & pl.col("daily_rank").is_not_null()
+        ).sort(["score", "sector"], descending=[True, False])
         if current.is_empty():
             return []
 
@@ -121,13 +180,15 @@ class IndustryStrengthService:
         for row in ranked.select(
             "trade_date", "sector", "daily_rank"
         ).iter_rows(named=True):
+            if row["daily_rank"] is None:
+                continue
             ranks_by_date.setdefault(row["trade_date"], {})[
                 row["sector"]
             ] = int(row["daily_rank"])
         dates = sorted(ranks_by_date)
 
         results: list[SectorStrength] = []
-        for rank, row in enumerate(current.iter_rows(named=True), start=1):
+        for row in current.iter_rows(named=True):
             streak = 0
             for check_date in reversed(dates):
                 day_rank = ranks_by_date[check_date].get(row["sector"])
@@ -139,7 +200,7 @@ class IndustryStrengthService:
                 SectorStrength(
                     sector=row["sector"],
                     score=float(row["score"]),
-                    rank=rank,
+                    rank=int(row["daily_rank"]),
                     return_20d=float(row["return_20d"]),
                     return_5d=float(row["return_5d"]),
                     breadth=float(row["breadth"]),
