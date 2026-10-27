@@ -202,6 +202,22 @@ def test_quality_without_suspend_partition_uses_count_fallback(
     assert report.coverage == 1.0
 
 
+def test_quality_fallback_flags_unexpected_code_and_exits_one(
+    monkeypatch: pytest.MonkeyPatch, store: ParquetStore
+):
+    _write_stocks(store, ["000001.SZ", "000002.SZ"])
+    store.write_processed("bars", _DAY, _bars("000001.SZ", "000004.SZ"))
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+
+    result = CliRunner().invoke(
+        cli_module.app, ["quality", "--day", "2024-01-02"]
+    )
+
+    assert result.exit_code == 1
+    assert "unexpected_codes" in result.output
+    assert "000004.SZ" in result.output
+
+
 def test_quality_empty_bars_fails_cleanly(store: ParquetStore):
     _write_stocks(store, ["000001.SZ"])
 
@@ -421,6 +437,49 @@ def test_assemble_range_assembles_only_open_days_in_range(
     assert store.read_processed(
         "bars", date(2024, 1, 5), date(2024, 1, 5)
     ).is_empty()
+
+
+def test_assemble_range_rejects_malformed_trade_cal(
+    monkeypatch: pytest.MonkeyPatch, store: ParquetStore
+):
+    store.write_reference("trade_cal", pl.DataFrame({"is_open": [1]}))
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["assemble-range", "--start", "2024-01-02", "--end", "2024-01-03"],
+    )
+
+    assert result.exit_code == 1
+    assert "cal_date" in result.output
+    assert "KeyError" not in result.output
+
+
+def test_assemble_range_does_not_visit_future_dates(
+    monkeypatch: pytest.MonkeyPatch, store: ParquetStore
+):
+    today = date.today()
+    future = today + timedelta(days=1)
+    _write_stocks(store, ["000001.SZ"])
+    _write_raw_day(store, future.strftime("%Y%m%d"))
+    _write_trade_cal(store, [today, future])
+    monkeypatch.setattr(cli_module, "_store", lambda: store)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "assemble-range",
+            "--start",
+            today.isoformat(),
+            "--end",
+            future.isoformat(),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "assembled 0/1" in result.output
+    assert "skipped 1" in result.output
+    assert store.read_processed("bars", future, future).is_empty()
 
 
 def _calendar() -> TradingCalendar:

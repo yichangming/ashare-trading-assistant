@@ -98,7 +98,10 @@ def restart_account(account: AccountState) -> AccountState:
     """Manually clear the drawdown stop latch.
 
     The half-risk latch is intentionally preserved; the next pipeline run
-    clears it once drawdown falls below the recovery threshold.
+    clears it once drawdown falls below the recovery threshold.  Clearing
+    ``trading_halted`` is not permanent: the pipeline re-latches it when
+    drawdown is still at or above the configured stop threshold, which is
+    the intended risk policy rather than a failed restart.
     """
     return account.model_copy(update={"trading_halted": False})
 
@@ -154,7 +157,8 @@ def quality_report(store: ParquetStore, trade_date: date) -> QualityReport:
     A full-day suspension (null/blank ``suspend_timing``) is removed from the
     required-code set, while every listed code remains allowed.  When no
     ``suspend_d`` partition exists at all, fall back to count-based coverage
-    against the full listed universe, as the pipeline does.
+    against the full listed universe with those codes allowed, as the
+    pipeline does.
     """
     provider = ParquetMarketDataProvider(store)
     bars = provider.load_bars(trade_date, trade_date)
@@ -167,7 +171,10 @@ def quality_report(store: ParquetStore, trade_date: date) -> QualityReport:
     suspend = provider.load_suspend(trade_date, trade_date)
     if suspend is None:
         report = DataQualityGate().check(
-            trade_date, bars, expected_count=stocks.height
+            trade_date,
+            bars,
+            expected_count=stocks.height,
+            allowed_codes=stock_codes,
         )
         report.warnings.append(
             "suspend_d unavailable; using count-based coverage"
@@ -239,35 +246,43 @@ def assemble_range(
     """Assemble every open day in ``[start, end]``.
 
     Open days are read from the persisted ``trade_cal`` and are never
-    extended beyond ``end``.  Open days without raw daily data are skipped
-    and reported; critical assembly failures are reported and exit non-zero.
+    extended beyond ``end`` or beyond today, so future dates are not visited.
+    Open days without raw daily data are skipped and reported; critical
+    assembly failures are reported and exit non-zero.
     """
     start_date = parse_date(start)
     end_date = parse_date(end)
     if start_date > end_date:
         raise typer.BadParameter("start must be on or before end")
     store = _store()
-    if store.read_reference("trade_cal").is_empty():
+    reference = store.read_reference("trade_cal")
+    if reference.is_empty():
         typer.echo(
             "trade_cal reference is missing; run the calendar command first",
             err=True,
         )
         raise typer.Exit(code=1)
-    calendar_frame = ParquetMarketDataProvider(store).load_trade_cal(
-        start_date, end_date
-    )
-    if calendar_frame.is_empty():
-        typer.echo(
-            f"no open trading days in {start_date}..{end_date}"
-        )
-        return
-    if not {"cal_date", "is_open"} <= set(calendar_frame.columns):
+    if not {"cal_date", "is_open"} <= set(reference.columns):
         typer.echo(
             "trade_cal is missing cal_date/is_open; refresh it with the "
             "calendar command",
             err=True,
         )
         raise typer.Exit(code=1)
+    effective_end = min(end_date, date.today())
+    if start_date > effective_end:
+        typer.echo(
+            f"no open trading days in {start_date}..{end_date}"
+        )
+        return
+    calendar_frame = ParquetMarketDataProvider(store).load_trade_cal(
+        start_date, effective_end
+    )
+    if calendar_frame.is_empty():
+        typer.echo(
+            f"no open trading days in {start_date}..{end_date}"
+        )
+        return
     open_dates = sorted(
         set(
             calendar_frame.filter(pl.col("is_open") == 1)["cal_date"]
@@ -345,8 +360,10 @@ def run(
     The account is loaded from ``--account-file`` when it exists, otherwise
     built from ``--equity``/``--cash``/``--peak-equity``.  ``--restart``
     manually clears a latched stop before the run and therefore requires an
-    existing account file.  Approved pending plans are merged into the
-    returned account and saved back atomically.
+    existing account file; the pipeline re-latches ``trading_halted`` when
+    drawdown is still at or above the configured stop threshold.  Approved
+    pending plans are merged into the returned account and saved back
+    atomically.
     """
     trade_date = parse_date(day)
     account_path = Path(account_file) if account_file else None
