@@ -15,6 +15,10 @@ class TushareClient:
         max_retries: int = 3,
         sleep=time.sleep,
     ):
+        if max_retries < 1:
+            raise ValueError("max_retries must be at least 1")
+        if rate_limit_per_min < 1:
+            raise ValueError("rate_limit_per_min must be at least 1")
         if pro is None:
             import tushare as ts
 
@@ -22,7 +26,7 @@ class TushareClient:
                 raise ValueError("Tushare token is required when pro is not injected")
             pro = ts.pro_api(token)
         self._pro = pro
-        self._min_interval = 60.0 / max(rate_limit_per_min, 1)
+        self._min_interval = 60.0 / rate_limit_per_min
         self._last_call = 0.0
         self._max_retries = max_retries
         self._sleep = sleep

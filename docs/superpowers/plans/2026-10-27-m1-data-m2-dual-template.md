@@ -1361,7 +1361,7 @@ def test_provider_filters_stock_basic(store: ParquetStore):
         pl.DataFrame(
             {
                 "ts_code": ["000001.SZ", "000002.SZ", "000003.SZ"],
-                "list_date": [date(2000, 1, 1), date(2023, 12, 1), date(2000, 1, 1)],
+                "list_date": [date(2000, 1, 1), date(2024, 12, 1), date(2000, 1, 1)],
                 "delist_date": [None, None, date(2023, 1, 1)],
             }
         ),
