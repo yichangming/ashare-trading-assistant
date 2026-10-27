@@ -63,7 +63,9 @@ Default configuration:
 
 - `backend/configs/app.yaml` chooses data directories (`data/raw`,
   `data/processed`, `data/regime`, all relative to `backend/`), the Tushare
-  provider, the history start, and the API rate limit.
+  provider, and the API rate limit. It also defines `data.history_start`,
+  but that value is currently unused: `sync` and `calendar` require explicit
+  `--start`/`--end` arguments.
 - `backend/configs/strategies/dual_template_v1.yaml` contains the version
   1.1 strategy thresholds, weights, entry/stop/sizing parameters, and risk
   limits. It is validated strictly at load time.
@@ -102,7 +104,8 @@ uv run python -m app.cli assemble-range --start 2018-01-01 --end 2024-12-31
 # 4. Inspect the quality gate for the run day (suspension-aware).
 uv run python -m app.cli quality --day 2024-12-31
 
-# 5. First planning run. --init-account creates the missing account file.
+# 5. First planning run. With --init-account the account file is created
+#    only after a successful run.
 uv run python -m app.cli run \
   --day 2024-12-31 \
   --equity 1000000 \
@@ -132,24 +135,31 @@ uv run python -m app.cli account --account-file data/account.json --clear-pendin
 ### Step details and failure modes
 
 - **`sync`** backfills every open day in `--start..--end` from the persisted
-  `trade_cal`, after refreshing `trade_cal`, `stock_basic`, and optional
-  references. Days with an existing manifest are skipped unless `--force`
-  is passed. Per-day critical endpoints (`daily`, `adj_factor`,
-  `daily_basic`, `stk_limit`, `index_daily`, plus `suspend_d` fetch errors)
-  fail the command; `limit_list_d` and optional references are reported as
-  warnings. The command prints the number of synced trading days.
+  `trade_cal`, after a strict reference refresh of `trade_cal`,
+  `stock_basic`, and optional references. Days with an existing manifest are
+  skipped unless `--force` is passed. A `trade_cal` or `stock_basic` fetch
+  failure aborts the command. Per-day critical endpoints (`daily`,
+  `adj_factor`, `daily_basic`, `stk_limit`, `index_daily`, plus `suspend_d`
+  fetch errors) fail the command; `limit_list_d` and optional references are
+  reported as warnings. The command prints the number of synced trading
+  days.
 - **`calendar`** refreshes and merges reference data for the requested
-  range, including `trade_cal`, without syncing daily bars. Coverage is
-  checked inclusively against the persisted calendar rows; if the calendar
-  does not span both `--start` and `--end`, the command exits non-zero with
-  guidance to backfill an earlier or later window. Use a range with a little
-  margin, because requested boundaries may be non-trading dates.
+  range, including `trade_cal`, without syncing daily bars. It uses a
+  non-strict calendar refresh: if the `trade_cal` fetch fails but a
+  persisted calendar already exists, the failure is reported as a warning
+  and the merge continues. Coverage is then checked inclusively against the
+  persisted calendar rows; if the calendar does not span both `--start` and
+  `--end`, the command exits non-zero with guidance to backfill an earlier
+  or later window. Use a range with a little margin, because requested
+  boundaries may be non-trading dates.
 - **`assemble-range`** reads open days from the persisted `trade_cal` and
   assembles `bars` and `index_bars` for each one. It never visits dates after
   `--end` or after today (Asia/Shanghai), skips open days with no raw
   `daily` partition, reports skipped days, and exits non-zero if any
-  assembly fails. `assemble --day` is the single-day equivalent and fails if
-  that day's raw daily data is missing.
+  assembly fails. It also exits non-zero when the calendar does not span
+  `--start` through the effective end (the earlier of `--end` and today), or
+  when the entire requested range is in the future. `assemble --day` is the
+  single-day equivalent and fails if that day's raw daily data is missing.
 - **`quality`** loads the processed bars for `--day` plus `stock_basic` and
   the raw `suspend_d` partition, prints `passed`, coverage, warning codes,
   and failure codes, and exits non-zero when the gate fails. It does not
@@ -171,18 +181,22 @@ uv run python -m app.cli account --account-file data/account.json --clear-pendin
    latch drawdown state at the configured 10% half-risk and 15% stop levels.
 2. Run the suspension-aware quality gate on the as-of bars.
 3. Build point-in-time features and the tradable universe.
-4. Compute the sentiment stage and trend regime.
-5. Compute industry strength and per-industry leader scores.
-6. Run the dual-template screener (A: mainline pullback, B: sentiment
+4. Compute industry strength.
+5. Compute the sentiment stage.
+6. Compute the market regime from the sentiment stage, industry ranking,
+   breadth, and index trend.
+7. Compute per-industry leader scores.
+8. Run the dual-template screener (A: mainline pullback, B: sentiment
    leader), then filter by `--template-mode`.
-7. Build entry, initial stop, fixed-risk position sizing, and take-profit
+9. Build entry, initial stop, fixed-risk position sizing, and take-profit
    plans for each candidate.
-8. Run the portfolio risk governor, which enforces position slots,
-   per-template caps, industry concentration, cash reserve, total exposure,
-   portfolio heat, duplicate-plan checks, drawdown halt, and correlation
-   limits.
-9. Emit a JSON result and, when `--account-file` is supplied, persist the
-   updated account state atomically.
+10. Run the portfolio risk governor, which enforces position slots,
+    per-template caps, the single-position cap
+    (`max_single_position_pct`), industry concentration, cash reserve,
+    total exposure, portfolio heat, duplicate-plan checks, drawdown halt,
+    and correlation limits.
+11. Emit a JSON result and, when `--account-file` is supplied, persist the
+    updated account state atomically.
 
 Approved plans have status `PENDING_ENTRY`. Plans rejected by the risk
 governor have status `REJECTED` with a `risk_decision` reason; candidates
@@ -192,7 +206,7 @@ is manual.
 
 Output and persistence behavior:
 
-- Without `--output`, the full JSON result (`regime`, `sectors`,
+- Without `--output`, the full JSON result (`as_of`, `regime`, `sectors`,
   `candidates`, `plans`, `rejected`, and `account`) is written to stdout.
   With `--output PATH`, it is written to that file and a summary still goes
   to stderr. `--output` and `--account-file` must be different paths. When
@@ -203,9 +217,10 @@ Output and persistence behavior:
 - If `--account-file` exists, that file is authoritative. Passing
   `--equity`, `--cash`, or `--peak-equity` that differ from the stored values
   prints a warning and the CLI values are ignored. Use
-  `--init-account` only when the file is missing; it creates the file from
+  `--init-account` only when the file is missing. It builds the account from
   the provided values (peak equity defaults to equity and is never below
-  equity).
+  equity), but the file is written only after a successful pipeline run; a
+  failed run leaves no account file.
 - Approved same-day plans are merged into the account's pending plans,
   de-duplicated by `ts_code`, and carry their `expires_on` date. Pending
   plans with `expires_on < run day` are pruned on later runs. Legacy pending
@@ -246,7 +261,7 @@ terminal.
 | `assemble` | `--day YYYY-MM-DD` (required) | Build processed `bars`/`index_bars` for one day from raw partitions | No |
 | `assemble-range` | `--start YYYY-MM-DD` (required), `--end YYYY-MM-DD` (required) | Build processed `bars`/`index_bars` for every open day in range | No |
 | `quality` | `--day YYYY-MM-DD` (required) | Run the suspension-aware quality gate and print warnings/failures | No |
-| `run` | `--day YYYY-MM-DD` (required), `--equity FLOAT` (default 1000000), `--cash FLOAT` (default 1000000), `--peak-equity FLOAT`, `--template-mode A\|B\|dual` (default `dual`), `--account-file PATH`, `--restart`, `--init-account`, `--output PATH` | Run the planning pipeline, print/write JSON, optionally persist account state | No |
+| `run` | `--day YYYY-MM-DD` (required), `--equity FLOAT` (default 1000000), `--cash FLOAT` (default 1000000), `--peak-equity FLOAT`, `--template-mode A\|B\|dual` (default `dual`), `--account-file PATH`, `--restart/--no-restart` (default no-restart), `--init-account`, `--output PATH` | Run the planning pipeline, print/write JSON, optionally persist account state | No |
 | `account` | `--account-file PATH` (required), `--clear-pending` | Inspect account equity/positions/pending/latches, or clear all pending plans | No |
 
 ## Data prerequisites
@@ -285,6 +300,11 @@ When SW membership is unavailable, industry falls back to
 `stock_basic.industry` and the run is marked degraded. A missing
 `index_classify` while membership exists still uses membership, but sector
 names fall back to the index code.
+
+Fetch failures for optional references (`namechange`, `index_classify`,
+`index_member`) are reported as warnings and also remove any previously
+stored copy of that reference, so a run does not mix stale and current
+reference data. The absence is surfaced as a degraded flag where relevant.
 
 ### Processed data written by `assemble` / `assemble-range`
 
@@ -399,7 +419,7 @@ The help output must list `sync`, `calendar`, `assemble`,
 - **`data_version` can fall back.** It is the day manifest hash when a valid
   manifest exists; otherwise the pipeline uses `dv_<YYYY-MM-DD>`. Processed
   data assembled without a manifest therefore has a date-only version.
-- **Plan identity is not byte-reproducible.** Plan/trade IDs use UUID4 and
+- **Plan identity is not byte-reproducible.** Plan IDs use UUID4 and
   `created_at` uses the wall clock, so two identical runs may serialize
   different bytes even though the decision inputs match.
 - **The implementation plan document is stale.** The file under
@@ -411,9 +431,11 @@ The help output must list `sync`, `calendar`, `assemble`,
   score, board height, volume, and turnover rather than exact
   `limit_list_d.first_time` ordering. B-template intraday triggers are daily
   approximations.
-  Correlation uses up to 60 trading days of adjusted, gap-aware returns;
-  pairs with fewer than 20 overlapping observations are labelled
-  "correlation unavailable" rather than blocking the plan.
+  Correlation uses up to 60 trading days of adjusted, gap-aware returns.
+  Individual pairs with fewer than 20 overlapping observations are skipped;
+  if a candidate has partners but none of its pairs reaches 20 observations,
+  the candidate is labelled "correlation unavailable". Such candidates are
+  approved with that note rather than blocked.
 - **Account state is not reconciled automatically.** Equity, cash,
   positions, and peaks are whatever the account JSON says. The pipeline does
   not pull broker balances or update positions from market data; you must
