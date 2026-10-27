@@ -6,22 +6,15 @@ from datetime import date
 
 import polars as pl
 
-_REQUIRED_COLUMNS = (
-    "ts_code",
-    "trade_date",
-    "open",
-    "high",
-    "low",
-    "close",
-    "vol",
-    "amount",
-    "adj_factor",
-)
+_KEY_COLUMNS = ("ts_code", "trade_date")
+_OHLCV_COLUMNS = ("open", "high", "low", "close", "vol", "amount")
 _PRICE_COLUMNS = ("open", "high", "low", "close")
-_FLOAT_COLUMNS = (*_PRICE_COLUMNS, "vol", "amount", "adj_factor")
+_REQUIRED_COLUMNS = (*_KEY_COLUMNS, *_OHLCV_COLUMNS, "adj_factor")
+_FLOAT_COLUMNS = (*_OHLCV_COLUMNS, "adj_factor")
 _SENTIMENT_COUNTS = ("limit_up_count", "limit_down_count", "max_board_height")
-_SENTIMENT_RATES = ("promotion_rate", "blow_rate", "red_rate", "limit_up_premium")
-_SENTIMENT_FIELDS = (*_SENTIMENT_COUNTS, *_SENTIMENT_RATES)
+_SENTIMENT_RATES = ("promotion_rate", "blow_rate", "red_rate")
+_SENTIMENT_PREMIUM = "limit_up_premium"
+_SENTIMENT_FIELDS = (*_SENTIMENT_COUNTS, *_SENTIMENT_RATES, _SENTIMENT_PREMIUM)
 
 
 def _validate_fraction(name: str, value: float) -> float:
@@ -33,6 +26,10 @@ def _validate_fraction(name: str, value: float) -> float:
     ):
         raise ValueError(f"{name} must be a finite number in [0, 1], got {value!r}")
     return float(value)
+
+
+def _is_float_dtype(dtype: pl.DataType) -> bool:
+    return dtype in (pl.Float32, pl.Float64)
 
 
 @dataclass
@@ -58,7 +55,11 @@ class DataQualityGate:
         )
 
     def check(
-        self, trade_date: date, bars: pl.DataFrame, expected_count: int
+        self,
+        trade_date: date,
+        bars: pl.DataFrame,
+        expected_count: int,
+        expected_codes: set[str] | None = None,
     ) -> QualityReport:
         failures: list[str] = []
         warnings: list[str] = []
@@ -97,6 +98,11 @@ class DataQualityGate:
                     f"coverage {coverage:.2%} below {self.min_coverage:.2%}",
                     "coverage_below_min",
                 )
+            if expected_codes:
+                fail(
+                    f"missing expected codes: {len(expected_codes)}",
+                    "missing_expected_codes",
+                )
             return report(coverage)
 
         missing = [column for column in _REQUIRED_COLUMNS if column not in bars.columns]
@@ -127,6 +133,21 @@ class DataQualityGate:
                     "coverage_exceeds_one",
                 )
 
+        if expected_codes is not None:
+            actual_codes = set(bars["ts_code"].drop_nulls().to_list())
+            missing_codes = expected_codes - actual_codes
+            extra_codes = actual_codes - expected_codes
+            if missing_codes:
+                fail(
+                    f"missing expected codes: {len(missing_codes)}",
+                    "missing_expected_codes",
+                )
+            if extra_codes:
+                fail(
+                    f"unexpected codes: {len(extra_codes)}",
+                    "unexpected_codes",
+                )
+
         unique_dates = bars["trade_date"].unique()
         if unique_dates.len() > 1:
             rendered = ", ".join(
@@ -151,47 +172,78 @@ class DataQualityGate:
                 "duplicate_rows",
             )
 
-        null_rows = bars.filter(
-            pl.any_horizontal([pl.col(column).is_null() for column in _REQUIRED_COLUMNS])
+        if "is_suspended" in bars.columns:
+            suspended = (
+                pl.col("is_suspended")
+                .cast(pl.Boolean, strict=False)
+                .fill_null(False)
+            )
+        else:
+            suspended = pl.lit(False, dtype=pl.Boolean)
+
+        def active(condition: pl.Expr) -> pl.Expr:
+            return condition & ~suspended
+
+        null_keys = bars.filter(
+            pl.any_horizontal(
+                [pl.col(column).is_null() for column in _KEY_COLUMNS]
+            )
         ).height
-        if null_rows:
-            fail(f"null OHLCV rows: {null_rows}", "null_ohlcv")
+        if null_keys:
+            fail(f"null key rows: {null_keys}", "null_key")
+
+        null_ohlcv = bars.filter(
+            active(
+                pl.any_horizontal(
+                    [pl.col(column).is_null() for column in _OHLCV_COLUMNS]
+                )
+            )
+        ).height
+        if null_ohlcv:
+            fail(f"null OHLCV rows: {null_ohlcv}", "null_ohlcv")
 
         float_columns = [
             column
             for column in _FLOAT_COLUMNS
-            if bars.schema[column] in (pl.Float32, pl.Float64)
+            if _is_float_dtype(bars.schema[column])
         ]
-        non_finite_conditions = [
-            (~pl.col(column).is_finite()).fill_null(False)
-            for column in float_columns
-        ]
-        if non_finite_conditions:
-            non_finite = bars.filter(
-                pl.any_horizontal(non_finite_conditions)
-            ).height
-            if non_finite:
-                fail(
-                    f"non-finite OHLCV rows: {non_finite}",
-                    "non_finite_ohlcv",
-                )
+        ohlcv_non_finite = pl.any_horizontal(
+            [
+                (~pl.col(column).is_finite()).fill_null(False)
+                for column in float_columns
+            ]
+        )
+        adj_non_finite = (
+            (~pl.col("adj_factor").is_finite()).fill_null(False)
+            if "adj_factor" in float_columns
+            else pl.lit(False)
+        )
+        non_finite = bars.filter(
+            active(ohlcv_non_finite) | adj_non_finite
+        ).height
+        if non_finite:
+            fail(f"non-finite OHLCV rows: {non_finite}", "non_finite_ohlcv")
 
         bad_ohlc = bars.filter(
-            (pl.col("low") > pl.col("open"))
-            | (pl.col("low") > pl.col("close"))
-            | (pl.col("high") < pl.col("open"))
-            | (pl.col("high") < pl.col("close"))
-            | (pl.col("low") > pl.col("high"))
+            active(
+                (pl.col("low") > pl.col("open"))
+                | (pl.col("low") > pl.col("close"))
+                | (pl.col("high") < pl.col("open"))
+                | (pl.col("high") < pl.col("close"))
+                | (pl.col("low") > pl.col("high"))
+            )
         ).height
         if bad_ohlc:
             fail(f"OHLC violations: {bad_ohlc}", "ohlc_violation")
 
         non_positive = bars.filter(
-            pl.any_horizontal(
-                [
-                    (pl.col(column) <= 0).fill_null(False)
-                    for column in _PRICE_COLUMNS
-                ]
+            active(
+                pl.any_horizontal(
+                    [
+                        (pl.col(column) <= 0).fill_null(False)
+                        for column in _PRICE_COLUMNS
+                    ]
+                )
             )
         ).height
         if non_positive:
@@ -204,7 +256,7 @@ class DataQualityGate:
             fail(f"invalid adj_factor rows: {bad_adj}", "invalid_adj_factor")
 
         negative = bars.filter(
-            (pl.col("vol") < 0) | (pl.col("amount") < 0)
+            active((pl.col("vol") < 0) | (pl.col("amount") < 0))
         ).height
         if negative:
             fail(
@@ -217,7 +269,12 @@ class DataQualityGate:
             for column in ("up_limit", "down_limit")
             if column in bars.columns
         ]
-        if len(limit_columns) == 1:
+        if not limit_columns:
+            fail(
+                "missing required columns: up_limit, down_limit",
+                "missing_required_columns",
+            )
+        elif len(limit_columns) == 1:
             missing_limit = (
                 "down_limit" if limit_columns[0] == "up_limit" else "up_limit"
             )
@@ -226,12 +283,33 @@ class DataQualityGate:
                 "partial_limit_columns",
             )
         if limit_columns:
-            null_limits = pl.any_horizontal(
-                [pl.col(column).is_null() for column in limit_columns]
+            non_finite_limit_columns = [
+                column
+                for column in limit_columns
+                if _is_float_dtype(bars.schema[column])
+            ]
+            if non_finite_limit_columns:
+                non_finite_limits = bars.filter(
+                    active(
+                        pl.any_horizontal(
+                            [
+                                (~pl.col(column).is_finite()).fill_null(False)
+                                for column in non_finite_limit_columns
+                            ]
+                        )
+                    )
+                ).height
+                if non_finite_limits:
+                    fail(
+                        f"non-finite limit prices: {non_finite_limits}",
+                        "non_finite_limit_prices",
+                    )
+
+            null_limits = active(
+                pl.any_horizontal(
+                    [pl.col(column).is_null() for column in limit_columns]
+                )
             )
-            if "is_suspended" in bars.columns:
-                suspended = pl.col("is_suspended").fill_null(False)
-                null_limits = null_limits & ~suspended
             null_limit_rows = bars.filter(null_limits).height
             if null_limit_rows:
                 fail(
@@ -249,7 +327,9 @@ class DataQualityGate:
                     pl.col("close") < pl.col("down_limit") - 0.001
                 )
             mismatched = bars.filter(
-                pl.any_horizontal(mismatch_conditions).fill_null(False)
+                active(
+                    pl.any_horizontal(mismatch_conditions).fill_null(False)
+                )
             ).height
             if (
                 bars.height
@@ -318,13 +398,21 @@ class DataQualityGate:
                     "invalid_sentiment_field",
                 )
                 continue
-            if field_name in _SENTIMENT_COUNTS and value < 0:
-                fail(
-                    f"invalid sentiment field: {field_name} "
-                    "(expected non-negative)",
-                    "invalid_sentiment_field",
-                )
-                continue
+            if field_name in _SENTIMENT_COUNTS:
+                if value % 1 != 0:
+                    fail(
+                        f"invalid sentiment field: {field_name} "
+                        "(expected integer)",
+                        "invalid_sentiment_field",
+                    )
+                    continue
+                if value < 0:
+                    fail(
+                        f"invalid sentiment field: {field_name} "
+                        "(expected non-negative)",
+                        "invalid_sentiment_field",
+                    )
+                    continue
             if field_name in _SENTIMENT_RATES and not 0 <= value <= 1:
                 fail(
                     f"invalid sentiment field: {field_name} "

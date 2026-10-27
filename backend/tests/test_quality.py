@@ -379,3 +379,149 @@ def test_sentiment_out_of_range_values_fail():
 def test_invalid_thresholds_raise(kwargs: dict, field: str):
     with pytest.raises(ValueError, match=field):
         DataQualityGate(**kwargs)
+
+
+@pytest.mark.parametrize("premium", [-0.03, 1.2])
+def test_signed_limit_up_premium_passes(premium: float):
+    snapshot = _sentiment()
+    snapshot["limit_up_premium"] = premium
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert report.passed
+    assert report.coverage == 1.0
+
+
+def test_non_finite_limit_up_premium_fails():
+    snapshot = _sentiment()
+    snapshot["limit_up_premium"] = float("inf")
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("limit_up_premium" in item for item in report.failures)
+    assert "invalid_sentiment_field" in report.failure_codes
+    assert report.coverage == 6 / 7
+
+
+def test_fractional_sentiment_count_fails():
+    snapshot = _sentiment()
+    snapshot["limit_up_count"] = 2.5
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert not report.passed
+    assert any("limit_up_count" in item for item in report.failures)
+    assert "invalid_sentiment_field" in report.failure_codes
+    assert report.coverage == 6 / 7
+
+
+def test_integral_float_sentiment_count_passes():
+    snapshot = _sentiment()
+    snapshot["limit_up_count"] = 3.0
+    report = DataQualityGate().check_sentiment(snapshot)
+    assert report.passed
+
+
+@pytest.mark.parametrize("column", ["up_limit", "down_limit"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_limit_prices_fail(column: str, value: float):
+    values = _bars()[column].to_list()
+    values[1] = value
+    bars = _bars().with_columns(pl.Series(column, values))
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("non-finite limit prices: 1" in item for item in report.failures)
+    assert "non_finite_limit_prices" in report.failure_codes
+
+
+def test_suspended_zero_volume_null_price_row_passes():
+    bars = _bars().with_columns(
+        pl.Series("open", [10.0, None]),
+        pl.Series("high", [10.5, None]),
+        pl.Series("low", [9.8, None]),
+        pl.Series("close", [10.2, None]),
+        pl.Series("vol", [100000.0, 0.0]),
+        pl.Series("amount", [1000000.0, 0.0]),
+        pl.Series("up_limit", [11.0, None]),
+        pl.Series("down_limit", [9.0, None]),
+        pl.Series("is_suspended", [False, True]),
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert report.passed, report.failures
+
+
+def test_suspended_zero_price_row_passes():
+    bars = _bars().with_columns(
+        pl.Series("open", [10.0, 0.0]),
+        pl.Series("high", [10.5, 0.0]),
+        pl.Series("low", [9.8, 0.0]),
+        pl.Series("close", [10.2, 0.0]),
+        pl.Series("vol", [100000.0, 0.0]),
+        pl.Series("amount", [1000000.0, 0.0]),
+        pl.Series("is_suspended", [False, True]),
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert report.passed, report.failures
+
+
+def test_suspended_rows_exempt_from_non_finite_values_and_mismatch():
+    bars = _bars().with_columns(
+        pl.Series("close", [10.2, float("nan")]),
+        pl.Series("up_limit", [11.0, float("nan")]),
+        pl.Series("is_suspended", [False, True]),
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert report.passed, report.failures
+
+    mismatched = _bars().with_columns(
+        pl.Series("close", [10.2, 23.0]),
+        pl.Series("high", [10.5, 23.5]),
+        pl.Series("is_suspended", [False, True]),
+    )
+    report = DataQualityGate().check(
+        date(2024, 1, 2), mismatched, expected_count=2
+    )
+    assert report.passed, report.failures
+
+
+def test_suspended_mask_accepts_integer_and_null():
+    bars = _bars().with_columns(
+        pl.Series("up_limit", [None, None]),
+        pl.Series("is_suspended", [1, None], dtype=pl.Int64),
+    )
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any("null limit prices: 1" in item for item in report.failures)
+
+
+def test_missing_both_limit_columns_fail():
+    bars = _bars().drop(["up_limit", "down_limit"])
+    report = DataQualityGate().check(date(2024, 1, 2), bars, expected_count=2)
+    assert not report.passed
+    assert any(
+        "missing required columns" in item
+        and "up_limit" in item
+        and "down_limit" in item
+        for item in report.failures
+    )
+    assert "missing_required_columns" in report.failure_codes
+
+
+def test_expected_codes_clean_match_passes():
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        _bars(),
+        expected_count=2,
+        expected_codes={"000001.SZ", "000002.SZ"},
+    )
+    assert report.passed
+    assert report.failure_codes == []
+
+
+def test_expected_codes_same_count_swap_fails():
+    report = DataQualityGate().check(
+        date(2024, 1, 2),
+        _bars(),
+        expected_count=2,
+        expected_codes={"000001.SZ", "000003.SZ"},
+    )
+    assert not report.passed
+    assert any("missing expected codes: 1" in item for item in report.failures)
+    assert any("unexpected codes: 1" in item for item in report.failures)
+    assert "missing_expected_codes" in report.failure_codes
+    assert "unexpected_codes" in report.failure_codes
