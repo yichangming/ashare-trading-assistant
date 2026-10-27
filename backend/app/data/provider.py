@@ -74,3 +74,9 @@ class ParquetMarketDataProvider:
 
     def load_index_member(self) -> pl.DataFrame:
         return self.store.read_reference("index_member")
+
+    def load_index_classify(self) -> pl.DataFrame:
+        return self.store.read_reference("index_classify")
+
+    def load_limit_list(self, start: date, end: date) -> pl.DataFrame:
+        return self.store.read_processed("limit_list", start, end)
