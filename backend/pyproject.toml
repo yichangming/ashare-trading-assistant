@@ -6,6 +6,7 @@ requires-python = ">=3.11,<3.14"
 dependencies = [
   "pydantic>=2.7,<3",
   "pydantic-settings>=2.3,<3",
+  "python-dotenv>=1,<2",
   "polars>=0.20,<2",
   "pyarrow>=16,<20",
   "duckdb>=1.0,<2",

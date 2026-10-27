@@ -216,13 +216,18 @@ def _warn_authoritative_account(
     equity: float,
     cash: float,
     peak_equity: float | None,
+    explicit: set[str],
 ) -> None:
     differing: list[str] = []
-    if Decimal(str(equity)) != account.equity:
+    if "equity" in explicit and Decimal(str(equity)) != account.equity:
         differing.append("--equity")
-    if Decimal(str(cash)) != account.cash:
+    if "cash" in explicit and Decimal(str(cash)) != account.cash:
         differing.append("--cash")
-    if peak_equity is not None and Decimal(str(peak_equity)) != account.peak_equity:
+    if (
+        "peak_equity" in explicit
+        and peak_equity is not None
+        and Decimal(str(peak_equity)) != account.peak_equity
+    ):
         differing.append("--peak-equity")
     if differing:
         typer.echo(
@@ -328,7 +333,15 @@ def calendar(
     typer.echo(f"reference data refreshed: {rendered}")
     for warning in service.reference_degraded:
         typer.echo(f"WARN: {warning}", err=True)
-    _, cal_max = _calendar_bounds(service.store)
+    cal_min, cal_max = _calendar_bounds(service.store)
+    if cal_min is None or cal_min > start_date:
+        rendered_min = cal_min.isoformat() if cal_min is not None else "unknown"
+        typer.echo(
+            f"WARN: trade_cal starts at {rendered_min}, after requested start "
+            f"{start_date.isoformat()}; sync/backfill an earlier window",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if cal_max is None or cal_max < end_date:
         rendered_max = cal_max.isoformat() if cal_max is not None else "unknown"
         typer.echo(
@@ -484,6 +497,7 @@ def quality(day: str = typer.Option(..., help="YYYY-MM-DD")) -> None:
 @app.command()
 @_command_errors
 def run(
+    ctx: typer.Context,
     day: str = typer.Option(..., help="YYYY-MM-DD"),
     equity: float = typer.Option(1_000_000.0),
     cash: float = typer.Option(1_000_000.0),
@@ -537,8 +551,21 @@ def run(
 
     account = build_account(account_path, equity, cash, peak_equity)
     if account_exists and account_path is not None:
+        explicit = {
+            name
+            for name in ("equity", "cash", "peak_equity")
+            if (
+                (source := ctx.get_parameter_source(name)) is not None
+                and source.name == "COMMANDLINE"
+            )
+        }
         _warn_authoritative_account(
-            account, account_path, equity, cash, peak_equity
+            account,
+            account_path,
+            equity,
+            cash,
+            peak_equity,
+            explicit,
         )
     if restart:
         account = restart_account(account)

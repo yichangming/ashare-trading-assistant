@@ -1042,6 +1042,37 @@ def test_run_warns_when_account_file_is_authoritative(
     assert load_account(path).equity == Decimal("2000000")
 
 
+def test_run_without_explicit_account_args_does_not_warn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr(cli_module, "_store", lambda: _StubStore(None))
+    monkeypatch.setattr(cli_module, "TradingPipeline", _FakePipeline)
+    path = tmp_path / "account.json"
+    save_account(
+        path,
+        _account(
+            equity="2000000", cash="1000000", peak_equity="2000000"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "run",
+            "--day",
+            "2024-01-02",
+            "--account-file",
+            str(path),
+            "--output",
+            str(tmp_path / "result.json"),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "authoritative" not in result.stderr
+    assert load_account(path).equity == Decimal("2000000")
+
+
 def test_run_rejects_output_equal_to_account_file(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -1126,6 +1157,24 @@ def test_calendar_command_warns_when_end_not_covered(
 
     assert result.exit_code == 1
     assert "before requested end" in result.stderr
+
+
+def test_calendar_command_warns_when_start_not_covered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    store = ParquetStore(
+        tmp_path / "raw", tmp_path / "processed", tmp_path / "regime"
+    )
+    service = _fake_service(store, FakePro())
+    monkeypatch.setattr(cli_module, "_sync_service", lambda: service)
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        ["calendar", "--start", "2023-12-31", "--end", "2024-01-05"],
+    )
+
+    assert result.exit_code == 1
+    assert "after requested start" in result.stderr
 
 
 def test_fresh_store_e2e_sync_calendar_assemble_quality(
