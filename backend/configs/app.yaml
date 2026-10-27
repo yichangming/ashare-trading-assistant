@@ -1,0 +1,8 @@
+data:
+  provider: tushare
+  raw_dir: data/raw
+  processed_dir: data/processed
+  regime_dir: data/regime
+  history_start: "2018-01-01"
+  rate_limit_per_min: 180
+strategy_path: configs/strategies/dual_template_v1.yaml

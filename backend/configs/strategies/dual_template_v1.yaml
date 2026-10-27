@@ -1,0 +1,165 @@
+name: dual_template_v1
+version: "1.1"
+environment:
+  index_code: "000985.CSI"
+  fallback_index_code: "000300.SH"
+  ma_fast: 20
+  ma_slow: 60
+  breadth_attack: 0.55
+  breadth_defense: 0.35
+  stage_confirm_days: 2
+  thresholds:
+    freeze:
+      limit_up_max: 30
+      limit_down_min: 20
+      blow_rate_min: 0.40
+      max_board_max: 2
+      red_rate_max: 0.30
+    start:
+      limit_up_min: 30
+      limit_up_max: 60
+      max_board_min: 3
+      max_board_max: 4
+      blow_rate_min: 0.20
+      blow_rate_max: 0.35
+      red_rate_min: 0.40
+      red_rate_max: 0.55
+    ferment:
+      limit_up_min: 60
+      max_board_min: 5
+      blow_rate_max: 0.25
+      red_rate_min: 0.55
+    climax:
+      limit_up_min: 90
+      max_board_min: 6
+      red_rate_min: 0.70
+      blow_rate_rise_pp: 5.0
+      premium_drop_pp: 1.0
+    ebb:
+      limit_up_max: 40
+      limit_down_min: 30
+      blow_rate_min: 0.45
+      red_rate_max: 0.30
+industry:
+  top_n: 3
+  persistence_days: 2
+  min_stocks: 5
+  source: auto
+  weights:
+    return_20d: 0.30
+    return_5d: 0.20
+    breadth: 0.20
+    amount_change: 0.15
+    limit_up_share: 0.15
+leader:
+  top_n_per_industry: 2
+  follower_rank_cutoff: 3
+  amount_vs_leader_min: 0.5
+  weights:
+    rs_20d: 0.25
+    rs_5d: 0.15
+    amount_turnover: 0.20
+    high_distance: 0.15
+    limit_up_status: 0.15
+    size_price_fit: 0.10
+template_a:
+  max_candidates: 15
+  max_per_industry: 2
+  allowed_boards: ["主板", "创业板"]
+  universe_min_price: 3.0
+  min_listing_days: 120
+  min_avg_amount: 100000000
+  min_price: 5.0
+  max_price: 100.0
+  market_cap_min: 5000000000
+  market_cap_max: 50000000000
+  max_distance_from_60d_high: 0.10
+  rs_20d_market_min: 0.70
+  pullback_days_min: 3
+  pullback_days_max: 8
+  volume_shrink_ratio: 1.0
+  ma_zone_pct: 0.02
+  max_ma20_extension: 0.08
+  entry_valid_days: 3
+  max_gap_pct: 0.03
+  stop_min_pct: 0.03
+  stop_max_pct: 0.08
+  atr_buffer: 0.5
+  time_stop_days: 10
+  risk_pct: 0.025
+  take_profit:
+    r1: 1.0
+    r2: 2.0
+    r3: 3.0
+    first_fraction: 0.333333
+    second_fraction: 0.333333
+  score:
+    leader: 0.70
+    setup: 0.30
+template_b:
+  max_candidates: 8
+  max_per_industry: 2
+  min_limit_up_in_sector: 3
+  sector_red_rate_min: 0.50
+  blow_rate_max: 0.35
+  max_board_min: 3
+  volume_ratio_min: 2.0
+  turnover_min: 0.05
+  turnover_max: 0.20
+  market_cap_min: 5000000000
+  market_cap_max: 20000000000
+  price_min: 5.0
+  price_max: 50.0
+  max_board: 4
+  max_20d_gain: 0.80
+  entry_valid_days: 2
+  max_gap_pct: 0.03
+  stop_min_pct: 0.03
+  stop_max_pct: 0.05
+  time_stop_days: 3
+  risk_pct: 0.02
+  take_profit:
+    r1: 1.0
+    r2: 2.0
+    second_fraction: 0.5
+  score:
+    leader: 0.70
+    setup: 0.30
+switching:
+  freeze:
+    a: {enabled: false, mode: observe, max_positions: 0}
+    b: {enabled: false, mode: observe, max_positions: 0}
+    risk_factor: 0.0
+  start:
+    a: {enabled: true, mode: normal, max_positions: 3}
+    b: {enabled: true, mode: normal, max_positions: 1}
+    risk_factor: 0.5
+  ferment:
+    a: {enabled: true, mode: normal, max_positions: 3}
+    b: {enabled: true, mode: normal, max_positions: 2}
+    risk_factor: 1.0
+  climax:
+    a: {enabled: true, mode: pullback_only, max_positions: 3}
+    b: {enabled: false, mode: observe, max_positions: 0}
+    risk_factor: 0.5
+  ebb:
+    a: {enabled: false, mode: observe, max_positions: 0}
+    b: {enabled: false, mode: observe, max_positions: 0}
+    risk_factor: 0.0
+risk:
+  max_positions: 3
+  max_b_positions: 2
+  max_single_position_pct: 0.40
+  min_cash_pct: 0.10
+  max_heat: 0.075
+  max_industry_positions: 2
+  correlation_threshold: 0.80
+  drawdown_half_at: 0.10
+  drawdown_stop_at: 0.15
+  round_trip_cost_pct: 0.003
+  commission_rate: 0.00025
+  commission_min: 5.0
+  stamp_duty_rate: 0.0005
+  transfer_fee_rate: 0.00001
+  slippage_rate: 0.001
+  b_slippage_rate: 0.002
