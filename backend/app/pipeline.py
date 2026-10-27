@@ -415,19 +415,32 @@ class TradingPipeline:
     def _index_ready(
         index_bars: pl.DataFrame, as_of: date, min_bars: int
     ) -> bool:
-        """Return whether ``index_bars`` can produce an as-of regime read."""
+        """Return whether ``index_bars`` can produce an as-of regime read.
+
+        The moving-average window is the trailing ``min_bars`` closes, so
+        that window must be complete and finite; a null or non-finite close
+        earlier in the history cannot fill the gap.
+        """
         if index_bars.is_empty():
             return False
         if not {"trade_date", "close"} <= set(index_bars.columns):
             return False
-        history = index_bars.filter(pl.col("trade_date") <= as_of)
+        history = index_bars.filter(
+            pl.col("trade_date") <= as_of
+        ).sort("trade_date")
+        if history.height < min_bars:
+            return False
         as_of_rows = history.filter(pl.col("trade_date") == as_of)
         if as_of_rows.is_empty() or as_of_rows["close"].is_null().all():
             return False
-        return (
-            history["trade_date"].n_unique() >= min_bars
-            and history["close"].is_not_null().sum() >= min_bars
-        )
+        if history["trade_date"].n_unique() < min_bars:
+            return False
+        trailing = history.tail(min_bars)["close"]
+        if trailing.null_count() > 0:
+            return False
+        if trailing.dtype in (pl.Float32, pl.Float64):
+            return bool(trailing.is_finite().all())
+        return True
 
     @staticmethod
     def _correlation_returns(

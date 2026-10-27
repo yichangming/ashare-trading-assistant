@@ -1205,6 +1205,26 @@ def test_pipeline_raises_when_index_history_insufficient():
         _run_real_path(provider)
 
 
+def test_index_ready_requires_finite_trailing_window():
+    as_of = date(2024, 3, 31)
+    dates = [as_of - timedelta(days=offset) for offset in range(119, -1, -1)]
+    closes = [3000.0 + index for index in range(120)]
+    bars = pl.DataFrame({"trade_date": dates, "close": closes})
+    assert TradingPipeline._index_ready(bars, as_of, 60)
+
+    nulled = list(closes)
+    nulled[-30] = None
+    assert not TradingPipeline._index_ready(
+        bars.with_columns(pl.Series("close", nulled)), as_of, 60
+    )
+
+    non_finite = list(closes)
+    non_finite[-1] = float("inf")
+    assert not TradingPipeline._index_ready(
+        bars.with_columns(pl.Series("close", non_finite)), as_of, 60
+    )
+
+
 def test_pipeline_requested_windows_follow_config():
     config = load_strategy_config()
     template_a = config.template_a.model_copy(
