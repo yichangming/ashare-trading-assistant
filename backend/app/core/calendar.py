@@ -10,7 +10,7 @@ from app.core.dates import parse_date
 
 class TradingCalendar:
     def __init__(self, dates: list[date]):
-        self.dates = sorted(dates)
+        self.dates = sorted(set(dates))
         self._index = {item: i for i, item in enumerate(self.dates)}
 
     def is_trading_day(self, day: date) -> bool:
@@ -19,7 +19,14 @@ class TradingCalendar:
     def add_trading_days(self, day: date, count: int) -> date:
         if day not in self._index:
             raise ValueError(f"{day} is not a trading day")
-        target = min(self._index[day] + count, len(self.dates) - 1)
+        if count < 0:
+            raise ValueError(f"count must be non-negative, got {count}")
+        target = self._index[day] + count
+        if target >= len(self.dates):
+            raise ValueError(
+                f"calendar coverage ends at {self.dates[-1]}; "
+                f"cannot add {count} trading days to {day}"
+            )
         return self.dates[target]
 
     def count_between(self, start: date, end: date) -> int:
