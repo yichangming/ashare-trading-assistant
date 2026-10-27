@@ -17,6 +17,9 @@ from app.domain.enums import (
 )
 from app.domain.money import price
 
+_ZERO = Decimal("0")
+_ONE = Decimal("1")
+
 
 class DomainModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -198,6 +201,8 @@ class AccountState(DomainModel):
     peak_equity: Decimal = Field(gt=0)
     positions: list[PositionState] = Field(default_factory=list)
     pending_plans: list[PendingExposure] = Field(default_factory=list)
+    trading_halted: bool = False
+    drawdown_half_latched: bool = False
 
     @property
     def drawdown_pct(self) -> float:
@@ -227,6 +232,39 @@ class AccountState(DomainModel):
 
     def with_pending(self, exposure: PendingExposure) -> AccountState:
         return self.model_copy(update={"pending_plans": [*self.pending_plans, exposure]})
+
+    def with_risk_latches(
+        self,
+        stop_at: float | Decimal,
+        half_at: float | Decimal,
+        recovery_at: float | Decimal = 0.05,
+    ) -> AccountState:
+        """Return a copy with drawdown latches updated.
+
+        Drawdown is computed with :class:`~decimal.Decimal` so the exact
+        10% and 15% boundaries are not affected by float representation.
+        The stop latch only ever transitions to ``True``; clearing it
+        requires an explicit manual restart.  The half-risk latch sets at
+        ``half_at`` and clears once drawdown falls below ``recovery_at``.
+        """
+        drawdown = max(_ZERO, _ONE - self.equity / self.peak_equity)
+        stop_threshold = Decimal(str(stop_at))
+        half_threshold = Decimal(str(half_at))
+        recovery_threshold = Decimal(str(recovery_at))
+
+        trading_halted = self.trading_halted or drawdown >= stop_threshold
+        if drawdown >= half_threshold:
+            drawdown_half_latched = True
+        elif drawdown < recovery_threshold:
+            drawdown_half_latched = False
+        else:
+            drawdown_half_latched = self.drawdown_half_latched
+        return self.model_copy(
+            update={
+                "trading_halted": trading_halted,
+                "drawdown_half_latched": drawdown_half_latched,
+            }
+        )
 
 
 class TradePlan(DomainModel):

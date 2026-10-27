@@ -60,7 +60,10 @@ class PositionSizer:
     bounded by its regime policy, while Template B is bounded by
     ``min(config.risk.max_b_positions, policy.max_positions)``.  A drawdown of
     at least ``drawdown_stop_at`` rejects; one of at least
-    ``drawdown_half_at`` halves the risk budget.
+    ``drawdown_half_at`` halves the risk budget.  A set
+    ``AccountState.trading_halted`` latch rejects even when the instantaneous
+    drawdown has recovered, and a set ``drawdown_half_latched`` latch keeps
+    the risk budget halved until the caller clears it.
 
     When ``correlations`` is not supplied, ``correlation_unavailable`` is
     recorded in ``constraints_checked`` instead of ``correlation``.
@@ -145,12 +148,21 @@ class PositionSizer:
         drawdown = max(_ZERO, _ONE - equity / peak_equity)
         drawdown_half_at = _dec(config.risk.drawdown_half_at)
         drawdown_stop_at = _dec(config.risk.drawdown_stop_at)
+        if account.trading_halted:
+            raise PositionRejectedError(
+                "drawdown circuit breaker active: trading halted, "
+                "manual restart required"
+            )
         if drawdown >= drawdown_stop_at:
             raise PositionRejectedError(
                 f"drawdown circuit breaker active: {drawdown:.4f} >= "
                 f"{drawdown_stop_at:.4f}"
             )
-        drawdown_factor = _HALF if drawdown >= drawdown_half_at else _ONE
+        drawdown_factor = (
+            _HALF
+            if account.drawdown_half_latched or drawdown >= drawdown_half_at
+            else _ONE
+        )
 
         risk_pct_value = (
             config.template_a.risk_pct
