@@ -27,6 +27,14 @@ class MarketRegimeService:
         data_version: str,
         config: StrategyConfig,
     ) -> MarketRegime:
+        if index_bars.is_empty():
+            raise ValueError(f"index data missing for {as_of}")
+        missing_columns = {"trade_date", "close"} - set(index_bars.columns)
+        if missing_columns:
+            raise ValueError(
+                "index bars missing required columns: "
+                + ", ".join(sorted(missing_columns))
+            )
         fast_window = config.environment.ma_fast
         slow_window = config.environment.ma_slow
         prepared = index_bars.sort("trade_date").with_columns(
@@ -122,7 +130,9 @@ class MarketRegimeService:
         )
         if stage == SentimentStage.CLIMAX:
             a = TemplatePolicy(
-                enabled=True, mode="pullback_only", max_positions=3
+                enabled=stage_policy.a.enabled,
+                mode="pullback_only",
+                max_positions=stage_policy.a.max_positions,
             )
             b = TemplatePolicy(
                 enabled=False, mode="observe", max_positions=0

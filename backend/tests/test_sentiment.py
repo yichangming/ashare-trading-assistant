@@ -62,6 +62,146 @@ def _stage_row(trade_date: date, **overrides: float | int) -> dict:
     return row
 
 
+def _bar(
+    code: str,
+    trade_date: date,
+    *,
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    pre_close: float,
+    up_limit: float,
+    down_limit: float,
+    suspended: bool = False,
+) -> dict:
+    return {
+        "ts_code": code,
+        "trade_date": trade_date,
+        "open": open_,
+        "high": high,
+        "low": low,
+        "close": close,
+        "pre_close": pre_close,
+        "up_limit": up_limit,
+        "down_limit": down_limit,
+        "vol": 0.0 if suspended else 100.0,
+        "amount": 0.0 if suspended else 1000.0,
+        "adj_factor": 1.0,
+        "is_suspended": suspended,
+    }
+
+
+def _multi_stock_bars() -> pl.DataFrame:
+    days = [date(2024, 1, 1) + timedelta(days=offset) for offset in range(4)]
+    # (code, day, open, high, low, close, pre_close, up_limit, down_limit)
+    rows = [
+        ("P", 0, 10.0, 11.0, 10.0, 11.0, 10.0, 11.0, 9.0),
+        ("F", 0, 10.0, 11.0, 10.0, 11.0, 10.0, 11.0, 9.0),
+        ("T2", 0, 10.0, 10.1, 9.9, 10.0, 10.0, 11.0, 9.0),
+        ("D", 0, 10.0, 10.1, 9.9, 10.0, 10.0, 11.0, 9.0),
+        ("P", 1, 11.22, 12.1, 11.2, 12.1, 11.0, 12.1, 9.9),
+        ("F", 1, 11.0, 12.1, 10.4, 10.5, 11.0, 12.1, 9.9),
+        ("T2", 1, 10.0, 11.0, 10.0, 10.2, 10.0, 11.0, 9.0),
+        ("D", 1, 10.0, 10.1, 9.0, 9.0, 10.0, 11.0, 9.0),
+        ("P", 2, 12.1, 12.2, 12.0, 12.1, 12.1, 13.31, 10.89),
+        ("F", 2, 10.5, 10.6, 10.4, 10.5, 10.5, 11.55, 9.45),
+        ("T2", 2, 10.2, 10.3, 10.1, 10.2, 10.2, 11.22, 9.18),
+        ("D", 2, 9.0, 9.1, 8.9, 9.0, 9.0, 9.9, 8.1),
+        ("P", 3, 12.1, 12.2, 12.0, 12.1, 12.1, 13.31, 10.89),
+        ("F", 3, 10.5, 10.6, 10.4, 10.5, 10.5, 11.55, 9.45),
+        ("T2", 3, 10.2, 10.3, 10.1, 10.2, 10.2, 11.22, 9.18),
+        ("D", 3, 9.0, 9.1, 8.9, 9.0, 9.0, 9.9, 8.1),
+    ]
+    return pl.DataFrame(
+        [
+            _bar(
+                code,
+                days[day],
+                open_=open_,
+                high=high,
+                low=low,
+                close=close,
+                pre_close=pre_close,
+                up_limit=up_limit,
+                down_limit=down_limit,
+            )
+            for (
+                code,
+                day,
+                open_,
+                high,
+                low,
+                close,
+                pre_close,
+                up_limit,
+                down_limit,
+            ) in rows
+        ]
+    )
+
+
+def _blow_rate_bars() -> pl.DataFrame:
+    rows = []
+    base = date(2024, 1, 1)
+    for day in range(4):
+        blow_count = 3 if day == 3 else 2
+        for index in range(20):
+            blown = index < blow_count
+            rows.append(
+                _bar(
+                    f"S{index:02d}",
+                    base + timedelta(days=day),
+                    open_=10.0,
+                    high=11.0,
+                    low=10.0,
+                    close=10.5 if blown else 11.0,
+                    pre_close=10.0,
+                    up_limit=11.0,
+                    down_limit=9.0,
+                )
+            )
+    return pl.DataFrame(rows)
+
+
+def _premium_bars() -> pl.DataFrame:
+    rows = []
+    price = 10.0
+    for day in range(5):
+        trade_date = date(2024, 1, 1) + timedelta(days=day)
+        if day < 4:
+            close = round(price * 1.1, 6)
+            rows.append(
+                _bar(
+                    "L",
+                    trade_date,
+                    open_=round(price * 1.02, 6),
+                    high=close,
+                    low=price,
+                    close=close,
+                    pre_close=price,
+                    up_limit=close,
+                    down_limit=round(price * 0.9, 6),
+                )
+            )
+            price = close
+        else:
+            rows.append(
+                _bar(
+                    "L",
+                    trade_date,
+                    open_=round(price * 1.01, 6),
+                    high=round(price * 1.02, 6),
+                    low=price,
+                    close=round(price * 1.02, 6),
+                    pre_close=price,
+                    up_limit=round(price * 1.1, 6),
+                    down_limit=round(price * 0.9, 6),
+                )
+            )
+    return pl.DataFrame(rows)
+
+
 def test_sentiment_history_contains_indicators():
     history = SentimentService().compute_history(_bars())
     last = history.sort("trade_date").tail(1).row(0, named=True)
@@ -216,7 +356,21 @@ def test_limit_flags_require_positive_limits():
 
 
 def test_compute_history_handles_empty_bars():
-    assert SentimentService().compute_history(pl.DataFrame()).is_empty()
+    history = SentimentService().compute_history(pl.DataFrame())
+    assert history.is_empty()
+    assert history.columns == [
+        "trade_date",
+        "limit_up_count",
+        "limit_down_count",
+        "max_board_height",
+        "promotion_rate",
+        "blow_rate",
+        "red_rate",
+        "limit_up_premium",
+        "blow_rate_ma3",
+        "max_board_ma3",
+        "premium_ma3",
+    ]
 
 
 def test_stage_classifier_holds_stage_when_fewer_than_two_conditions():
@@ -319,3 +473,249 @@ def test_stage_classifier_handles_empty_history():
     )
     assert classified.is_empty()
     assert "sentiment_stage" in classified.columns
+    assert "initial_stage" in classified.columns
+
+
+def test_exact_sentiment_metrics_and_prior_means():
+    history = (
+        SentimentService()
+        .compute_history(_multi_stock_bars())
+        .sort("trade_date")
+    )
+    day1, day2, day3, day4 = (
+        history.row(index, named=True) for index in range(4)
+    )
+
+    assert day2["limit_up_count"] == 1
+    assert day2["limit_down_count"] == 1
+    assert day2["max_board_height"] == 2
+    assert day2["promotion_rate"] == pytest.approx(0.5)
+    assert day2["blow_rate"] == pytest.approx(2 / 3)
+    assert day2["red_rate"] == pytest.approx(0.5)
+    assert day2["limit_up_premium"] == pytest.approx(0.01)
+
+    # Prior-3-day means; the first row falls back to its own value.
+    assert day1["blow_rate_ma3"] == pytest.approx(day1["blow_rate"])
+    assert day2["blow_rate_ma3"] == pytest.approx(day1["blow_rate"])
+    assert day3["blow_rate_ma3"] == pytest.approx(
+        (day1["blow_rate"] + day2["blow_rate"]) / 2
+    )
+    assert day4["blow_rate_ma3"] == pytest.approx(2 / 9)
+    assert day4["max_board_ma3"] == pytest.approx(1.0)
+    assert day1["premium_ma3"] == pytest.approx(0.0)
+    assert day2["premium_ma3"] == pytest.approx(0.0)
+    assert day3["premium_ma3"] == pytest.approx(
+        (day1["limit_up_premium"] + day2["limit_up_premium"]) / 2
+    )
+    assert day4["premium_ma3"] == pytest.approx(0.01 / 3)
+
+
+def test_prior_three_day_means_exclude_current_day():
+    blow_history = (
+        SentimentService()
+        .compute_history(_blow_rate_bars())
+        .sort("trade_date")
+    )
+    assert [
+        round(value, 6) for value in blow_history["blow_rate"].to_list()
+    ] == [0.10, 0.10, 0.10, 0.15]
+    blow_last = blow_history.tail(1).row(0, named=True)
+    assert blow_last["blow_rate_ma3"] == pytest.approx(0.10)
+    assert (
+        blow_last["blow_rate"] - blow_last["blow_rate_ma3"]
+    ) * 100 >= 5.0 - 1e-9
+
+    premium_history = (
+        SentimentService()
+        .compute_history(_premium_bars())
+        .sort("trade_date")
+    )
+    assert [
+        round(value, 6) for value in premium_history["limit_up_premium"]
+    ] == [0.0, 0.02, 0.02, 0.02, 0.01]
+    premium_last = premium_history.tail(1).row(0, named=True)
+    assert premium_last["premium_ma3"] == pytest.approx(0.02)
+    assert (
+        premium_last["limit_up_premium"] - premium_last["premium_ma3"]
+    ) * 100 <= -1.0 + 1e-9
+
+
+@pytest.mark.parametrize(
+    ("blow_rate", "blow_rate_ma3", "premium", "premium_ma3"),
+    [
+        (0.15, 0.10, 0.02, 0.02),
+        (0.10, 0.10, 0.01, 0.02),
+    ],
+)
+def test_climax_conditions_use_prior_means(
+    blow_rate: float,
+    blow_rate_ma3: float,
+    premium: float,
+    premium_ma3: float,
+):
+    config = load_strategy_config()
+    first = _stage_row(
+        date(2024, 1, 1),
+        limit_up_count=100,
+        max_board_height=6,
+        red_rate=0.8,
+        blow_rate=blow_rate,
+        blow_rate_ma3=blow_rate_ma3,
+        limit_up_premium=premium,
+        premium_ma3=premium_ma3,
+    )
+    second = {**first, "trade_date": date(2024, 1, 2)}
+    stages = SentimentStageClassifier().classify_series(
+        _history([first, second]), config
+    )["sentiment_stage"].to_list()
+    assert stages == ["start", "climax"]
+
+
+def test_missing_market_day_breaks_board_streak():
+    day1 = date(2024, 1, 1)
+    day2 = date(2024, 1, 2)
+    day3 = date(2024, 1, 3)
+    bars = pl.DataFrame(
+        [
+            _bar(
+                "A",
+                day1,
+                open_=10.0,
+                high=11.0,
+                low=10.0,
+                close=11.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+            # A's day-2 bar is missing; day 2 is still a market date via B.
+            _bar(
+                "A",
+                day3,
+                open_=11.0,
+                high=12.1,
+                low=11.0,
+                close=12.1,
+                pre_close=11.0,
+                up_limit=12.1,
+                down_limit=9.9,
+            ),
+            _bar(
+                "B",
+                day1,
+                open_=10.0,
+                high=10.1,
+                low=9.9,
+                close=10.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+            _bar(
+                "B",
+                day2,
+                open_=10.0,
+                high=10.1,
+                low=9.9,
+                close=10.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+            _bar(
+                "B",
+                day3,
+                open_=10.0,
+                high=10.1,
+                low=9.9,
+                close=10.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+        ]
+    )
+    history = SentimentService().compute_history(bars).sort("trade_date")
+    last = history.row(2, named=True)
+    assert last["max_board_height"] == 1
+    assert last["promotion_rate"] == 0.0
+    assert last["red_rate"] == 0.0
+    assert last["limit_up_premium"] == 0.0
+
+
+def test_suspended_prior_limit_up_excluded_from_red_rate_and_premium():
+    day1 = date(2024, 1, 1)
+    day2 = date(2024, 1, 2)
+    bars = pl.DataFrame(
+        [
+            _bar(
+                "A",
+                day1,
+                open_=10.0,
+                high=11.0,
+                low=10.0,
+                close=11.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+            _bar(
+                "B",
+                day1,
+                open_=10.0,
+                high=11.0,
+                low=10.0,
+                close=11.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+            ),
+            _bar(
+                "A",
+                day2,
+                open_=10.0,
+                high=10.0,
+                low=10.0,
+                close=10.0,
+                pre_close=10.0,
+                up_limit=11.0,
+                down_limit=9.0,
+                suspended=True,
+            ),
+            _bar(
+                "B",
+                day2,
+                open_=11.22,
+                high=11.3,
+                low=11.1,
+                close=11.4,
+                pre_close=11.0,
+                up_limit=12.1,
+                down_limit=9.9,
+            ),
+        ]
+    )
+    history = SentimentService().compute_history(bars).sort("trade_date")
+    last = history.row(1, named=True)
+    assert last["limit_up_count"] == 0
+    assert last["promotion_rate"] == 0.0
+    assert last["red_rate"] == 1.0
+    assert last["limit_up_premium"] == pytest.approx(0.02)
+
+
+def test_classifier_annotates_initial_stage():
+    config = load_strategy_config()
+    history = _history(
+        [
+            _stage_row(date(2024, 1, 1)),
+            _stage_row(date(2024, 1, 2)),
+            _stage_row(date(2024, 1, 3)),
+        ]
+    )
+    classified = SentimentStageClassifier().classify_series(history, config)
+    assert classified["sentiment_stage"].to_list() == [
+        "start",
+        "ferment",
+        "ferment",
+    ]
+    assert classified["initial_stage"].to_list() == [True, False, False]

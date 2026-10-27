@@ -5,7 +5,7 @@ from datetime import date, timedelta
 import polars as pl
 import pytest
 
-from app.core.config import load_strategy_config
+from app.core.config import StrategyConfig, load_strategy_config
 from app.domain.enums import SentimentStage, Template, TrendRegime
 from app.domain.models import MarketRegime
 from app.regime.market import MarketRegimeService
@@ -35,6 +35,24 @@ def _neutral() -> pl.DataFrame:
     )
 
 
+def _between_mas() -> pl.DataFrame:
+    return _index_bars(
+        [300.0 - 4.0 * index for index in range(51)]
+        + [100.0 + 4.0 * (index - 50) for index in range(51, 61)]
+    )
+
+
+def _config_with_climax_a(**updates: object) -> StrategyConfig:
+    base = load_strategy_config()
+    climax = base.switching.climax.model_copy(
+        update={
+            "a": base.switching.climax.a.model_copy(update=updates),
+        }
+    )
+    switching = base.switching.model_copy(update={"climax": climax})
+    return base.model_copy(update={"switching": switching})
+
+
 def _sentiment_row() -> dict:
     return {
         "limit_up_count": 80,
@@ -53,6 +71,7 @@ def _compute(
     stage: SentimentStage,
     breadth: float = 0.60,
     as_of: date = date(2024, 3, 1),
+    config: StrategyConfig | None = None,
 ) -> MarketRegime:
     return MarketRegimeService().compute(
         as_of=as_of,
@@ -63,7 +82,7 @@ def _compute(
         sector_ranking=[],
         degraded_flags=[],
         data_version="dv_test",
-        config=load_strategy_config(),
+        config=config if config is not None else load_strategy_config(),
     )
 
 
@@ -181,3 +200,76 @@ def test_future_index_bars_do_not_change_regime():
     full = _compute(full_bars, stage=SentimentStage.FERMENT, as_of=as_of)
     truncated = _compute(_rising(), stage=SentimentStage.FERMENT, as_of=as_of)
     assert full.model_dump() == truncated.model_dump()
+
+
+@pytest.mark.parametrize(
+    ("breadth", "expected", "risk_factor"),
+    [
+        (0.35, TrendRegime.NEUTRAL, 0.5),
+        (0.55, TrendRegime.ATTACK, 1.0),
+    ],
+)
+def test_breadth_threshold_boundaries(
+    breadth: float, expected: TrendRegime, risk_factor: float
+):
+    regime = _compute(_rising(), stage=SentimentStage.FERMENT, breadth=breadth)
+    assert regime.trend_regime == expected
+    assert regime.risk_factor == pytest.approx(risk_factor)
+
+
+def test_index_between_mas_is_defensive_before_attack():
+    regime = _compute(
+        _between_mas(), stage=SentimentStage.FERMENT, breadth=0.55
+    )
+    assert regime.indicators.index_close < regime.indicators.index_ma60
+    assert regime.indicators.index_close > regime.indicators.index_ma20
+    assert regime.trend_regime == TrendRegime.DEFENSIVE
+    assert regime.risk_factor == 0.0
+    assert all(
+        not policy.enabled
+        for policy in regime.template_availability.values()
+    )
+
+
+def test_insufficient_index_history_raises():
+    short = _index_bars([100.0 + index for index in range(30)])
+    with pytest.raises(ValueError, match="index history insufficient"):
+        _compute(
+            short,
+            stage=SentimentStage.FERMENT,
+            as_of=date(2024, 1, 30),
+        )
+
+
+def test_empty_index_bars_raise():
+    with pytest.raises(ValueError, match="index data missing"):
+        _compute(pl.DataFrame(), stage=SentimentStage.FERMENT)
+
+
+def test_index_bars_missing_columns_raise():
+    bars = pl.DataFrame({"trade_date": [date(2024, 3, 1)]})
+    with pytest.raises(ValueError, match="missing required columns"):
+        _compute(bars, stage=SentimentStage.FERMENT)
+
+
+def test_climax_uses_configured_a_max_positions():
+    config = _config_with_climax_a(enabled=True, max_positions=2)
+    regime = _compute(_rising(), stage=SentimentStage.CLIMAX, config=config)
+    a = regime.template_availability[Template.A]
+    assert a.enabled
+    assert a.mode == "pullback_only"
+    assert a.max_positions == 2
+    b = regime.template_availability[Template.B]
+    assert not b.enabled
+    assert b.max_positions == 0
+
+
+def test_climax_disabled_a_stays_disabled():
+    config = _config_with_climax_a(enabled=False, max_positions=0)
+    regime = _compute(_rising(), stage=SentimentStage.CLIMAX, config=config)
+    a = regime.template_availability[Template.A]
+    assert not a.enabled
+    assert a.max_positions == 0
+    b = regime.template_availability[Template.B]
+    assert not b.enabled
+    assert b.max_positions == 0
