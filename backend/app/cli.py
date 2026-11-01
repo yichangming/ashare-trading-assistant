@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import os
 import tempfile
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 from app.core.config import BACKEND_ROOT, load_app_config, load_strategy_config
 from app.core.dates import parse_date
 from app.core.errors import DataNotReadyError, DataQualityError
+from app.core.logging import configure_logging
 from app.data.assemble import DataAssembler
 from app.data.provider import ParquetMarketDataProvider
 from app.data.quality import (
@@ -40,9 +42,14 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 app = typer.Typer(
-    help="A-share data and dual-template planning CLI",
+    help="A-share data, A-F planning, account and web CLI",
     rich_markup_mode=None,
 )
+
+
+@app.callback()
+def _bootstrap() -> None:
+    configure_logging()
 
 
 def _command_errors(func: Callable[P, R]) -> Callable[P, R]:
@@ -666,6 +673,142 @@ def account(
             f"shares={exposure.shares} entry={exposure.entry_price} "
             f"stop={exposure.stop_price} expires_on={exposure.expires_on}"
         )
+
+
+@app.command()
+@_command_errors
+def serve(
+    host: str | None = typer.Option(None, help="Bind host; defaults to web.host"),
+    port: int | None = typer.Option(None, help="Bind port; defaults to web.port"),
+    scheduler: bool = typer.Option(
+        False,
+        "--scheduler/--no-scheduler",
+        help="Run the in-process APScheduler (one worker only)",
+    ),
+) -> None:
+    """Serve the local web dashboard and JSON API."""
+    _load_env()
+    if scheduler:
+        os.environ["ASHARE_ENABLE_SCHEDULER"] = "1"
+    from app.core.full_config import load_full_config
+
+    web = load_full_config().web
+    import uvicorn
+
+    uvicorn.run(
+        "app.api.app:create_app",
+        factory=True,
+        host=host or web.host,
+        port=port or web.port,
+        workers=1,
+    )
+
+
+@app.command()
+@_command_errors
+def migrate() -> None:
+    """Apply Alembic migrations to the operational SQLite database."""
+    _load_env()
+    from alembic.config import Config
+
+    from alembic import command
+
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
+    command.upgrade(config, "head")
+    typer.echo("database is at head")
+
+
+@app.command()
+@_command_errors
+def daily(
+    day: str | None = typer.Option(None, help="YYYY-MM-DD; defaults to today"),
+    strategy_mode: str = typer.Option("all", help="A-F strategy or 'all'"),
+    force: bool = typer.Option(False, help="Re-run even if the job succeeded"),
+) -> None:
+    """Run the idempotent post-close pipeline and write the daily report."""
+    _load_env()
+    from app.core.full_config import load_full_config
+    from app.db.session import prepare_database
+    from app.jobs.daily import DailyJobService
+
+    prepare_database()
+    service = DailyJobService(
+        provider=ParquetMarketDataProvider(_store()),
+        config=load_full_config(),
+    )
+    outcome = service.run(
+        parse_date(day) if day else _today(),
+        strategy_mode=strategy_mode,
+        force=force,
+    )
+    typer.echo(
+        f"status={outcome.status} skipped={outcome.skipped} "
+        f"plans={len(outcome.plans)}"
+    )
+    if outcome.report:
+        typer.echo(f"report={outcome.report.get('markdown_path', '')}")
+
+
+@app.command()
+@_command_errors
+def backtest(
+    start: str = typer.Option(..., help="YYYY-MM-DD"),
+    end: str = typer.Option(..., help="YYYY-MM-DD"),
+    initial_equity: float = typer.Option(1_000_000.0),
+    strategy_mode: str = typer.Option("all", help="A-F strategy or 'all'"),
+    demo: bool = typer.Option(False, "--demo/--no-demo"),
+    max_days: int | None = typer.Option(None, help="Limit the replay length"),
+    output: Path | None = typer.Option(None, help="Write JSON result to this path"),
+) -> None:
+    """Replay the shared daily decision pipeline over a historical range."""
+    _load_env()
+    from app.backtest.engine import BacktestEngine
+    from app.core.full_config import load_full_config
+
+    engine = BacktestEngine(
+        provider=ParquetMarketDataProvider(_store()),
+        config=load_full_config(),
+    )
+    result = engine.run(
+        parse_date(start),
+        parse_date(end),
+        initial_equity=initial_equity,
+        strategy_mode=strategy_mode,
+        max_days=max_days,
+        is_demo=demo,
+    )
+    payload = json.dumps(result.model_dump(mode="json"), ensure_ascii=False, indent=2)
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(payload, encoding="utf-8")
+        typer.echo(f"written to {output}", err=True)
+    else:
+        typer.echo(payload)
+    typer.echo(
+        f"trades={len(result.trades)} final_equity={result.final_equity} "
+        f"total_return={result.total_return:.4f}",
+        err=True,
+    )
+
+
+@app.command("events-import")
+@_command_errors
+def events_import(
+    path: Path = typer.Argument(..., help="CSV or JSON events file"),
+    source: str = typer.Option("manual", help="Source label stored with events"),
+) -> None:
+    """Import manually verified events for the F strategy."""
+    _load_env()
+    from app.db.session import prepare_database, session_scope
+    from app.events.ingest import EventIngestor
+
+    if not path.is_file():
+        raise ValueError(f"event file does not exist: {path}")
+    prepare_database()
+    with session_scope() as session:
+        imported = EventIngestor(session).ingest_manual_file(path, source=source)
+    typer.echo(f"imported={imported}")
 
 
 if __name__ == "__main__":

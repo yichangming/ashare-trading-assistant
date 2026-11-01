@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}今日总览 · 交易辅助台{% endblock %}
+{% block content %}
+{% set trend = regime.trend_regime if regime else 'unknown' %}
+{% set stage = regime.sentiment_stage if regime else 'unknown' %}
+{% set risk = regime.risk_factor if regime else 0 %}
+{% set global_risk = regime.global_risk if regime else 'normal' %}
+<div class="hero">
+  <section class="card">
+    <div class="eyebrow">MARKET VERDICT</div>
+    <div class="verdict">
+      <div class="copy">
+        <h1>{{ trend }} / {{ stage }}</h1>
+        <p class="muted">趋势 {{ trend }} · 情绪 {{ stage }} · 风险系数 <span class="mono">{{ '%.2f'|format(risk) }}</span></p>
+        <p class="muted small">宽度 {{ '%.1f%%'|format((regime.indicators.breadth * 100) if regime else 0) }} · 波动 {{ regime.volatility_label if regime else '-' }} · 流动性 {{ regime.liquidity_label if regime else '-' }}</p>
+        {% if regime and regime.degraded_flags %}
+        <p class="small cinnabar">数据降级：{{ regime.degraded_flags|join('、') }}</p>
+        {% endif %}
+      </div>
+      <div class="seal {{ 'ok' if global_risk == 'normal' else ('warn' if global_risk == 'reduce' else '') }}">
+        {{ '可决策' if global_risk == 'normal' else ('建议减仓' if global_risk == 'reduce' else ('暂停新增' if global_risk == 'pause_new' else '清仓复核')) }}
+      </div>
+    </div>
+  </section>
+  <section class="card">
+    <div class="eyebrow">ACCOUNT RISK</div>
+    <div class="grid two" style="margin-top:.5rem">
+      <div><div class="stat-label">权益</div><div class="stat">{{ '%.0f'|format(account.equity) if account else '—' }}</div></div>
+      <div><div class="stat-label">现金</div><div class="stat">{{ '%.0f'|format(account.cash) if account else '—' }}</div></div>
+      <div><div class="stat-label">持仓</div><div class="stat">{{ positions|length }}</div></div>
+      <div><div class="stat-label">待执行计划</div><div class="stat">{{ plans|selectattr('status','equalto','PENDING_EXECUTION')|list|length + plans|selectattr('status','equalto','PENDING_ENTRY')|list|length }}</div></div>
+    </div>
+    <div class="stat-label" style="margin-top:.7rem">组合 heat {{ '%.2f%%'|format((account.heat * 100) if account else 0) }} / 7.50%</div>
+    <div class="heatbar"><span style="width: {{ [(account.heat / 0.075 * 100) if account else 0, 100]|min }}%"></span></div>
+    {% if account and not account.risk_config_configured %}<p class="small cinnabar" style="margin-top:.5rem">真实账户风险配置未完成：不会生成假装适用的股数。</p>{% endif %}
+  </section>
+</div>
+
+<section class="card" style="margin-top:.9rem">
+  <div class="card-head"><div class="eyebrow">STRATEGY PERMISSIONS</div><span class="muted small">A 趋势回踩 · B 涨停承接 · C 平台突破 · D 超跌修复 · E 区间 · F 事件</span></div>
+  <div class="permissions">
+    {% for letter in ['A','B','C','D','E','F'] %}
+    {% set perm = (regime.strategy_permissions[letter] if regime and regime.strategy_permissions and letter in regime.strategy_permissions else {'mode':'paused','risk_factor':0,'reasons':[]}) %}
+    <div class="perm {{ perm.mode }}">
+      <div class="letter">{{ letter }}</div>
+      <div class="state">{{ {'normal':'可做','reduced':'降档','paused':'暂停'}.get(perm.mode, perm.mode) }}</div>
+      <div class="muted small mono">{{ '%.2f'|format(perm.risk_factor) }}</div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+
+<div class="grid two" style="margin-top:.9rem">
+  <section class="card flush">
+    <div class="card-head" style="padding:1rem 1rem 0"><h2>待执行计划</h2><a class="small" href="/plans">全部计划 →</a></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>代码</th><th>策略</th><th>入场</th><th>止损</th><th>股数</th><th>状态</th></tr></thead>
+        <tbody>
+        {% for plan in plans[:8] %}
+          <tr><td class="mono">{{ plan.ts_code }}</td><td>{{ plan.strategy }}</td><td class="num">{{ plan.entry }}</td><td class="num">{{ plan.stop }}</td><td class="num">{{ plan.shares }}</td><td><span class="tag {{ 'ok' if 'PENDING' in plan.status else '' }}">{{ plan.status }}</span></td></tr>
+        {% else %}
+          <tr><td colspan="6" class="empty">暂无计划。盘后任务会在此生成。</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>通知与数据</h2><a class="small" href="/notifications">通知中心 →</a></div>
+    {% for item in notifications[:6] %}
+      <div class="notice {{ 'risk' if item.level in ['risk','critical'] else '' }}" style="margin-bottom:.45rem">
+        <strong>{{ item.title }}</strong><div class="small muted">{{ item.message }}</div>
+      </div>
+    {% else %}<p class="empty">暂无未处理通知。</p>{% endfor %}
+    <div class="small muted" style="margin-top:.6rem">
+      最新行情：{{ data_status.latest_processed or '—' }} · 账户同步：{{ account.last_synced_at if account and account.last_synced_at else '—' }}
+      {% if data_status.stale %}<span class="cinnabar">（数据可能过期）</span>{% endif %}
+    </div>
+  </section>
+</div>
+{% endblock %}

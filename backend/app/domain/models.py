@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.domain.enums import (
+    AccountMode,
     EntryType,
+    GlobalRiskMode,
+    PermissionMode,
     PlanStatus,
     RiskOutcome,
     SentimentStage,
+    Strategy,
+    SubMode,
     Template,
     TrendRegime,
 )
@@ -60,6 +65,14 @@ class SectorStrength(DomainModel):
     persistent_days: int = Field(ge=0)
 
 
+class StrategyPermission(DomainModel):
+    strategy: Strategy
+    mode: PermissionMode
+    risk_factor: float = Field(ge=0, le=1)
+    reasons: list[str] = Field(default_factory=list)
+    data_time: datetime | None = None
+
+
 class MarketRegime(DomainModel):
     trade_date: date
     trend_regime: TrendRegime
@@ -70,6 +83,15 @@ class MarketRegime(DomainModel):
     sector_ranking: list[SectorStrength] = Field(default_factory=list)
     degraded_flags: list[str] = Field(default_factory=list)
     data_version: str
+    strategy_permissions: dict[Strategy, StrategyPermission] = Field(
+        default_factory=dict
+    )
+    global_risk: GlobalRiskMode = GlobalRiskMode.NORMAL
+    risk_reasons: list[str] = Field(default_factory=list)
+    breadth_label: str = "normal"
+    volatility_label: str = "normal"
+    liquidity_label: str = "normal"
+    decline_diffusion: float = 1.0
 
     @model_validator(mode="after")
     def _both_templates(self) -> MarketRegime:
@@ -81,7 +103,7 @@ class MarketRegime(DomainModel):
 class Candidate(DomainModel):
     ts_code: str
     trade_date: date
-    template: Template
+    template: Template = Template.A
     setup_type: str
     horizon: Literal["short", "mid"]
     sector: str
@@ -93,6 +115,11 @@ class Candidate(DomainModel):
     sentiment_stage: SentimentStage
     strategy_version: str
     data_version: str
+    strategy: Strategy | None = None
+    sub_mode: SubMode | None = None
+    permission: PermissionMode = PermissionMode.NORMAL
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    data_time: datetime | None = None
 
 
 class EntryPlan(DomainModel):
@@ -101,6 +128,7 @@ class EntryPlan(DomainModel):
     entry_zone_low: Decimal | None = Field(default=None, gt=0)
     entry_zone_high: Decimal | None = Field(default=None, gt=0)
     validity_days: int = Field(gt=0)
+    validity_minutes: int | None = Field(default=None, gt=0)
     max_chase_pct: float = Field(ge=0)
     cancel_conditions: list[str] = Field(default_factory=list)
     expires_on: date
@@ -175,8 +203,10 @@ class PendingExposure(DomainModel):
     entry_price: Decimal = Field(gt=0)
     stop_price: Decimal = Field(gt=0)
     shares: int = Field(ge=0)
-    template: Template
+    template: Template = Template.A
     expires_on: date | None = None
+    strategy: Strategy | None = None
+    sub_mode: SubMode | None = None
 
     @model_validator(mode="after")
     def _stop_below_entry(self) -> PendingExposure:
@@ -193,7 +223,13 @@ class PositionState(DomainModel):
     cost_price: Decimal = Field(gt=0)
     current_stop: Decimal = Field(gt=0)
     current_price: Decimal = Field(gt=0)
-    template: Template
+    template: Template = Template.A
+    strategy: Strategy | None = None
+    sub_mode: SubMode | None = None
+    primary_strategy: Strategy | None = None
+    initial_r: Decimal | None = None
+    initial_shares: int = Field(default=0, ge=0)
+    add_on_count: int = Field(default=0, ge=0)
 
 
 class AccountState(DomainModel):
@@ -204,6 +240,10 @@ class AccountState(DomainModel):
     pending_plans: list[PendingExposure] = Field(default_factory=list)
     trading_halted: bool = False
     drawdown_half_latched: bool = False
+    mode: AccountMode = AccountMode.PAPER
+    risk_config_configured: bool = False
+    last_synced_at: datetime | None = None
+    stale: bool = False
 
     @property
     def drawdown_pct(self) -> float:
@@ -283,6 +323,17 @@ class TradePlan(DomainModel):
     data_version: str
     code_version: str
     reasons: list[str] = Field(default_factory=list)
+    strategy: Strategy | None = None
+    sub_mode: SubMode | None = None
+    signal_time: datetime | None = None
+    data_time: datetime | None = None
+    confirmation_price: Decimal | None = Field(default=None, gt=0)
+    max_acceptable_price: Decimal | None = Field(default=None, gt=0)
+    execution_low: Decimal | None = Field(default=None, gt=0)
+    execution_high: Decimal | None = Field(default=None, gt=0)
+    cancel_reason: str | None = None
+    target_status: Literal["known", "unknown"] = "known"
+    risk_notes: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _entry_above_stop(self) -> TradePlan:

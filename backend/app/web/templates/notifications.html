@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}通知中心 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head"><div><div class="eyebrow">ALERTS</div><h1>通知中心</h1><p class="muted small">风险优先、去重；确认后从未处理列表移除。</p></div><a class="btn small" href="/notifications?all=1">显示全部</a></div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>级别</th><th>标题</th><th>内容</th><th>交易日</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody>
+    {% for item in notifications %}
+      <tr>
+        <td><span class="tag {{ 'risk' if item.level in ['risk','critical'] else '' }}">{{ item.level }}</span></td>
+        <td><strong>{{ item.title }}</strong><div class="muted small">{{ item.code }}</div></td>
+        <td class="small">{{ item.message }}</td>
+        <td class="mono small">{{ item.trade_date or '—' }}</td>
+        <td>{{ '已确认' if item.acknowledged_at else '未处理' }}</td>
+        <td>{% if not item.acknowledged_at %}<form method="post" action="/notifications/{{ item.id }}/ack"><button class="btn small" type="submit">确认</button></form>{% else %}<span class="muted small">—</span>{% endif %}</td>
+      </tr>
+    {% else %}<tr><td colspan="6" class="empty">暂无通知。</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</div>
+{% endblock %}

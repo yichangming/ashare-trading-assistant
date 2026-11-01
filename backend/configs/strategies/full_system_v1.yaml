@@ -1,0 +1,173 @@
+name: full_system_v1
+version: "1.0"
+
+market:
+  index_code: "000985.CSI"
+  fallback_index_code: "000300.SH"
+  ma_fast: 20
+  ma_slow: 60
+  slope_window: 10
+  breadth_attack: 0.55
+  breadth_defense: 0.35
+  breadth_exit: 0.45
+  vol_stress_percentile: 0.85
+  liquidity_dry_ratio: 0.70
+  decline_diffusion: 1.5
+  confirm_days: 2
+
+universe:
+  allowed_boards: ["主板", "创业板", "科创板"]
+  min_listing_days: 120
+  min_avg_amount: 100000000
+  b_min_avg_amount: 50000000
+  min_price: 3.0
+  max_price: 200.0
+  market_cap_min: 3000000000
+  market_cap_max: 80000000000
+  b_market_cap_min: 3000000000
+  b_market_cap_max: 30000000000
+
+strategies:
+  a:
+    rs_min: 0.70
+    pullback_window: 20
+    pullback_min_days: 3
+    pullback_max_days: 8
+    pullback_depth_min: 0.02
+    pullback_depth_max: 0.15
+    touch_atr: 0.5
+    stop_atr: 0.5
+    stop_min: 0.03
+    stop_max: 0.08
+    time_stop_days: 10
+    r2: 2.0
+    r3: 3.0
+    first_fraction: 0.333333
+    second_fraction: 0.333333
+    risk_pct: 0.025
+  b:
+    board_min: 1
+    board_max: 2
+    observe_days: 3
+    stop_atr: 0.5
+    stop_min: 0.03
+    stop_max: 0.05
+    time_stop_days: 3
+    risk_pct: 0.02
+    b2_bar_minutes: 5
+    b2_stabilize_count: 2
+    b2_valid_minutes: 10
+    b2_max_attempts: 2
+    b2_last_signal_time: "14:50"
+    b2_stop_max: 0.03
+    b2_stop_min: 0.015
+  c:
+    platform_window: 20
+    width_min: 0.04
+    width_max: 0.15
+    min_touches: 3
+    touch_spacing: 2
+    breakout_atr: 0.2
+    volume_ratio_min: 1.2
+    c1_valid_days: 1
+    c2_observe_days: 10
+    c2_zone_atr: 0.5
+    c2_valid_days: 2
+    stop_atr: 0.5
+    stop_min: 0.03
+    stop_max: 0.08
+    time_stop_days: 10
+    r2: 2.0
+    r3: 3.0
+    risk_pct: 0.025
+  d:
+    z_min: -2.0
+    drop5_uptrend: -0.08
+    drop5_downtrend: -0.12
+    drop10_uptrend: -0.12
+    drop10_downtrend: -0.18
+    drawdown20_uptrend: 0.15
+    drawdown20_downtrend: 0.25
+    industry_relative: -0.03
+    min_conditions: 2
+    structure_wait_days: 5
+    stop_atr: 0.5
+    stop_min: 0.03
+    stop_max: 0.08
+    time_stop_days: 5
+    risk_pct: 0.015
+    downtrend_risk_factor: 0.5
+  e:
+    range_window: 30
+    width_min: 0.04
+    width_max: 0.15
+    min_touches: 3
+    touch_spacing: 3
+    slope_min: -0.0005
+    entry_zone_pct: 0.20
+    stop_atr: 0.5
+    stop_min: 0.03
+    stop_max: 0.08
+    valid_days: 2
+    min_rr: 1.5
+    time_stop_days: 10
+    risk_pct: 0.015
+  f:
+    event_window_days: 5
+    require_verified: true
+    allow_ambiguous: false
+    ai_extraction: false
+    price_mode: c2
+    risk_pct: 0.02
+
+risk:
+  max_positions: 5
+  max_b_positions: 2
+  single_position_pct: 0.30
+  max_industry_positions: 2
+  min_cash_pct: 0.10
+  max_exposure_pct: 0.90
+  max_heat: 0.075
+  correlation_threshold: 0.80
+  drawdown_half_at: 0.10
+  drawdown_stop_at: 0.15
+  add_on_max: 2
+  add_on_fraction: 0.50
+  add_on_strategies: ["A", "C", "F"]
+  stress_gap_pct: -0.10
+
+costs:
+  commission_rate: 0.00025
+  commission_min: 5.0
+  stamp_duty_rate: 0.0005
+  transfer_fee_rate: 0.00001
+  slippage_a: 0.001
+  slippage_b: 0.002
+  round_trip_cost_pct: 0.003
+
+events:
+  event_window_days: 5
+  require_human_verification: true
+  retraction_detection: true
+
+backtest:
+  initial_equity: 1000000
+  min_history_days: 400
+  walk_forward_train_years: 3
+  walk_forward_test_years: 1
+  demo: true
+
+scheduler:
+  timezone: "Asia/Shanghai"
+  daily_time: "17:00"
+  data_health_time: "16:30"
+  intraday_interval_seconds: 60
+  retry_count: 3
+  retry_base_seconds: 30
+
+web:
+  host: "127.0.0.1"
+  port: 8000
+  allow_demo: true
+  sse_heartbeat_seconds: 15
+  sound_notifications: true

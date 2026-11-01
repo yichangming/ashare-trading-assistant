@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 · A 股交易辅助台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card login-card">
+    <div class="seal seal-large">交易辅助台</div>
+    <h1>单用户登录</h1>
+    <p class="muted small">本地决策辅助系统。所有交易由你人工执行。</p>
+    {% if error %}<div class="notice risk">{{ error }}</div>{% endif %}
+    <form method="post" action="/login">
+      <input type="hidden" name="next" value="{{ next or '/' }}">
+      <div class="field">
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required autofocus style="width:100%">
+      </div>
+      <button class="btn primary" type="submit" style="width:100%">进入交易台</button>
+    </form>
+    <p class="footer-note">没有默认密码。部署时通过 <span class="mono">ASHARE_PASSWORD</span> 或 <span class="mono">ASHARE_PASSWORD_HASH</span> 配置，密钥通过 <span class="mono">ASHARE_SECRET_KEY</span> 配置。</p>
+  </div>
+</div>
+</body>
+</html>

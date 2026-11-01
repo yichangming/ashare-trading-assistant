@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}计划与成交 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="card flush">
+  <div class="card-head" style="padding:1rem 1rem 0">
+    <div><div class="eyebrow">PLANS</div><h1>交易计划</h1><p class="muted small">计划状态与券商撤单结果分开记录；只有确认成交才释放资金与风险额度。</p></div>
+    <form method="post" action="/api/jobs/run"><input type="hidden" name="strategy_mode" value="all"><input type="hidden" name="force" value="1"><input type="hidden" name="redirect" value="/plans"><button class="btn" type="submit">重跑今日管线</button></form>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>日期</th><th>代码</th><th>策略</th><th>状态</th><th class="num">确认价 P</th><th class="num">最高接受</th><th class="num">止损</th><th class="num">股数</th><th class="num">R</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for plan in plans %}
+        <tr>
+          <td class="mono small">{{ plan.trade_date }}</td>
+          <td class="mono">{{ plan.ts_code }}<div class="muted small">{{ plan.sector }}</div></td>
+          <td><span class="tag">{{ plan.strategy }}</span><div class="muted small">{{ plan.sub_mode or '' }}</div></td>
+          <td><span class="tag {{ 'ok' if plan.status in ['PENDING_EXECUTION','OPEN'] else ('risk' if plan.status in ['REJECTED','CANCELLED','EXPIRED','INVALIDATED'] else '') }}">{{ plan.status }}</span></td>
+          <td class="num">{{ plan.confirmation_price or '—' }}</td>
+          <td class="num">{{ plan.max_acceptable_price or '—' }}</td>
+          <td class="num">{{ plan.stop }}</td>
+          <td class="num">{{ plan.shares }}</td>
+          <td class="num">{{ plan.r_value }}</td>
+          <td>
+            {% if plan.status in ['PENDING_EXECUTION','PENDING_ENTRY'] %}
+            <form method="post" action="/api/plans/{{ plan.id }}/confirm" style="display:inline"><input type="hidden" name="redirect" value="/plans"><button class="btn small" type="submit">确认</button></form>
+            <form method="post" action="/api/plans/{{ plan.id }}/cancel" style="display:inline"><input type="hidden" name="redirect" value="/plans"><button class="btn small danger" type="submit">取消</button></form>
+            {% else %}<span class="muted small">—</span>{% endif %}
+          </td>
+        </tr>
+        {% if plan.reasons %}
+        <tr><td></td><td colspan="9" class="small muted">理由：{{ plan.reasons|join('；') }}{% if plan.cancel_reason %}<span class="cinnabar"> · 取消：{{ plan.cancel_reason }}</span>{% endif %}</td></tr>
+        {% endif %}
+      {% else %}
+        <tr><td colspan="10" class="empty">暂无计划。请先运行盘后任务。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<section class="card" style="margin-top:.9rem">
+  <div class="eyebrow">EXECUTION LOG</div>
+  <div class="table-wrap"><table>
+    <thead><tr><th>时间</th><th>代码</th><th>方向</th><th class="num">价格</th><th class="num">股数</th><th class="num">费用</th><th>计划</th><th>来源</th></tr></thead>
+    <tbody>
+    {% for execution in executions %}
+      <tr><td class="mono small">{{ execution.executed_at }}</td><td class="mono">{{ execution.ts_code }}</td><td>{{ execution.side }}</td><td class="num">{{ execution.price }}</td><td class="num">{{ execution.shares }}</td><td class="num">{{ execution.fees }}</td><td class="mono small">{{ execution.plan_id or '—' }}</td><td>{{ execution.source }}</td></tr>
+    {% else %}<tr><td colspan="8" class="empty">暂无成交。</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

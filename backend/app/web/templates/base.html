@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}交易辅助台{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="rail">
+    <div class="brand">
+      <div class="brand-mark">木</div>
+      <div>
+        <div class="brand-name">A 股交易辅助台</div>
+        <div class="brand-sub">DECISION DESK</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if active == 'overview' else '' }}"><span class="idx">01</span>今日总览</a>
+      <a href="/opportunities" class="{{ 'active' if active == 'opportunities' else '' }}"><span class="idx">02</span>策略机会</a>
+      <a href="/positions" class="{{ 'active' if active == 'positions' else '' }}"><span class="idx">03</span>持仓监控</a>
+      <a href="/plans" class="{{ 'active' if active == 'plans' else '' }}"><span class="idx">04</span>计划与成交</a>
+      <a href="/reports" class="{{ 'active' if active == 'reports' else '' }}"><span class="idx">05</span>每日报告</a>
+      <a href="/backtest" class="{{ 'active' if active == 'backtest' else '' }}"><span class="idx">06</span>回测与模拟</a>
+      <a href="/notifications" class="{{ 'active' if active == 'notifications' else '' }}"><span class="idx">07</span>通知中心</a>
+      <a href="/settings" class="{{ 'active' if active == 'settings' else '' }}"><span class="idx">08</span>设置与健康</a>
+    </nav>
+    <div class="rail-foot">
+      <div>单用户 · 人工执行</div>
+      <div>不自动下单</div>
+    </div>
+  </aside>
+  <main class="main">
+    {% if demo %}<div class="demo-banner">演示模式：当前数据/结果仅用于验证软件，不代表真实账户或策略绩效。</div>{% endif %}
+    <div class="topbar">
+      <div>
+        <div class="eyebrow">{{ today }}</div>
+        <div class="muted small">数据时间：{{ data_time or '未知' }}</div>
+      </div>
+      <div class="spacer"></div>
+      <span class="chip"><span class="sse-dot" id="sse-dot"></span><span id="sse-label">连接中</span></span>
+      <a class="chip" href="/notifications">未处理通知 <strong id="notif-count">{{ notification_count or 0 }}</strong></a>
+      <form method="post" action="/logout" style="margin:0">
+        <button class="btn small" type="submit">退出</button>
+      </form>
+    </div>
+    {% block content %}{% endblock %}
+    <div class="footer-note">
+      研究/决策辅助软件，不构成投资建议。行情数据受 Tushare 授权条款约束；所有买入卖出由用户在券商端人工完成。
+    </div>
+  </main>
+</div>
+<script>
+(function () {
+  const dot = document.getElementById('sse-dot');
+  const label = document.getElementById('sse-label');
+  const count = document.getElementById('notif-count');
+  function setState(on, text) {
+    if (!dot) return;
+    dot.classList.toggle('on', on);
+    if (label) label.textContent = text;
+  }
+  if (window.EventSource) {
+    const source = new EventSource('/api/events/stream');
+    source.onopen = function () { setState(true, '实时连接'); };
+    source.onmessage = function (event) {
+      try {
+        const payload = JSON.parse(event.data);
+        if (payload.unacknowledged !== undefined && count) count.textContent = payload.unacknowledged;
+        if (payload.latest_job) setState(true, '实时 · 任务 ' + payload.latest_job);
+        if (count && payload.notifications && payload.notifications.length) {
+          count.parentElement.title = payload.notifications[0].title;
+        }
+      } catch (e) { /* ignore malformed heartbeat */ }
+    };
+    source.onerror = function () { setState(false, '轮询回退'); };
+  } else {
+    setState(false, '轮询回退');
+  }
+  async function poll() {
+    try {
+      const response = await fetch('/api/notifications?unacknowledged=1&limit=1');
+      const data = await response.json();
+      if (count) count.textContent = data.unacknowledged || 0;
+    } catch (e) { /* offline */ }
+  }
+  setInterval(poll, 30000);
+})();
+</script>
+</body>
+</html>

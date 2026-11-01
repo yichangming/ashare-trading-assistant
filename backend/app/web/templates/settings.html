@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block title %}设置与健康 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="grid two">
+  <section class="card">
+    <div class="eyebrow">RISK PROFILE</div>
+    <h2>账户与风险配置</h2>
+    {% if account and account.risk_config_configured %}<p class="small jade">风险配置已完成。</p>{% else %}<p class="small cinnabar">风险配置未完成：真实账户股数会显示为不可用。</p>{% endif %}
+    <form method="post" action="/settings/risk">
+      <div class="form-row">
+        <div class="field"><label>权益</label><input name="equity" type="number" step="1000" value="{{ account.equity if account else 1000000 }}"></div>
+        <div class="field"><label>现金</label><input name="cash" type="number" step="1000" value="{{ account.cash if account else 1000000 }}"></div>
+        <div class="field"><label>最大可接受回撤</label><input name="max_drawdown" type="number" step="0.01" value="{{ account.max_drawdown if account else 0.15 }}"></div>
+      </div>
+      <div class="field"><label>账户模式</label><select name="mode"><option value="real" {{ 'selected' if account and account.mode == 'real' else '' }}>真实（人工执行）</option><option value="paper" {{ 'selected' if account and account.mode == 'paper' else '' }}>模拟</option><option value="demo" {{ 'selected' if account and account.mode == 'demo' else '' }}>演示</option></select></div>
+      <button class="btn primary" type="submit">保存风险配置</button>
+    </form>
+    <p class="small muted">真实账户必须在此明确配置；系统不会生成通用默认密码或假装适用的股数。</p>
+  </section>
+  <section class="card">
+    <div class="eyebrow">HEALTH</div>
+    <h2>运行健康</h2>
+    <div class="small">
+      <p>数据库：<span class="{{ 'jade' if health and health.ok else 'cinnabar' }}">{{ 'OK' if health and health.ok else '需关注' }}</span></p>
+      {% if health and health.issues %}<ul class="small cinnabar">{% for issue in health.issues %}<li>{{ issue }}</li>{% endfor %}</ul>{% endif %}
+      <p>预期交易日：<span class="mono">{{ health.expected_trade_date if health and health.expected_trade_date else '—' }}</span></p>
+      <p>最新处理日：<span class="mono">{{ data_status.latest_processed or '—' }}</span></p>
+      <p>最新原始日：<span class="mono">{{ data_status.latest_raw or '—' }}</span></p>
+      <p>账户同步：<span class="mono">{{ account.last_synced_at if account and account.last_synced_at else '—' }}</span>{% if account and account.stale %}<span class="cinnabar">（过期）</span>{% endif %}</p>
+      <p>调度器：<span class="{{ 'jade' if scheduler_running else 'cinnabar' }}">{{ '运行中' if scheduler_running else '未启动' }}</span></p>
+      <p>实时/分钟：<span class="muted">stk_mins 限频 1 次/分钟；realtime_quote 盘中可用性需实测</span></p>
+    </div>
+    <div class="notice" style="margin-top:.6rem">
+      <strong>演示模式</strong>
+      <form method="post" action="/settings/demo" style="margin-top:.4rem">
+        <input type="hidden" name="enabled" value="{{ '0' if demo else '1' }}">
+        <button class="btn small" type="submit">{{ '退出演示标记' if demo else '开启演示标记' }}</button>
+      </form>
+      <div class="small muted">演示标记只改变页面/回测标识，不会伪造行情或账户数据。</div>
+    </div>
+    <p class="small" style="margin-top:.7rem"><a href="/api/health">/api/health</a> · <a href="/api/data/status">/api/data/status</a></p>
+  </section>
+</div>
+<section class="card" style="margin-top:.9rem">
+  <div class="eyebrow">EVENTS</div>
+  <h2>事件导入</h2>
+  <p class="muted small">公告全文/政策/合同/产品获批没有稳定接口时，使用结构化 CSV/JSON 导入并在页面外人工核验；未核验事件不会进入真实资金。</p>
+  <form method="post" action="/settings/events/import" enctype="multipart/form-data">
+    <div class="form-row"><input type="file" name="file" accept=".csv,.json" required><button class="btn" type="submit">导入事件</button></div>
+  </form>
+</section>
+{% endblock %}

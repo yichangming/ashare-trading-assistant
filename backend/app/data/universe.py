@@ -90,6 +90,8 @@ class UniverseBuilder:
         stocks: pl.DataFrame,
         namechange: pl.DataFrame,
         config: StrategyConfig,
+        *,
+        min_listing_days: int | None = None,
     ) -> pl.DataFrame:
         """Build the broad tradable universe as of ``as_of``.
 
@@ -101,7 +103,12 @@ class UniverseBuilder:
         investment universe.  ``build`` layers the Template-A filters on top.
         """
         template = config.template_a
-        self._check_calendar(as_of, template.min_listing_days)
+        listing_min = (
+            min_listing_days
+            if min_listing_days is not None
+            else template.min_listing_days
+        )
+        self._check_calendar(as_of, listing_min)
         if "trade_date" not in features.columns:
             raise ValueError("features missing required column: trade_date")
         features = features.filter(pl.col("trade_date") == as_of)
@@ -141,7 +148,7 @@ class UniverseBuilder:
             pl.Series("is_st", is_st, dtype=pl.Boolean),
         )
         return merged.filter(
-            (pl.col("listing_days") >= template.min_listing_days)
+            (pl.col("listing_days") >= listing_min)
             & (~pl.col("is_st"))
             & (~pl.col("is_suspended"))
         )

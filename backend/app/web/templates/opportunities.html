@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}策略机会 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="card">
+  <div class="card-head">
+    <div><div class="eyebrow">A–F OPPORTUNITIES</div><h1>策略机会</h1><p class="muted small">评分只在同一策略族内有意义，不能跨策略比较，也不代表胜率。</p></div>
+    <form method="get" class="form-row">
+      <div><label>策略</label><select name="strategy" onchange="this.form.submit()">
+        <option value="">全部</option>
+        {% for letter in ['A','B','C','D','E','F'] %}<option value="{{ letter }}" {{ 'selected' if strategy_filter == letter else '' }}>{{ letter }}</option>{% endfor %}
+      </select></div>
+    </form>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>策略</th><th>代码</th><th>行业</th><th>阶段</th><th class="num">评分</th><th>理由 / 失效条件</th><th>数据时间</th></tr></thead>
+      <tbody>
+      {% for item in candidates %}
+        <tr>
+          <td><span class="tag">{{ item.strategy }}</span><div class="muted small">{{ item.sub_mode or '' }}</div></td>
+          <td class="mono">{{ item.ts_code }}<div class="muted small">{{ item.setup_type }}</div></td>
+          <td>{{ item.sector }}</td>
+          <td><span class="tag {{ 'ok' if item.stage == 'confirmed' else '' }}">{{ item.stage }}</span></td>
+          <td class="num">{{ '%.1f'|format(item.score) }}</td>
+          <td class="small">{{ item.reasons|join('；') }}{% if item.cancel_conditions %}<div class="muted">失效：{{ item.cancel_conditions|join('；') }}</div>{% endif %}</td>
+          <td class="small muted">{{ item.data_time or '—' }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="7" class="empty">当前没有候选。防守期、数据不足或策略权限暂停都可能导致空结果。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<div class="grid two" style="margin-top:.9rem">
+  <section class="card"><div class="eyebrow">PERMISSIONS</div>
+    {% for letter in ['A','B','C','D','E','F'] %}
+      {% set perm = permissions.get(letter) if permissions else none %}
+      <div class="form-row" style="justify-content:space-between;border-bottom:1px solid var(--line);padding:.35rem 0">
+        <span><strong>{{ letter }}</strong> {{ strategy_names[letter] }}</span>
+        <span class="tag {{ 'ok' if perm and perm.mode == 'normal' else ('risk' if perm and perm.mode == 'paused' else '') }}">{{ perm.mode if perm else 'paused' }}</span>
+      </div>
+    {% endfor %}
+  </section>
+  <section class="card"><div class="eyebrow">DATA NOTES</div>
+    <p class="muted small">观察中（observing）的候选不会进入买点/仓位流程；只有确认（confirmed）且通过风控的候选才生成 PENDING_EXECUTION 计划。</p>
+    <p class="muted small">B2 盘中模式需要 5 分钟数据；日线任务只发布观察名单。事件策略只接受已核验事件。</p>
+  </section>
+</div>
+{% endblock %}

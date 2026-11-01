@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}每日报告 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="grid two">
+  <section class="card">
+    <div class="eyebrow">DAILY REPORTS</div>
+    <h1>每日报告</h1>
+    <p class="muted small">报告是盘后快照；数据未就绪时会标注不完整，不伪装为最终结果。</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>日期</th><th>Markdown</th><th>HTML</th></tr></thead>
+      <tbody>
+      {% for report in reports %}
+        <tr><td class="mono"><a href="/reports?date={{ report.date }}">{{ report.date }}</a></td><td><a href="/reports/{{ report.date }}/markdown">daily.md</a></td><td><a href="/reports/{{ report.date }}/html">daily.html</a></td></tr>
+      {% else %}<tr><td colspan="3" class="empty">暂无报告。运行每日任务后生成。</td></tr>{% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+  <section class="card">
+    <div class="eyebrow">SELECTED</div>
+    {% if selected_date %}
+      <h2>{{ selected_date }}</h2>
+      {% if selected_markdown %}<pre class="small" style="white-space:pre-wrap;max-height:60vh;overflow:auto">{{ selected_markdown }}</pre>{% else %}<p class="empty">该日报告尚未生成。</p>{% endif %}
+    {% else %}
+      <p class="empty">选择左侧日期查看报告。</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

@@ -1,24 +1,24 @@
 # A-Share Trading Assistant
 
-Personal A-share decision-support backend. It syncs market data, builds a
-point-in-time feature store, classifies the market environment, screens for
-two setup types, and emits a risk-reviewed trade plan for manual execution.
+Personal A-share decision-support system. It syncs market data, builds a
+point-in-time feature store, classifies the market environment, screens the
+A–F strategy families, and emits risk-reviewed trade plans for manual
+execution. It also ships a local web desk, scheduler, event ingestion,
+account/CSV reconciliation, and a daily replay backtester.
 
-This repository implements **M1 (data foundation)** and **M2 (dual-template
-planning)** only.
-
-| Milestone | Status | Scope |
+| Layer | Status | Scope |
 | --- | --- | --- |
-| M1 | Implemented | Tushare sync to Parquet, manifests, DuckDB queries, quality gates, point-in-time universe, features |
-| M2 | Implemented | Sentiment/regime, industry strength, leader score, dual-template screener, entry/stop/sizing/take-profit, portfolio risk governor, pipeline, CLI |
-| M3 | Out of scope | Backtest engine, versioned reference snapshots, historical replay |
-| M4 | Out of scope | Scheduler and reports |
-| M5 | Out of scope | Web dashboard |
-| M6 | Out of scope | Broker adapters and automated execution |
+| M1 data foundation | Implemented | Tushare sync to Parquet, manifests, DuckDB queries, quality gates, point-in-time universe, features |
+| M2 legacy dual-template | Implemented | Original A/B planning pipeline and CLI remain available and tested |
+| v2 strategies A–F | Implemented | A trend pullback, B1/B2 limit-up absorption, C1/C2 platform, D oversold, E range, F events; per-strategy permissions and unified plans |
+| v2 operations | Implemented | SQLite account/plans/executions/events/jobs, CSV imports, daily job, reports, notifications, APScheduler, SSE, 8-page Chinese web desk |
+| v2 backtest | Implemented (limited by data) | Daily replay shares the live pipeline; minute B2 signal replay only when minute data exists; walk-forward/ablation/cost sensitivity helpers |
+| Broker integration | Not implemented by design | No automated ordering; every buy/sell is entered manually in the broker |
 
-**This system never places orders.** v1 is planning only; every entry, stop,
-and exit is executed manually. It is personal research software, not
-investment advice.
+**This system never places orders.** Every entry, stop, and exit is executed
+manually. It is personal research software, not investment advice. See
+[`docs/full-system/`](docs/full-system/) for architecture, strategy rules,
+parameters, acceptance criteria, deployment, and the test report.
 
 ## Requirements and setup
 
@@ -58,6 +58,27 @@ wins, and the repository-root file wins over `backend/.env` when both define
 the variable. Only `sync` and `calendar` need the token; `assemble`,
 `assemble-range`, `quality`, `run`, and `account` work offline against the
 local store.
+
+The web desk additionally requires a login secret. There is no default
+password; the app refuses to start without one.
+
+```text
+# .env
+ASHARE_PASSWORD=choose-a-long-password
+ASHARE_SECRET_KEY=<output of: python -c "import secrets; print(secrets.token_urlsafe(32))">
+```
+
+Start it from `backend/`:
+
+```bash
+uv run python -m app.cli migrate       # Alembic upgrade
+uv run python -m app.cli serve --scheduler
+# open http://127.0.0.1:8000
+```
+
+The scheduler is off by default unless `--scheduler` (or
+`ASHARE_ENABLE_SCHEDULER=1`) is set. Run exactly one worker because the
+in-process scheduler must not be duplicated.
 
 Default configuration:
 
@@ -262,7 +283,21 @@ terminal.
 | `assemble-range` | `--start YYYY-MM-DD` (required), `--end YYYY-MM-DD` (required) | Build processed `bars`/`index_bars` for every open day in range | No |
 | `quality` | `--day YYYY-MM-DD` (required) | Run the suspension-aware quality gate and print warnings/failures | No |
 | `run` | `--day YYYY-MM-DD` (required), `--equity FLOAT` (default 1000000), `--cash FLOAT` (default 1000000), `--peak-equity FLOAT`, `--template-mode A\|B\|dual` (default `dual`), `--account-file PATH`, `--restart/--no-restart` (default no-restart), `--init-account`, `--output PATH` | Run the planning pipeline, print/write JSON, optionally persist account state | No |
-| `account` | `--account-file PATH` (required), `--clear-pending` | Inspect account equity/positions/pending/latches, or clear all pending plans | No |
+| `account` | `--account-file PATH` (required), `--clear-pending` | Inspect legacy account JSON, or clear all pending plans | No |
+| `serve` | `--host`, `--port`, `--scheduler/--no-scheduler` | Serve the web desk and JSON API (single worker) | Web auth env |
+| `migrate` | — | Apply Alembic migrations to `data/app.db` | No |
+| `daily` | `--day YYYY-MM-DD`, `--strategy-mode`, `--force` | Run the idempotent A–F post-close pipeline and write the report | No |
+| `backtest` | `--start`, `--end`, `--initial-equity`, `--strategy-mode`, `--demo`, `--max-days`, `--output` | Daily replay of the shared decision pipeline | No |
+| `events-import` | `PATH`, `--source` | Import verified manual CSV/JSON events for F | No |
+
+Backup the operational database without stopping the web app:
+
+```bash
+uv run python scripts/backup_db.py --database data/app.db --out data/backups --retain 30
+```
+
+The legacy `run` command still drives the original M2 A/B pipeline and JSON
+account file. The v2 daily job is `daily` and stores state in SQLite.
 
 ## Data prerequisites
 
@@ -372,16 +407,13 @@ are read through DuckDB with hive partitioning.
 
 ```bash
 cd backend
-uv run pytest                 # 761 tests pass
+uv run pytest                 # 842 tests collected
 uv run ruff check app tests   # no errors
-uv run mypy app               # 2 expected missing-stub errors
+uv run mypy app               # no errors
 ```
 
-`mypy app` currently reports exactly two known errors because third-party
-stub packages are not installed: `Library stubs not installed for "yaml"`
-in `app/core/config.py` and missing `tushare` stubs in
-`app/data/tushare_client.py`. These are dependency-typing gaps, not type
-errors in this codebase.
+Third-party packages without type stubs (`yaml`, `tushare`, `apscheduler`)
+are ignored by mypy; that is a dependency-typing gap, not a code error.
 
 A quick CLI smoke check:
 
@@ -389,18 +421,32 @@ A quick CLI smoke check:
 uv run python -m app.cli --help
 ```
 
-The help output must list `sync`, `calendar`, `assemble`,
-`assemble-range`, `quality`, `run`, and `account`.
+The help output must list the legacy data commands plus `serve`, `migrate`,
+`daily`, `backtest`, and `events-import`.
 
 ## Known limitations and follow-ups
 
-- **M3-M6 are out of scope:** there is no backtest engine, scheduler,
-  reporting layer, web dashboard, or broker adapter. `run` plans one day
-  from data already on disk; it does not replay history or fill orders.
+- **No broker integration by design.** There is no automated order path.
+  Plans, confirmations, and execution imports are all human-driven.
+- **Minute data is optional and rate limited.** B2 intraday signals and the
+  minute replay require `stk_mins` (about one request per minute); without it
+  the system reports degraded data and does not substitute daily bars.
+- **Event full text/policy coverage is manual.** Announcement full text,
+  policy details, and some contract/product approvals have no stable
+  interface; import structured CSV/JSON and verify by hand. AI extraction is
+  not part of the core path.
+- **Session state is a signed cookie.** The single-user web desk uses
+  Starlette's signed session cookie, not a server-side session table. Set a
+  stable `ASHARE_SECRET_KEY`; put HTTPS and a reverse proxy in front for LAN
+  use (see `docs/full-system/deployment.md`).
+- **Backtest is conservative but not exchange-perfect.** Daily replay models
+  T+1, limit-up/down, suspension, fees, slippage, and same-day stop priority;
+  intraday B2 PnL is not fabricated from daily bars. Delisted names without
+  bars are reported in `missing_data` rather than force-liquidated.
 - **Reference snapshots are overwritten.** `sync`/`calendar` replace
   `backend/data/raw/reference/*.parquet` in place. Manifests record reference
   checksums for the day they were written, but old reference bytes are not
-  retrievable. Versioned reference snapshots are a M3 follow-up.
+  retrievable. Versioned reference snapshots remain a future improvement.
 - **Real Tushare contracts need token verification.** `trade_cal` is fetched
   in yearly chunks, `stock_basic` once per list status (`L`, `D`, `P`),
   `namechange` in five-year chunks, and `index_member` per SW L1 industry.
@@ -445,9 +491,10 @@ The help output must list `sync`, `calendar`, `assemble`,
   positions, and peaks are whatever the account JSON says. The pipeline does
   not pull broker balances or update positions from market data; you must
   maintain that state yourself and use `--restart` with manual review.
-- **Regime snapshots are not persisted by the CLI.** `run` includes the
-  regime in its JSON output; `backend/data/regime/` is reserved for M4
-  reporting. Use `--output` if you want to retain a run.
+- **Legacy `run` does not persist regime snapshots.** The v2 `daily` job
+  stores regime and candidate JSON in SQLite snapshots; the legacy `run`
+  command only includes the regime in its JSON output. Use `--output` if you
+  want to retain a legacy run.
 
 ## Layout and architecture
 
@@ -461,16 +508,28 @@ backend/
     indicators/  FeatureBuilder (adjusted OHLC, MAs, ATR, returns, volume,
                  board height, pullback, 60-day high)
     regime/      sentiment cycle, market regime, industry strength,
-                 leader score
-    screener/    dual-template A/B screener and registry
-    planning/    entry, stop, position sizing, take-profit
-    risk/        portfolio risk governor
-    pipeline.py  end-to-end orchestration and prerequisite checks
+                 leader score, four-dimensional permissions
+    screener/    legacy dual-template A/B screener
+    strategies/  A–F strategy modules, B2 state machine, registry
+    planning/    unified entry, stop, sizing, take-profit, strategy planner
+    risk/        legacy governor + A–F strategy governor
+    portfolio/   SQLite account, executions, lots, CSV imports, fees
+    events/      event ingestion, verification, retraction, event risk
+    backtest/    daily replay simulator, analytics, minute B2 replay
+    jobs/        daily job, intraday monitor, B2 monitor, exits, health,
+                 reports, APScheduler
+    api/         FastAPI app, auth, JSON API, SSE
+    web/         Jinja2 templates and static CSS
+    db/          SQLAlchemy models, session, repositories
+    pipeline.py  legacy M2 orchestration
+    pipeline_v2.py  A–F orchestration
     cli.py       Typer CLI
   configs/
     app.yaml
     strategies/dual_template_v1.yaml
-  tests/         761 pytest tests
+    strategies/full_system_v1.yaml
+  alembic/       operational schema migrations
+  tests/         829 pytest tests
 ```
 
 Data flow:
@@ -496,7 +555,10 @@ raw/manifests/<YYYYMMDD>.json
 processed/bars/trade_date=YYYY-MM-DD/data.parquet
 processed/index_bars/trade_date=YYYY-MM-DD/data.parquet
 processed/limit_list/trade_date=YYYY-MM-DD/data.parquet
-regime/                                  # reserved for M4
+regime/                                  # regime snapshot cache
+app.db                                   # SQLite operational state (v2)
+reports/<date>/daily.md|daily.html       # generated daily reports
+imports/                                 # uploaded CSV/JSON files
 ```
 
 ## Safety and compliance
@@ -511,8 +573,9 @@ regime/                                  # reserved for M4
 - Data can be stale, incomplete, suspended, or wrong. The quality gate and
   degraded flags reduce risk but do not eliminate it. Validate any plan
   independently and size positions conservatively.
-- Backtesting and performance evaluation are not implemented; no claim of
-  profitability should be inferred from planning output.
+- Backtesting is implemented but limited by available data; software tests do
+  not establish strategy profitability. See the separate software/test report
+  and never treat demo results as evidence of edge.
 
 ## M1/M2 acceptance checklist
 
@@ -532,11 +595,15 @@ regime/                                  # reserved for M4
 - [x] CLI workflow: `sync`, `calendar`, `assemble`, `assemble-range`,
   `quality`, `run`, `account`, including account persistence and
   pending-plan pruning.
-- [x] Verification: 761 tests pass, ruff reports no errors, mypy reports
-  only the two documented missing-stub errors, and `--help` lists all seven
-  commands.
-- [ ] M3-M6 capabilities (backtest, scheduler/reports, dashboard, broker
-  adapters) are intentionally not implemented.
+- [x] Verification: 842 tests collected, ruff reports no errors, mypy
+  reports no errors, and `--help` lists the legacy and v2 commands.
+- [x] v2 A–F strategies, permissions, unified plans, SQLite account/CSV,
+  events, replay backtest, scheduler, reports, notifications, SSE, and the
+  eight-page Chinese web desk are implemented and covered by tests.
+- [ ] Broker adapters and automated execution are intentionally not
+  implemented.
+- [ ] Live Tushare/minutes/realtime permission and contract validation remains
+  an external follow-up; the test suite uses injected fakes.
 
 Acceptance above is at the code and test level. Live Tushare permission and
 endpoint-contract validation remains a follow-up because the test suite uses

@@ -56,6 +56,11 @@ _COMMANDS = (
     "quality",
     "run",
     "account",
+    "serve",
+    "migrate",
+    "daily",
+    "backtest",
+    "events-import",
 )
 
 

@@ -26,6 +26,21 @@ class FeatureBuilder:
         frame = bars.filter(pl.col("trade_date") <= as_of).sort(
             ["ts_code", "trade_date"]
         )
+        return self._compute(frame).filter(
+            pl.col("trade_date") == as_of
+        ).drop(_HELPER_COLUMNS)
+
+    def build_panel(self, bars: pl.DataFrame) -> pl.DataFrame:
+        """Compute trailing features for every row in one vectorized pass.
+
+        Cross-sectional ``rs_20d_market`` is ranked within each trade date, so
+        a row never uses another date's information.  This is the backtest
+        entry point; :meth:`build` remains the as-of convenience wrapper.
+        """
+        frame = bars.sort(["ts_code", "trade_date"])
+        return self._compute(frame).drop(_HELPER_COLUMNS)
+
+    def _compute(self, frame: pl.DataFrame) -> pl.DataFrame:
         frame = frame.with_columns(
             pl.int_range(0, pl.len()).over("ts_code").alias("_row_idx")
         )
@@ -237,11 +252,9 @@ class FeatureBuilder:
             ),
         )
 
-        asof = frame.filter(pl.col("trade_date") == as_of)
-        asof = asof.with_columns(
+        return frame.with_columns(
             (
-                pl.col("ret_20d").rank("average")
-                / pl.col("ret_20d").count()
+                pl.col("ret_20d").rank("average").over("trade_date")
+                / pl.col("ret_20d").count().over("trade_date")
             ).alias("rs_20d_market")
         )
-        return asof.drop(_HELPER_COLUMNS)

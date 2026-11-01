@@ -1,0 +1,25 @@
+services:
+  app:
+    build:
+      context: ./backend
+    image: ashare-trading-assistant:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    environment:
+      ASHARE_DATABASE_URL: sqlite:////app/backend/data/app.db
+      ASHARE_ENABLE_SCHEDULER: "1"
+    volumes:
+      - ./backend/data:/app/backend/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

@@ -220,10 +220,12 @@
 | 参数 | 默认 |
 |---|---|
 | 时区 | Asia/Shanghai |
-| 盘后任务 | 交易日 17:00 |
-| 盘中监控 | 交易时段每 1 分钟；5 分钟 bar 驱动 B2 |
-| 数据健康 | 最新日线/分钟/账户新鲜度 |
-| 日志保留 | 90 天 |
+| 盘后任务 | 交易日 17:00（`daily_time`） |
+| 数据健康 | 交易日 16:30（`data_health_time`）；最新日线/分钟/账户新鲜度 |
+| 盘中监控 | 交易时段每 60 秒（`intraday_interval_seconds`）；5 分钟 bar 驱动 B2 |
+| 失败重试 | `retry_count=3`，指数退避 `retry_base_seconds=30` |
+| 任务恢复 | 启动时把残留 `running` 任务标记失败，允许重跑 |
+| 日志/通知保留 | 90 天（`notification_retention_days`） |
 | 通知 | 站内；风险优先；去重；确认/未处理 |
 | 认证 | 单用户；无默认密码；HTTPS 说明 |
 | 部署 | Docker Compose 或 systemd；SQLite 备份 |

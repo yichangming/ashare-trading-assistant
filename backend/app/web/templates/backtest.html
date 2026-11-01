@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}回测与模拟 · 交易辅助台{% endblock %}
+{% block content %}
+<div class="grid two">
+  <section class="card">
+    <div class="eyebrow">REPLAY LAB</div>
+    <h1>回测与模拟</h1>
+    <p class="muted small">回测调用与实盘相同的策略、买点、止损、仓位、止盈和风控代码；日线回放不模拟 B2 盘中路径。</p>
+    <form method="post" action="/backtest/run">
+      <div class="form-row">
+        <div class="field"><label>开始</label><input type="date" name="start" required></div>
+        <div class="field"><label>结束</label><input type="date" name="end" required></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>策略模式</label><select name="strategy_mode"><option value="all">A–F 全部</option>{% for letter in ['A','B','C','D','E','F'] %}<option value="{{ letter }}">{{ letter }}</option>{% endfor %}</select></div>
+        <div class="field"><label>初始权益</label><input type="number" name="initial_equity" value="1000000" step="10000"></div>
+        <div class="field"><label><input type="checkbox" name="demo" value="1"> 使用演示标记</label></div>
+      </div>
+      <button class="btn primary" type="submit">运行回放</button>
+    </form>
+    <p class="small muted">长区间会串行调用每日管线，耗时较长；任务在后台运行。演示标记不会伪造行情，真实分钟数据缺失时 B2 不纳入日线回放。</p>
+  </section>
+  <section class="card">
+    <div class="eyebrow">RUNS</div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>ID</th><th>区间</th><th>模式</th><th>状态</th><th class="num">收益</th><th>演示</th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        <tr><td class="mono small"><a href="/backtest?run={{ run.id }}">{{ run.id[:8] }}</a></td><td class="small">{{ run.period_start }} → {{ run.period_end }}</td><td>{{ run.strategy_mode }}</td><td><span class="tag {{ 'ok' if run.status == 'succeeded' else ('risk' if run.status == 'failed' else '') }}">{{ run.status }}</span></td><td class="num">{{ '%.2f%%'|format(run.total_return * 100) if run.total_return is not none else '—' }}</td><td>{{ '是' if run.is_demo else '否' }}</td></tr>
+      {% else %}<tr><td colspan="6" class="empty">暂无回测。</td></tr>{% endfor %}
+      </tbody>
+    </table></div>
+  </section>
+</div>
+{% if selected %}
+<section class="card" style="margin-top:.9rem">
+  <div class="card-head"><div><div class="eyebrow">RESULT {{ selected.id[:8] }}</div><h2>{{ selected.period_start }} → {{ selected.period_end }}</h2></div>{% if selected.is_demo %}<span class="tag risk">演示，不可作为策略有效证据</span>{% endif %}</div>
+  <div class="grid four">
+    <div><div class="stat-label">净收益</div><div class="stat">{{ '%.2f%%'|format(selected.metrics.total_return * 100) if selected.metrics else '—' }}</div></div>
+    <div><div class="stat-label">最大回撤</div><div class="stat">{{ '%.2f%%'|format(selected.metrics.max_drawdown * 100) if selected.metrics else '—' }}</div></div>
+    <div><div class="stat-label">胜率</div><div class="stat">{{ '%.1f%%'|format(selected.metrics.win_rate * 100) if selected.metrics else '—' }}</div></div>
+    <div><div class="stat-label">平均 R</div><div class="stat">{{ '%.2f'|format(selected.metrics.avg_r) if selected.metrics else '—' }}</div></div>
+  </div>
+  {% if selected.equity %}
+  <canvas id="equity-chart" height="160" style="width:100%;margin-top:1rem;background:rgba(11,29,25,.35);border:1px solid var(--line);border-radius:8px"></canvas>
+  <script>
+  (function(){
+    const points = {{ selected.equity|tojson }};
+    const canvas = document.getElementById('equity-chart');
+    if (!canvas || !points.length) return;
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width = canvas.clientWidth * 2;
+    const h = canvas.height;
+    const values = points.map(p => p.equity);
+    const min = Math.min(...values), max = Math.max(...values);
+    ctx.lineWidth = 3; ctx.strokeStyle = '#5bbf9b';
+    ctx.beginPath();
+    points.forEach((p, i) => {
+      const x = (i / Math.max(1, points.length - 1)) * w;
+      const y = h - 12 - ((p.equity - min) / Math.max(1, max - min)) * (h - 24);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.stroke();
+  })();
+  </script>
+  {% endif %}
+  {% if selected.missing_data %}<div class="notice risk small">缺失/失败日期：{{ selected.missing_data|join('；') }}</div>{% endif %}
+  <div class="table-wrap" style="margin-top:.8rem"><table>
+    <thead><tr><th>代码</th><th>策略</th><th>入场</th><th>退出</th><th class="num">入场价</th><th class="num">退出价</th><th class="num">股数</th><th class="num">R</th><th class="num">盈亏</th><th>原因</th></tr></thead>
+    <tbody>
+    {% for trade in selected.trades %}
+      <tr><td class="mono">{{ trade.ts_code }}</td><td>{{ trade.strategy }}</td><td class="small">{{ trade.entry_date }}</td><td class="small">{{ trade.exit_date }}</td><td class="num">{{ trade.entry_price }}</td><td class="num">{{ trade.exit_price }}</td><td class="num">{{ trade.shares }}</td><td class="num">{{ '%.2f'|format(trade.r_multiple) }}</td><td class="num {{ 'jade' if trade.pnl > 0 else 'cinnabar' }}">{{ '%.2f'|format(trade.pnl) }}</td><td>{{ trade.exit_reason }}</td></tr>
+    {% else %}<tr><td colspan="10" class="empty">该回测没有成交。</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endblock %}

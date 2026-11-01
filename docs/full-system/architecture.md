@@ -10,7 +10,7 @@
 
 - Tushare 日线同步、manifest、Parquet/DuckDB、质量闸门、点时股票池、特征；
 - 情绪/趋势/行业/龙头、双模板 A/B 选股、买点/止损/仓位/止盈/组合风控、管线、CLI；
-- 761+ 离线测试；2018-2026 日线数据已在本机 `backend/data/`（gitignored）。
+- 842 个离线测试；2018-2026 日线数据已在本机 `backend/data/`（gitignored）。
 
 本次 v2 在此基础上扩展，不重写数据层和已正确的模块：
 

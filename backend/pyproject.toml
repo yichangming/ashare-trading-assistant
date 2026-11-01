@@ -15,6 +15,15 @@ dependencies = [
   "pyyaml>=6,<7",
   "typer>=0.12,<1",
   "rich>=13,<14",
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.30,<1",
+  "sqlalchemy>=2.0,<3",
+  "alembic>=1.13,<2",
+  "jinja2>=3.1,<4",
+  "apscheduler>=3.10,<4",
+  "python-multipart>=0.0.9,<1",
+  "pwdlib[argon2]>=0.2,<1",
+  "itsdangerous>=2.2,<3",
 ]
 
 [dependency-groups]
@@ -24,6 +33,7 @@ dev = [
   "hypothesis>=6,<7",
   "ruff>=0.5,<1",
   "mypy>=1.10,<2",
+  "pytest-asyncio>=0.23,<1",
 ]
 
 [tool.pytest.ini_options]
@@ -37,3 +47,19 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+disable_error_code = ["import-untyped"]
+
+[[tool.mypy.overrides]]
+# Polars row values are typed as Any; the strategies validate them at runtime.
+module = ["app.strategies.*", "app.planning.strategy_planner"]
+disable_error_code = ["arg-type"]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI/Typer declare parameters as callables in defaults.
+"app/api/app.py" = ["B008"]
+"app/cli.py" = ["B008"]
