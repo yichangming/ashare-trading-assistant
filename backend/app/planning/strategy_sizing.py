@@ -55,14 +55,29 @@ class StrategyPositionSizer:
 
         equity = float(account.equity)
         drawdown = account.drawdown_pct
-        if drawdown >= config.risk.drawdown_stop_at:
+        stop_at = min(
+            config.risk.drawdown_stop_at,
+            account.max_drawdown
+            if account.risk_config_configured and account.max_drawdown > 0
+            else config.risk.drawdown_stop_at,
+        )
+        half_at = min(
+            config.risk.drawdown_half_at,
+            stop_at * (2 / 3),
+        )
+        if drawdown >= stop_at:
             raise PositionRejectedError("drawdown circuit breaker active")
         drawdown_factor = (
             0.5
-            if account.drawdown_half_latched
-            or drawdown >= config.risk.drawdown_half_at
+            if account.drawdown_half_latched or drawdown >= half_at
             else 1.0
         )
+        if account.valuation_incomplete:
+            if account.mode == AccountMode.REAL:
+                raise PositionRejectedError(
+                    "valuation incomplete; reconcile prices before new plans"
+                )
+            drawdown_factor *= 0.5
         risk_pct = {
             Strategy.A: config.strategies.a.risk_pct,
             Strategy.B: config.strategies.b.risk_pct,
@@ -89,6 +104,9 @@ class StrategyPositionSizer:
         original = shares
         adjustments: list[str] = []
         checks = ["risk_budget"]
+        if account.valuation_incomplete:
+            checks.append("valuation_incomplete")
+            adjustments.append("valuation incomplete: size reduced by 50%")
 
         existing_position = next(
             (
@@ -115,6 +133,18 @@ class StrategyPositionSizer:
             if existing_position.current_price < existing_position.cost_price:
                 raise PositionRejectedError(
                     "add-on requires the existing position to be profitable"
+                )
+            if (
+                existing_position.current_stop > 0
+                and existing_position.current_price
+                <= existing_position.current_stop
+            ):
+                raise PositionRejectedError(
+                    "add-on blocked by existing hard risk"
+                )
+            if existing_position.needs_reconciliation:
+                raise PositionRejectedError(
+                    "add-on blocked: existing position needs reconciliation"
                 )
             if stop.initial_stop < existing_position.current_stop:
                 raise PositionRejectedError(
@@ -226,4 +256,5 @@ class StrategyPositionSizer:
             heat_after=heat_after,
             constraints_checked=checks,
             adjustments=adjustments,
+            is_add_on=is_add_on,
         )

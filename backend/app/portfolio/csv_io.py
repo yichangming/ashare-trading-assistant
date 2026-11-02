@@ -209,8 +209,11 @@ def _import_position(
         current_stop=Decimal(row["current_stop"]),
         current_price=Decimal(row["current_price"]),
         primary_strategy=row.get("strategy") or None,
+        sub_mode=row.get("sub_mode") or None,
         plan_id=row.get("plan_id") or None,
         opened_at=opened_at,
+        needs_reconciliation=True,
+        valuation_status="unknown",
     )
     # Selling reduces lots FIFO; an imported position without a lot would make
     # every later sell fail with a lot-accounting mismatch.

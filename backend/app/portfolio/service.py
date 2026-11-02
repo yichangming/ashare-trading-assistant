@@ -34,9 +34,11 @@ from app.domain.enums import (
     PlanStatus,
     Strategy,
     SubMode,
+    ValuationStatus,
 )
 from app.domain.models import AccountState
 from app.portfolio.fees import calculate_fees
+from app.portfolio.market import PricePoint
 
 
 class PortfolioError(RuntimeError):
@@ -73,6 +75,8 @@ class AccountService:
         row.cash = Decimal(str(cash if cash is not None else equity))
         row.max_drawdown = max_drawdown
         row.risk_config_configured = True
+        row.last_reconciled_at = datetime.now(UTC)
+        row.stale = False
         row.risk_profile_json = risk_profile or {}
         AuditRepository.log(
             self.session,
@@ -117,8 +121,16 @@ class AccountService:
         sector: str = "未知",
         strategy: Strategy | None = None,
         sub_mode: SubMode | None = None,
-        enforce_plan: bool = True,
+        enforce_plan: bool | None = None,
+        strict_plan: bool = False,
     ) -> ExecutionRow:
+        """Record a real fill.
+
+        Plan linkage is attribution, not permission to rewrite history.  A
+        known plan supplies strategy/sub-mode/sector/version and the initial
+        stop; price or expiry deviations are persisted for audit.  Pass
+        ``strict_plan=True`` when a caller wants the old fail-closed behavior.
+        """
         if shares <= 0:
             raise PortfolioError("shares must be positive")
         if side == ExecutionSide.BUY and shares % 100 != 0:
@@ -126,25 +138,77 @@ class AccountService:
         price_value = Decimal(str(price))
         if price_value <= 0:
             raise PortfolioError("price must be positive")
-        if plan_id and enforce_plan:
-            plan = PlanRepository.get(self.session, plan_id)
-            if plan is not None:
-                try:
-                    domain = PlanRepository.to_domain(plan)
-                except Exception:  # noqa: BLE001 - legacy payload
-                    domain = None
-                if domain is not None:
-                    if executed_at.date() > domain.expires_on:
-                        raise PortfolioError("plan has expired")
-                    upper = domain.max_acceptable_price
-                    if (
-                        side == ExecutionSide.BUY
-                        and upper is not None
-                        and price_value > upper
-                    ):
-                        raise PortfolioError(
-                            "price exceeds plan max_acceptable_price"
-                        )
+        if external_id:
+            existing = self.session.scalar(
+                select(ExecutionRow).where(
+                    ExecutionRow.account_id == self.account_id,
+                    ExecutionRow.external_id == external_id,
+                )
+            )
+            if existing is not None:
+                return existing
+
+        if enforce_plan is not None:
+            strict_plan = strict_plan or bool(enforce_plan)
+
+        plan_row = PlanRepository.get(self.session, plan_id) if plan_id else None
+        domain = None
+        if plan_row is not None:
+            if plan_row.account_id != self.account_id:
+                raise PortfolioError("plan belongs to a different account")
+            if plan_row.ts_code != ts_code:
+                raise PortfolioError("plan does not match execution security")
+            try:
+                domain = PlanRepository.to_domain(plan_row)
+            except Exception:  # noqa: BLE001 - legacy payload
+                domain = None
+            if domain is not None:
+                strategy = strategy or domain.strategy or (
+                    Strategy(plan_row.strategy) if plan_row.strategy else None
+                )
+                sub_mode = sub_mode or domain.sub_mode or (
+                    SubMode(plan_row.sub_mode) if plan_row.sub_mode else None
+                )
+                sector = plan_row.sector or sector
+            else:
+                strategy = strategy or (
+                    Strategy(plan_row.strategy) if plan_row.strategy else None
+                )
+                sub_mode = sub_mode or (
+                    SubMode(plan_row.sub_mode) if plan_row.sub_mode else None
+                )
+                sector = plan_row.sector or sector
+
+        deviations: list[str] = []
+        if domain is not None:
+            if executed_at.date() > domain.expires_on:
+                deviations.append(
+                    f"成交晚于计划有效期 {domain.expires_on.isoformat()}"
+                )
+            upper = domain.max_acceptable_price
+            if (
+                side == ExecutionSide.BUY
+                and upper is not None
+                and price_value > upper
+            ):
+                deviations.append(
+                    f"成交价 {price_value} 高于最高接受价 {upper}"
+                )
+            assert plan_row is not None
+            row_status = PlanStatus(plan_row.status)
+            if side == ExecutionSide.BUY and row_status in (
+                PlanStatus.CANCELLED,
+                PlanStatus.EXPIRED,
+                PlanStatus.INVALIDATED,
+                PlanStatus.REJECTED,
+            ):
+                deviations.append(f"计划状态为 {row_status.value}")
+            if strict_plan and deviations:
+                raise PortfolioError("; ".join(deviations))
+        elif plan_id and plan_row is None:
+            deviations.append("关联的计划不存在，策略字段标记为待补全")
+        deviation_text = "；".join(deviations) or None
+
         row = self.account()
         fee_value = (
             Decimal(str(fees))
@@ -155,6 +219,11 @@ class AccountService:
                 shares=shares,
                 costs=self.config.costs,
             ).total
+        )
+        strategy_version = (
+            domain.strategy_version
+            if domain is not None
+            else (plan_row.strategy_version if plan_row is not None else None)
         )
         execution, created = ExecutionRepository.add(
             self.session,
@@ -169,11 +238,24 @@ class AccountService:
             source=source,
             external_id=external_id,
             note=note,
+            strategy=strategy.value if strategy else None,
+            sub_mode=sub_mode.value if sub_mode else None,
+            sector=sector,
+            strategy_version=strategy_version,
+            plan_deviation=deviation_text,
         )
         if not created:
             return execution
+        if deviation_text:
+            AuditRepository.log(
+                self.session,
+                actor="user",
+                action="execution_deviation",
+                target=ts_code,
+                after={"plan_id": plan_id, "deviation": deviation_text},
+            )
         if side == ExecutionSide.BUY:
-            self._buy(
+            batch_index, initial_r = self._buy(
                 row,
                 ts_code=ts_code,
                 price=price_value,
@@ -184,6 +266,13 @@ class AccountService:
                 sector=sector,
                 strategy=strategy,
                 sub_mode=sub_mode,
+                strategy_version=strategy_version,
+                domain=domain,
+                needs_reconciliation=plan_id is None or domain is None,
+            )
+            execution.batch_index = batch_index
+            execution.initial_r = (
+                Decimal(str(initial_r)) if initial_r is not None else None
             )
         else:
             self._sell(
@@ -212,7 +301,10 @@ class AccountService:
         sector: str,
         strategy: Strategy | None,
         sub_mode: SubMode | None,
-    ) -> None:
+        strategy_version: str | None,
+        domain: Any,
+        needs_reconciliation: bool,
+    ) -> tuple[int, Decimal | None]:
         debit = price * shares + fees
         if account.cash < debit:
             raise PortfolioError("insufficient cash")
@@ -226,17 +318,54 @@ class AccountService:
             if new_shares
             else price
         )
-        stop = position.current_stop if position and position.current_stop > 0 else price
-        if plan_id:
-            plan = PlanRepository.get(self.session, plan_id)
-            if plan is not None:
-                try:
-                    domain = PlanRepository.to_domain(plan)
-                    stop = domain.stop_plan.initial_stop
-                except Exception:
-                    pass
-                if position and position.current_stop > 0:
-                    stop = max(stop, position.current_stop)
+
+        explicit_add_on = bool(
+            domain is not None and domain.position_plan.is_add_on
+        )
+        different_plan = bool(
+            position is not None
+            and position.plan_id
+            and plan_id
+            and position.plan_id != plan_id
+        )
+        is_add_on = explicit_add_on or different_plan
+        same_plan_lots = [
+            lot
+            for lot in (position.lots if position is not None else [])
+            if plan_id and lot.plan_id == plan_id
+        ]
+        if is_add_on:
+            if same_plan_lots:
+                batch_index = same_plan_lots[0].add_index
+            else:
+                max_index = max(
+                    (
+                        lot.add_index
+                        for lot in (position.lots if position is not None else [])
+                    ),
+                    default=0,
+                )
+                batch_index = max(max_index, position.add_on_count if position else 0) + 1
+        else:
+            batch_index = 0
+
+        initial_stop: Decimal | None = None
+        if domain is not None:
+            initial_stop = domain.stop_plan.initial_stop
+        elif position is not None and position.current_stop > 0:
+            initial_stop = position.current_stop
+        initial_r = (
+            price - initial_stop
+            if initial_stop is not None and initial_stop > 0
+            else None
+        )
+        proposed_stop = initial_stop
+        if position is not None and position.current_stop > 0:
+            if proposed_stop is None:
+                proposed_stop = position.current_stop
+            else:
+                proposed_stop = max(proposed_stop, position.current_stop)
+
         if position is None:
             position = PositionRepository.upsert(
                 self.session,
@@ -246,30 +375,72 @@ class AccountService:
                 shares=new_shares,
                 available_shares=0,
                 cost_price=new_cost,
-                current_stop=stop,
+                current_stop=proposed_stop or Decimal("0"),
                 current_price=price,
                 primary_strategy=strategy.value if strategy else None,
+                sub_mode=sub_mode.value if sub_mode else None,
+                strategy_version=strategy_version,
                 plan_id=plan_id,
                 opened_at=executed_at,
+                highest_price=price,
+                initial_r=initial_r,
+                initial_shares=shares,
+                add_on_count=0,
+                target_state_json=[],
+                needs_reconciliation=needs_reconciliation,
+                valuation_status=ValuationStatus.OK.value,
+                valuation_at=executed_at,
             )
         else:
             position.shares = new_shares
             position.cost_price = new_cost
-            position.current_stop = stop
+            if proposed_stop is not None:
+                position.current_stop = proposed_stop
             position.current_price = price
+            position.highest_price = max(
+                position.highest_price or price, price
+            )
             if strategy and not position.primary_strategy:
                 position.primary_strategy = strategy.value
-            position.plan_id = plan_id or position.plan_id
+            if sub_mode and not position.sub_mode:
+                position.sub_mode = sub_mode.value
+            if strategy_version and not position.strategy_version:
+                position.strategy_version = strategy_version
+            if not is_add_on:
+                position.plan_id = plan_id or position.plan_id
+                position.initial_shares = max(0, position.initial_shares) + shares
+                if position.initial_r is None and initial_r is not None:
+                    position.initial_r = initial_r
+            else:
+                position.add_on_count = max(
+                    position.add_on_count, batch_index
+                )
+            position.needs_reconciliation = bool(
+                position.needs_reconciliation or needs_reconciliation
+            )
+
+        self._update_target_state(
+            position,
+            domain=domain,
+            shares=shares,
+            initial_shares=position.initial_shares,
+            is_add_on=is_add_on,
+        )
         lot = PositionLotRow(
             id=uuid4().hex,
             position_id=position.id,
             strategy=strategy.value if strategy else None,
             sub_mode=sub_mode.value if sub_mode else None,
+            sector=sector,
+            strategy_version=strategy_version,
             shares=shares,
             cost_price=price,
-            initial_r=None,
+            initial_r=initial_r,
+            initial_stop=initial_stop,
+            entry_fees=fees,
+            is_add_on=is_add_on,
             opened_at=executed_at,
-            add_index=len(position.lots),
+            add_index=batch_index,
             plan_id=plan_id,
         )
         self.session.add(lot)
@@ -281,8 +452,66 @@ class AccountService:
             actor="user",
             action="buy",
             target=ts_code,
-            after={"shares": shares, "price": float(price), "fees": float(fees)},
+            after={
+                "shares": shares,
+                "price": float(price),
+                "fees": float(fees),
+                "batch_index": batch_index,
+                "initial_r": float(initial_r) if initial_r is not None else None,
+            },
         )
+        return batch_index, initial_r
+
+    def _update_target_state(
+        self,
+        position: PositionRow,
+        *,
+        domain: Any,
+        shares: int,
+        initial_shares: int,
+        is_add_on: bool,
+    ) -> None:
+        if domain is None:
+            return
+        existing = [
+            item
+            for item in (position.target_state_json or [])
+            if isinstance(item, dict)
+        ]
+        if not is_add_on and not any(
+            int(item.get("filled_shares") or 0) > 0 for item in existing
+        ):
+            from app.portfolio.exit_rules import target_states_from_plan
+
+            states = target_states_from_plan(
+                [target.model_dump(mode="json") for target in domain.take_profit_plan.targets],
+                total_shares=position.shares,
+                initial_shares=initial_shares,
+            )
+            position.target_state_json = [
+                state.model_dump(mode="json") for state in states
+            ]
+            return
+        if is_add_on:
+            from app.portfolio.exit_rules import target_states_from_plan
+
+            additional = target_states_from_plan(
+                [target.model_dump(mode="json") for target in domain.take_profit_plan.targets],
+                total_shares=position.shares,
+                initial_shares=shares,
+            )
+            merged: dict[float, dict] = {
+                float(item.get("price") or 0): dict(item) for item in existing
+            }
+            for state in additional:
+                key = float(state.price)
+                if key in merged:
+                    merged[key]["planned_shares"] = int(
+                        merged[key].get("planned_shares") or 0
+                    ) + state.planned_shares
+                else:
+                    merged[key] = state.model_dump(mode="json")
+            position.target_state_json = list(merged.values())
 
     def _sell(
         self,
@@ -305,26 +534,80 @@ class AccountService:
             raise PortfolioError("sell exceeds position")
         account.cash += price * shares - fees
         remaining = position.shares - shares
-        realized = (price - position.cost_price) * shares
-        position.realized_r += float(realized)
-        self._reduce_lots(position, shares)
+        risk_per_share = (
+            float(position.initial_r)
+            if position.initial_r is not None and position.initial_r > 0
+            else None
+        )
+        if risk_per_share:
+            position.realized_r += (
+                (float(price) - float(position.cost_price)) / risk_per_share
+            ) * shares
+        self._allocate_target_fills(position, shares)
+        if remaining <= 0:
+            # Deleting the position cascades to its lots; reducing them first
+            # would make the ORM try to delete the same rows twice.
+            pass
+        else:
+            self._reduce_lots(position, shares)
         if remaining <= 0:
             PositionRepository.delete(self.session, self.account_id, ts_code)
-            if plan_id:
-                PlanRepository.update_status(
-                    self.session, plan_id, PlanStatus.CLOSED, "position closed"
-                )
+            for row in PlanRepository.list_open(self.session, self.account_id):
+                if row.ts_code == ts_code:
+                    PlanRepository.update_status(
+                        self.session, row.id, PlanStatus.CLOSED, "position closed"
+                    )
         else:
             position.shares = remaining
             position.current_price = price
+            position.highest_price = max(
+                position.highest_price or price, price
+            )
             self.refresh_available(executed_at.date())
         AuditRepository.log(
             self.session,
             actor="user",
             action="sell",
             target=ts_code,
-            after={"shares": shares, "price": float(price), "fees": float(fees)},
+            after={
+                "shares": shares,
+                "price": float(price),
+                "fees": float(fees),
+                "remaining": max(0, remaining),
+            },
         )
+
+    def _allocate_target_fills(self, position: PositionRow, shares: int) -> None:
+        """Mark take-profit tranches as filled without deleting their state.
+
+        The allocation is FIFO across the plan's targets.  A stop-out closes
+        the position anyway; a partial manual sell is at least visible in the
+        tranche progress rather than silently disappearing.
+        """
+        states = [
+            dict(item)
+            for item in (position.target_state_json or [])
+            if isinstance(item, dict)
+        ]
+        remaining = int(shares)
+        for item in states:
+            if remaining <= 0:
+                break
+            planned = int(item.get("planned_shares") or 0)
+            filled = int(item.get("filled_shares") or 0)
+            available = max(0, planned - filled)
+            if available <= 0:
+                item["status"] = "done"
+                continue
+            take = min(remaining, available)
+            item["filled_shares"] = filled + take
+            remaining -= take
+            item["status"] = (
+                "done"
+                if item["filled_shares"] >= planned
+                else "partial"
+            )
+        position.target_state_json = states
 
     def _reduce_lots(self, position: PositionRow, shares: int) -> None:
         remaining = shares
@@ -335,6 +618,8 @@ class AccountService:
             lot.shares -= reduce
             remaining -= reduce
             if lot.shares == 0:
+                if lot in position.lots:
+                    position.lots.remove(lot)
                 self.session.delete(lot)
         if remaining > 0:
             raise PortfolioError("lot accounting mismatch")
@@ -342,6 +627,14 @@ class AccountService:
     def _update_plan_after_buy(self, plan_id: str) -> None:
         plan = PlanRepository.get(self.session, plan_id)
         if plan is None:
+            return
+        if plan.status not in (
+            PlanStatus.PENDING_EXECUTION.value,
+            PlanStatus.PENDING_ENTRY.value,
+            PlanStatus.PARTIAL_FILL.value,
+        ):
+            # A real fill against an expired/cancelled plan is still recorded
+            # for audit, but it must not resurrect the plan state.
             return
         filled = sum(
             execution.shares
@@ -362,10 +655,105 @@ class AccountService:
             Decimal("0"),
         )
         account.equity = account.cash + value
-        account.peak_equity = max(account.peak_equity, account.equity)
+        performance_equity = account.equity - (account.net_deposits or Decimal("0"))
+        account.peak_equity = max(account.peak_equity, performance_equity)
         account.last_synced_at = datetime.now(UTC)
-        account.stale = False
+        account.last_valuation_at = datetime.now(UTC)
+        # Deliberately do not touch last_reconciled_at: a fill or a valuation
+        # is not a full manual reconciliation of the broker account.
         self.session.flush()
+
+    def revalue(
+        self,
+        as_of: date,
+        points: dict[str, PricePoint],
+        *,
+        now: datetime | None = None,
+    ) -> AccountRow:
+        """Unified mark-to-market step.
+
+        Missing/stale quotes keep the last known price, mark the valuation
+        incomplete, and never zero the position value.  External cash flows
+        are excluded from the peak/drawdown baseline.
+        """
+        account = self.account()
+        incomplete: list[str] = []
+        positions = PositionRepository.list_positions(self.session, self.account_id)
+        for position in positions:
+            point = points.get(position.ts_code)
+            if (
+                point is not None
+                and point.data_time is not None
+                and position.opened_at is not None
+                and point.data_time.date() < position.opened_at.date()
+            ):
+                point = None
+            if point is None:
+                position.valuation_status = ValuationStatus.MISSING.value
+                position.valuation_at = now or datetime.now(UTC)
+                incomplete.append(f"{position.ts_code}: 缺少行情")
+                continue
+            if not point.usable:
+                position.valuation_status = point.status.value
+                position.valuation_at = point.data_time or now or datetime.now(UTC)
+                issues = "；".join(point.issues) or point.status.value
+                incomplete.append(f"{position.ts_code}: {issues}")
+                continue
+            position.current_price = Decimal(str(point.price))
+            position.valuation_status = ValuationStatus.OK.value
+            position.valuation_at = point.data_time or now or datetime.now(UTC)
+            if point.high > 0:
+                position.highest_price = max(
+                    position.highest_price or Decimal("0"),
+                    Decimal(str(point.high)),
+                )
+        value = sum(
+            (position.current_price * position.shares for position in positions),
+            Decimal("0"),
+        )
+        account.equity = account.cash + value
+        performance_equity = account.equity - (account.net_deposits or Decimal("0"))
+        account.peak_equity = max(account.peak_equity, performance_equity)
+        account.valuation_incomplete = bool(incomplete)
+        account.valuation_note = "；".join(incomplete) or None
+        account.last_valuation_at = now or datetime.now(UTC)
+        account.last_synced_at = account.last_valuation_at
+        self.session.flush()
+        return account
+
+    def reconcile(
+        self,
+        *,
+        equity: Decimal | float | None = None,
+        cash: Decimal | float | None = None,
+        note: str | None = None,
+        reconciled_at: datetime | None = None,
+    ) -> AccountRow:
+        """Record an explicit human reconciliation of broker balances."""
+        account = self.account()
+        if equity is not None:
+            account.equity = Decimal(str(equity))
+        if cash is not None:
+            account.cash = Decimal(str(cash))
+        account.last_reconciled_at = reconciled_at or datetime.now(UTC)
+        account.stale = False
+        account.risk_profile_json = {
+            **(account.risk_profile_json or {}),
+            "last_reconciliation_note": note,
+        }
+        AuditRepository.log(
+            self.session,
+            actor="user",
+            action="reconcile_account",
+            target=self.account_id,
+            after={
+                "equity": float(account.equity),
+                "cash": float(account.cash),
+                "note": note,
+            },
+        )
+        self._recompute_equity(account)
+        return account
 
     def record_cash_flow(
         self,
@@ -377,17 +765,24 @@ class AccountService:
         note: str | None = None,
     ) -> bool:
         account = self.account()
+        value = Decimal(str(amount))
+        if flow_type in ("withdraw", "withdrawal") and value > 0:
+            value = -value
         _, created = CashFlowRepository.add(
             self.session,
             account_id=self.account_id,
             flow_type=flow_type,
-            amount=amount,
+            amount=value,
             occurred_at=occurred_at,
             external_id=external_id,
             note=note,
         )
         if created:
-            account.cash += Decimal(str(amount))
+            account.cash += value
+            if flow_type in ("deposit", "withdraw", "withdrawal"):
+                account.net_deposits = (
+                    account.net_deposits or Decimal("0")
+                ) + value
             self._recompute_equity(account)
             AuditRepository.log(
                 self.session,
@@ -408,15 +803,51 @@ class AccountService:
         cash = Decimal(str(cash_per_share)) * position.shares
         if cash:
             account.cash += cash
-        if share_ratio:
+        if share_ratio and share_ratio != -1:
+            ratio = Decimal(str(1 + share_ratio))
             new_shares = int(position.shares * (1 + share_ratio) // 100 * 100)
             if new_shares > 0:
                 position.cost_price = position.cost_price * position.shares / new_shares
-                position.current_stop = position.current_stop / Decimal(
-                    str(1 + share_ratio)
+                if position.current_stop > 0:
+                    position.current_stop = position.current_stop / ratio
+                if position.initial_r is not None:
+                    position.initial_r = position.initial_r / ratio
+                if position.highest_price is not None:
+                    position.highest_price = position.highest_price / ratio
+                position.initial_shares = int(
+                    position.initial_shares * (1 + share_ratio)
+                )
+                position.available_shares = int(
+                    position.available_shares * (1 + share_ratio)
                 )
                 position.shares = new_shares
-                position.available_shares = new_shares
+                lots = PositionRepository.list_lots(self.session, position.id)
+                for lot in lots:
+                    if lot.cost_price > 0:
+                        lot.cost_price = lot.cost_price / ratio
+                    if lot.initial_stop is not None:
+                        lot.initial_stop = lot.initial_stop / ratio
+                    if lot.initial_r is not None:
+                        lot.initial_r = lot.initial_r / ratio
+                    lot.shares = int(lot.shares * (1 + share_ratio))
+                if lots:
+                    lots[0].shares += new_shares - sum(
+                        lot.shares for lot in lots
+                    )
+                states = []
+                for item in position.target_state_json or []:
+                    entry = dict(item)
+                    entry["price"] = float(
+                        Decimal(str(entry.get("price") or 0)) / ratio
+                    )
+                    entry["planned_shares"] = int(
+                        int(entry.get("planned_shares") or 0) * (1 + share_ratio)
+                    )
+                    entry["filled_shares"] = int(
+                        int(entry.get("filled_shares") or 0) * (1 + share_ratio)
+                    )
+                    states.append(entry)
+                position.target_state_json = states
         return cash
 
     def apply_corporate_action(
@@ -500,9 +931,19 @@ class AccountService:
         return len(rows)
 
     def mark_stale(self, as_of: date) -> bool:
+        """Mark a real account stale based on *manual reconciliation* age.
+
+        A nightly valuation updates ``last_valuation_at`` but never claims the
+        broker balances were reconciled.
+        """
         account = self.account()
-        if account.last_synced_at is None or account.last_synced_at.date() < as_of:
-            account.stale = True
+        if account.mode == AccountMode.REAL.value:
+            reference = (
+                account.last_reconciled_at.date()
+                if account.last_reconciled_at is not None
+                else None
+            )
+            account.stale = reference is None or reference < as_of
         else:
             account.stale = False
         self.session.flush()

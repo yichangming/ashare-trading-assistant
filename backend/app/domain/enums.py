@@ -147,6 +147,29 @@ class NotificationLevel(StrEnum):
     CRITICAL = "critical"
 
 
+class PositionAction(StrEnum):
+    """Shared action vocabulary for live review, intraday and backtests."""
+
+    HOLD = "hold"
+    ADD_CONDITIONAL = "conditional_add"
+    REDUCE = "reduce"
+    EXIT = "exit"
+    WAIT_EXECUTION = "wait_execution"
+    DATA_ANOMALY = "data_anomaly"
+
+
+class ValuationStatus(StrEnum):
+    OK = "ok"
+    STALE = "stale"
+    MISSING = "missing"
+    UNKNOWN = "unknown"
+
+
+class ExitSession(StrEnum):
+    DAILY = "daily"
+    INTRADAY = "intraday"
+
+
 class JobStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"

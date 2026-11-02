@@ -38,8 +38,10 @@
 
 - 接口：`stk_mins(ts_code, freq="5min", start_date, end_date)`。
 - 返回：`trade_time, open, high, low, close, vol, amount`；49 根/完整交易日（含 09:35–15:00）。
-- 限频：**1 次/分钟**；因此只能监控一个小观察池（持仓 + 前一交易日 B 候选）。
-- 时点：只使用已完成 bar；不使用未来 bar。
+- 限频：**1 次/分钟**；进程内用实例级锁全局协调，不能每只股票各自缓存
+  后同时突破接口总限频。因此只能监控一个小观察池（持仓 + 前一交易日 B 候选）。
+- 时点：`trade_time` 按 bar 完成时间使用，只使用 `<= now` 的已完成 bar；
+  不额外延迟一根，不使用未来 bar。B2 的 10 交易分钟有效期跨午休计算。
 - VWAP：`amount/vol` 与价格量级一致（实测 11.64 vs 11.645）；精确计算，异常时标记 `vwap_approximate`。
 - 历史回补：1 次/分钟意味着全市场 5 年分钟回补不可行；只回补观察池/近期区间，回测缺失处明确标注。
 
@@ -47,9 +49,12 @@
 
 - `ts.realtime_quote` 在休市返回 `None`；盘中可用性与延迟**未验证**。
 - 系统实现 `RealtimeQuoteAdapter`：
-  - 若盘中可用：用于持仓保护线/硬风险监控和 B2 辅助；
-  - 若不可用/延迟超阈值：回退到 5 分钟 bar（1 次/分钟）并标记 `realtime_degraded`；
-  - 健康状态在 Web “运行健康”显示；不可用时不得声称实时。
+  - 校验报价日期、时区、行情时间、获取时间、未来偏差和年龄阈值；
+  - 旧日期/过期报价不更新持仓价格、不触发止损；缺少可靠时间戳标
+    `unknown`，不能用当前时间伪装；
+  - 不可用时回退到已完成的 5 分钟 bar，明确标记 `minute_delayed` 及延迟；
+    无数据时标 `missing`；
+  - 单只失败继续检查其他持仓，健康状态在 Web “运行健康”显示。
 - 不使用 `rt_k`（无权限）。
 
 ### 2.3 指数盘中
@@ -78,6 +83,8 @@
 ### 3.3 缺失处理
 
 - 事件数据缺失：F 权限 `paused/reduced`，报告标注 `event_data_incomplete`；D 的负面事件风险同样标注。
+- 自动同步区分：接口成功但 0 行 = `no_new_events`；无 token/权限/网络
+  失败 = `unavailable/failed`。`events` 表有历史记录不等于当前覆盖完整。
 - 不得用“无事件”推断安全。
 
 ## 4. 数据存储与同步
@@ -89,6 +96,9 @@
 - 账户/成交/计划/通知/任务/审计：SQLite `backend/data/app.db`。
 - 数据版本：日 manifest 哈希；分钟/事件各自 snapshot id；计划保存 `data_version`。
 - 交易日历/时区：`Asia/Shanghai`，`trade_cal` 为准。
+- 自动更新阶段记录 `succeeded/reused/skipped/unavailable/failed`；无外部
+  凭据时不得显示为同步成功。关键数据未就绪时停止新增信号，已有持仓保护
+  继续运行。
 
 ## 5. 外部成本与阻塞
 

@@ -108,23 +108,53 @@ def test_manual_execution_updates_positions(client: TestClient):
             "price": "10",
             "shares": "1000",
             "fees": "5",
-            "executed_at": "2026-11-02T10:00:00",
+            "executed_at": "2026-10-27T10:00:00",
         },
         follow_redirects=False,
     )
     assert response.status_code == 303
-    positions = client.get("/api/positions").json()["positions"]
+    payload = client.get("/api/positions").json()
+    positions = payload["positions"]
     assert positions[0]["ts_code"] == "000001.SZ"
     assert positions[0]["shares"] == 1000
+    decisions = payload["decisions"]
+    assert decisions[0]["action"] == "data_anomaly"
+    assert decisions[0]["reason_code"] == "stop_missing"
+    for field in (
+        "ts_code",
+        "primary_strategy",
+        "sub_mode",
+        "rule_version",
+        "suggested_shares",
+        "restricted_shares",
+        "current_stop",
+        "targets",
+        "confirmed",
+        "executed_shares",
+        "pending_shares",
+        "data_time",
+    ):
+        assert field in decisions[0]
+    assert "valuation" in payload
+    page = client.get("/positions")
+    assert 'data-position-code="000001.SZ"' in page.text
+    assert "数据异常" in page.text
 
 
-def test_sse_stream_emits_an_event_after_login(client: TestClient):
+def test_sse_stream_emits_positions_and_freshness_after_login(client: TestClient):
+    import json
+
     _login(client)
     with client.stream("GET", "/api/events/stream") as response:
         assert response.status_code == 200
         assert "text/event-stream" in response.headers["content-type"]
         first = next(response.iter_lines())
     assert first.startswith("data:")
+    payload = json.loads(first.removeprefix("data:").strip())
+    assert "positions" in payload
+    assert "quote_freshness" in payload
+    assert "valuation_incomplete" in payload
+    assert "last_reconciled_at" in payload
 
 
 def test_plan_confirmation_is_persisted(client: TestClient):

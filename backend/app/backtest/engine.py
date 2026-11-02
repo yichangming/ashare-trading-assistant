@@ -112,7 +112,12 @@ class BacktestEngine:
         simulator = Simulator(self.config, equity, equity, equity)
         notes: list[str] = [
             "daily OHLC replay; same-day stop and target resolves to stop",
+            "unfilled orders remain pending until expires_on",
+            "entry and exit fees are included in trade PnL and reconciliation",
             "B2 intraday is not simulated from daily bars",
+            "corporate-action-adjusted PnL and delisting lifecycle are limited "
+            "when the historical data does not cover them; performance is not "
+            "presented as complete in those cases",
         ]
         for day in open_dates:
             bars = self.provider.load_bars(day, day)

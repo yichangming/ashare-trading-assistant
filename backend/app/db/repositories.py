@@ -34,11 +34,13 @@ from app.domain.enums import (
     Strategy,
     SubMode,
     Template,
+    ValuationStatus,
 )
 from app.domain.models import (
     AccountState,
     PendingExposure,
     PositionState,
+    TargetState,
     TradePlan,
 )
 
@@ -75,6 +77,7 @@ class AccountRepository:
             initial_equity=Decimal(str(equity)),
             max_drawdown=max_drawdown,
             risk_config_configured=risk_config_configured,
+            net_deposits=Decimal("0"),
         )
         session.add(row)
         session.flush()
@@ -107,7 +110,15 @@ class AccountRepository:
         row.risk_config_configured = state.risk_config_configured
         row.trading_halted = state.trading_halted
         row.drawdown_half_latched = state.drawdown_half_latched
+        row.max_drawdown = state.max_drawdown
+        row.net_deposits = state.net_deposits
+        row.valuation_incomplete = state.valuation_incomplete
+        row.valuation_note = state.valuation_note
         row.last_synced_at = state.last_synced_at or datetime.now(UTC)
+        row.last_valuation_at = state.last_valuation_at or row.last_valuation_at
+        row.last_reconciled_at = (
+            state.last_reconciled_at or row.last_reconciled_at
+        )
         row.stale = state.stale
         session.flush()
         return row
@@ -125,12 +136,25 @@ class AccountRepository:
         for position in positions:
             price = prices.get(position.ts_code, position.current_price)
             lots = PositionRepository.list_lots(session, position.id)
-            initial_shares = (
+            initial_shares = position.initial_shares or (
                 sum(lot.shares for lot in lots if lot.add_index == 0)
                 if lots
                 else position.shares
             )
-            add_on_count = max((lot.add_index for lot in lots), default=0)
+            add_on_count = max(
+                position.add_on_count,
+                max((lot.add_index for lot in lots), default=0),
+            )
+            strategy_value = position.primary_strategy or next(
+                (lot.strategy for lot in lots if lot.strategy), None
+            )
+            sub_mode_value = position.sub_mode or next(
+                (lot.sub_mode for lot in lots if lot.sub_mode), None
+            )
+            targets = [
+                TargetState.model_validate(item)
+                for item in (position.target_state_json or [])
+            ]
             position_states.append(
                 PositionState(
                     ts_code=position.ts_code,
@@ -140,15 +164,33 @@ class AccountRepository:
                     cost_price=position.cost_price,
                     current_stop=position.current_stop,
                     current_price=price,
-                    template=Template.A,
-                    strategy=Strategy(position.primary_strategy)
-                    if position.primary_strategy
+                    template=Template.B
+                    if strategy_value == Strategy.B.value
+                    else Template.A,
+                    strategy=Strategy(strategy_value)
+                    if strategy_value
                     else None,
-                    sub_mode=SubMode(lots[-1].sub_mode)
-                    if lots and lots[-1].sub_mode
+                    sub_mode=SubMode(sub_mode_value)
+                    if sub_mode_value
                     else None,
+                    primary_strategy=Strategy(strategy_value)
+                    if strategy_value
+                    else None,
+                    strategy_version=position.strategy_version,
+                    initial_r=position.initial_r,
                     initial_shares=initial_shares,
                     add_on_count=add_on_count,
+                    needs_reconciliation=bool(
+                        position.needs_reconciliation
+                        or position.primary_strategy is None
+                        or position.current_stop <= 0
+                    ),
+                    valuation_status=ValuationStatus(
+                        position.valuation_status or "unknown"
+                    ),
+                    valuation_at=position.valuation_at,
+                    data_time=position.valuation_at,
+                    targets=targets,
                 )
             )
         pending = PlanRepository.pending_exposures(session, account_id)
@@ -162,7 +204,13 @@ class AccountRepository:
             drawdown_half_latched=row.drawdown_half_latched,
             mode=AccountMode(row.mode),
             risk_config_configured=row.risk_config_configured,
+            max_drawdown=row.max_drawdown,
+            net_deposits=row.net_deposits,
+            valuation_incomplete=row.valuation_incomplete,
+            valuation_note=row.valuation_note,
             last_synced_at=row.last_synced_at,
+            last_valuation_at=row.last_valuation_at,
+            last_reconciled_at=row.last_reconciled_at,
             stale=row.stale,
         )
 
@@ -210,9 +258,19 @@ class PositionRepository:
         current_stop: Decimal | float = 0,
         current_price: Decimal | float = 0,
         primary_strategy: str | None = None,
+        sub_mode: str | None = None,
+        strategy_version: str | None = None,
         plan_id: str | None = None,
         opened_at: datetime | None = None,
         status: str = "open",
+        highest_price: Decimal | float | None = None,
+        initial_r: Decimal | float | None = None,
+        initial_shares: int | None = None,
+        add_on_count: int | None = None,
+        target_state_json: list[dict[str, Any]] | None = None,
+        needs_reconciliation: bool = False,
+        valuation_status: str = "unknown",
+        valuation_at: datetime | None = None,
     ) -> PositionRow:
         row = PositionRepository.get(session, account_id, ts_code)
         if row is None:
@@ -227,9 +285,27 @@ class PositionRepository:
                 current_stop=Decimal(str(current_stop)),
                 current_price=Decimal(str(current_price)),
                 primary_strategy=primary_strategy,
+                sub_mode=sub_mode,
+                strategy_version=strategy_version,
                 plan_id=plan_id,
                 opened_at=opened_at or datetime.now(UTC),
                 status=status,
+                highest_price=(
+                    Decimal(str(highest_price))
+                    if highest_price is not None
+                    else Decimal(str(cost_price))
+                ),
+                initial_r=(
+                    Decimal(str(initial_r)) if initial_r is not None else None
+                ),
+                initial_shares=(
+                    int(initial_shares) if initial_shares is not None else shares
+                ),
+                add_on_count=add_on_count or 0,
+                target_state_json=target_state_json or [],
+                needs_reconciliation=needs_reconciliation,
+                valuation_status=valuation_status,
+                valuation_at=valuation_at,
             )
             session.add(row)
         else:
@@ -241,8 +317,27 @@ class PositionRepository:
             row.current_price = Decimal(str(current_price))
             if primary_strategy:
                 row.primary_strategy = primary_strategy
+            if sub_mode:
+                row.sub_mode = sub_mode
+            if strategy_version:
+                row.strategy_version = strategy_version
             row.plan_id = plan_id or row.plan_id
             row.status = status
+            if highest_price is not None:
+                row.highest_price = Decimal(str(highest_price))
+            if initial_r is not None:
+                row.initial_r = Decimal(str(initial_r))
+            if initial_shares is not None:
+                row.initial_shares = int(initial_shares)
+            if add_on_count is not None:
+                row.add_on_count = int(add_on_count)
+            if target_state_json is not None:
+                row.target_state_json = target_state_json
+            row.needs_reconciliation = bool(
+                row.needs_reconciliation or needs_reconciliation
+            )
+            row.valuation_status = valuation_status
+            row.valuation_at = valuation_at or row.valuation_at
         session.flush()
         return row
 
@@ -279,6 +374,8 @@ class PlanRepository:
                 sub_mode=plan.sub_mode.value if plan.sub_mode else None,
                 status=plan.status.value,
                 expires_on=plan.expires_on,
+                expires_at=plan.expires_at,
+                is_add_on=plan.position_plan.is_add_on,
                 confirmation_price=plan.confirmation_price,
                 max_acceptable_price=plan.max_acceptable_price,
                 stop_price=plan.stop_plan.initial_stop,
@@ -292,6 +389,9 @@ class PlanRepository:
             session.add(row)
         else:
             row.status = plan.status.value
+            row.expires_on = plan.expires_on
+            row.expires_at = plan.expires_at
+            row.is_add_on = plan.position_plan.is_add_on
             row.stop_price = plan.stop_plan.initial_stop
             row.shares = plan.position_plan.shares
             row.risk_amount = plan.position_plan.risk_amount
@@ -368,12 +468,56 @@ class PlanRepository:
         return len(rows)
 
     @staticmethod
+    def expire_intraday(
+        session: Session, now: datetime, account_id: str = "default"
+    ) -> int:
+        """Expire B2-style plans whose exact validity moment has passed."""
+        active = (
+            PlanStatus.PENDING_EXECUTION.value,
+            PlanStatus.PENDING_ENTRY.value,
+            PlanStatus.PARTIAL_FILL.value,
+        )
+        candidates = list(
+            session.scalars(
+                select(PlanRow).where(
+                    PlanRow.account_id == account_id,
+                    PlanRow.status.in_(active),
+                    PlanRow.expires_at.is_not(None),
+                )
+            )
+        )
+        rows = []
+        for row in candidates:
+            expires_at = row.expires_at
+            if expires_at is None:
+                continue
+            if expires_at.tzinfo is None and now.tzinfo is not None:
+                expires_at = expires_at.replace(tzinfo=now.tzinfo)
+            if expires_at <= now:
+                rows.append(row)
+        for row in rows:
+            row.status = PlanStatus.EXPIRED.value
+            payload = dict(row.plan_json or {})
+            payload["cancel_reason"] = "expired"
+            row.plan_json = payload
+        if rows:
+            session.flush()
+        return len(rows)
+
+    @staticmethod
     def pending_exposures(session: Session, account_id: str = "default") -> list[PendingExposure]:
         exposures: list[PendingExposure] = []
         today = date.today()
+        now = datetime.now(UTC)
         for row in PlanRepository.list_open(session, account_id):
             if row.expires_on < today:
                 continue
+            expires_at = row.expires_at
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=UTC)
+                if expires_at <= now:
+                    continue
             if row.status not in (
                 PlanStatus.PENDING_EXECUTION.value,
                 PlanStatus.PENDING_ENTRY.value,
@@ -460,6 +604,13 @@ class ExecutionRepository:
         source: str = "manual",
         external_id: str | None = None,
         note: str | None = None,
+        strategy: str | None = None,
+        sub_mode: str | None = None,
+        sector: str | None = None,
+        strategy_version: str | None = None,
+        batch_index: int | None = None,
+        initial_r: Decimal | float | None = None,
+        plan_deviation: str | None = None,
     ) -> tuple[ExecutionRow, bool]:
         if external_id:
             existing = session.scalar(
@@ -480,6 +631,15 @@ class ExecutionRepository:
             shares=int(shares),
             fees=Decimal(str(fees)),
             executed_at=executed_at,
+            strategy=strategy,
+            sub_mode=sub_mode,
+            sector=sector,
+            strategy_version=strategy_version,
+            batch_index=batch_index,
+            initial_r=(
+                Decimal(str(initial_r)) if initial_r is not None else None
+            ),
+            plan_deviation=plan_deviation,
             source=source,
             external_id=external_id,
             note=note,

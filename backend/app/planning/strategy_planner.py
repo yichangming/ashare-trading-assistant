@@ -12,6 +12,7 @@ from app.domain.enums import EntryType, Strategy, SubMode
 from app.domain.models import (
     Candidate,
     EntryPlan,
+    ExitRules,
     StopPlan,
     TakeProfitPlan,
     TakeProfitTarget,
@@ -33,6 +34,7 @@ class StrategyPlanParts:
     max_acceptable_price: Decimal
     execution_low: Decimal
     execution_high: Decimal
+    exit_rules: ExitRules
 
 
 def _validity_days(candidate: Candidate, config: FullSystemConfig) -> int:
@@ -152,6 +154,41 @@ def _trailing_rules(strategy: Strategy) -> tuple[str, str]:
     )
 
 
+def _exit_rules(
+    strategy: Strategy, time_stop_days: int, config: FullSystemConfig
+) -> ExitRules:
+    if strategy == Strategy.B:
+        return ExitRules(
+            trailing="breakeven_1r_2r_ma5_atr",
+            time_exit="no_new_high",
+            time_stop_days=time_stop_days,
+        )
+    if strategy == Strategy.D:
+        return ExitRules(
+            trailing="breakeven_1r_2r_ma5_atr",
+            time_exit="no_new_high",
+            time_stop_days=time_stop_days,
+        )
+    if strategy == Strategy.E:
+        return ExitRules(
+            trailing="breakeven_1r_2r_range_atr",
+            time_exit="below_entry",
+            time_stop_days=time_stop_days,
+        )
+    if strategy == Strategy.F:
+        return ExitRules(
+            trailing="breakeven_1r_2r_atr",
+            time_exit="event_expiry",
+            time_stop_days=time_stop_days,
+            event_expiry_days=config.strategies.f.event_window_days,
+        )
+    return ExitRules(
+        trailing="breakeven_1r_2r_atr",
+        time_exit="below_entry",
+        time_stop_days=time_stop_days,
+    )
+
+
 class StrategyPlanner:
     def plan_parts(
         self,
@@ -238,6 +275,7 @@ class StrategyPlanner:
             max_acceptable_price=price(max_acceptable),
             execution_low=price(entry_price),
             execution_high=price(max_acceptable),
+            exit_rules=_exit_rules(strategy, time_stop, config),
         )
 
     def _expiry(self, calendar: TradingCalendar, as_of: date, days: int) -> date:

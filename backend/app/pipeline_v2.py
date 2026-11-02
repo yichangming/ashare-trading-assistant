@@ -124,13 +124,20 @@ class StrategyPipeline:
         strategy_mode: str = "all",
         session: Session | None = None,
         events_by_code: dict[str, list[dict]] | None = None,
+        events_available: bool | None = None,
         minute_health: bool = True,
         data_version: str | None = None,
         data_fault: bool = False,
     ) -> StrategyPipelineResult:
-        account = account.with_risk_latches(
+        stop_at = min(
             self.config.risk.drawdown_stop_at,
-            self.config.risk.drawdown_half_at,
+            account.max_drawdown
+            if account.risk_config_configured and account.max_drawdown > 0
+            else self.config.risk.drawdown_stop_at,
+        )
+        account = account.with_risk_latches(
+            stop_at,
+            min(self.config.risk.drawdown_half_at, stop_at * (2 / 3)),
         )
         expiry_days = max(
             self.config.strategies.a.valid_days,
@@ -296,7 +303,8 @@ class StrategyPipeline:
         events = events_by_code
         if events is None and session is not None:
             events = self._load_events(session, as_of)
-        events_available = events_by_code is not None or session is not None
+        if events_available is None:
+            events_available = events_by_code is not None or session is not None
         context = StrategyContext(
             as_of=as_of,
             bars=bars,
@@ -352,6 +360,7 @@ class StrategyPipeline:
                         position_plan=position,
                         take_profit_plan=parts.take_profit,
                         expires_on=parts.entry.expires_on,
+                        exit_rules=parts.exit_rules,
                         strategy_version=self.config.version,
                         data_version=regime.data_version,
                         code_version=self.code_version,

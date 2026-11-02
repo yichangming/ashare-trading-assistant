@@ -48,7 +48,13 @@ class StrategyRiskGovernor:
                 self._reject(plan, "trading halted: manual restart required")
                 for plan in plans
             ]
-        if account.drawdown_pct >= config.risk.drawdown_stop_at:
+        stop_at = min(
+            config.risk.drawdown_stop_at,
+            account.max_drawdown
+            if account.risk_config_configured and account.max_drawdown > 0
+            else config.risk.drawdown_stop_at,
+        )
+        if account.drawdown_pct >= stop_at:
             return [
                 self._reject(plan, "drawdown circuit breaker active")
                 for plan in plans
@@ -57,6 +63,14 @@ class StrategyRiskGovernor:
             return [
                 self._reject(
                     plan, "account data stale; reconcile positions first"
+                )
+                for plan in plans
+            ]
+        if account.mode == AccountMode.REAL and account.valuation_incomplete:
+            return [
+                self._reject(
+                    plan,
+                    "valuation incomplete; reconcile prices before new plans",
                 )
                 for plan in plans
             ]
@@ -119,6 +133,25 @@ class StrategyRiskGovernor:
                         self._reject(
                             plan,
                             "add-on requires the existing position to be profitable",
+                        )
+                    )
+                    continue
+                if (
+                    existing.current_stop > 0
+                    and existing.current_price <= existing.current_stop
+                ):
+                    output.append(
+                        self._reject(
+                            plan,
+                            "add-on blocked by existing hard risk",
+                        )
+                    )
+                    continue
+                if existing.needs_reconciliation:
+                    output.append(
+                        self._reject(
+                            plan,
+                            "add-on blocked: existing position needs reconciliation",
                         )
                     )
                     continue

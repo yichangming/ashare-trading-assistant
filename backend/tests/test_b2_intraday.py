@@ -143,7 +143,7 @@ def test_b2_monitor_turns_watchlist_signal_into_plan():
         SnapshotRepository.save(
             session,
             account_id="default",
-            trade_date=day,
+            trade_date=date(2026, 10, 29),
             state=state,
             detail={
                 "candidates": [candidate.model_dump(mode="json")],

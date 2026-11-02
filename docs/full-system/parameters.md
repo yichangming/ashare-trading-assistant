@@ -226,6 +226,36 @@
 | 失败重试 | `retry_count=3`，指数退避 `retry_base_seconds=30` |
 | 任务恢复 | 启动时把残留 `running` 任务标记失败，允许重跑 |
 | 日志/通知保留 | 90 天（`notification_retention_days`） |
-| 通知 | 站内；风险优先；去重；确认/未处理 |
+| 通知 | 站内；风险优先；按状态变化去重；确认/未处理 |
 | 认证 | 单用户；无默认密码；HTTPS 说明 |
 | 部署 | Docker Compose 或 systemd；SQLite 备份 |
+
+### 12.1 估值、对账与盘中新鲜度
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| 权益口径 | 现金 + Σ(有效价×股数) | 缺行情保留最后价格并标不完整，不清零 |
+| 估值时间 | `last_valuation_at` | 盘后/执行后的行情估值 |
+| 人工核对 | `last_reconciled_at` | 只有显式核对才更新；盘后任务不宣称已对账 |
+| 净入金 | `net_deposits` | 入出金不计入收益；峰值/回撤按表现权益 |
+| 用户最大回撤 | 表单值 | 与配置上限取更严格者参与 sizing/governor |
+| 实时报价最大年龄 | 180 秒 | 可配 `intraday.max_quote_age_seconds` |
+| 延迟分钟数据上限 | 900 秒 | 可配 `intraday.max_delayed_seconds` |
+| 未来时间偏差 | 30 秒 | 超过标 unknown，不触发止损 |
+| 分钟源限频 | 60 秒/次 | 实例级全局，不按股票各自缓存 |
+
+### 12.2 数据更新阶段
+
+交易日检查 → 参考/日历 → 增量日线 → 清洗组装 → 质量门 → 结构化事件
+→ 账户/持仓估值 → A-F → 计划 → 日报。阶段状态：
+`succeeded/reused/skipped/unavailable/failed`；无 `TUSHARE_TOKEN` 为
+`unavailable`，不是成功。关键数据未就绪时停止新增信号，已持仓保护继续。
+
+### 12.3 加仓批次口径
+
+- 首次买入的多笔成交共享 `add_index=0`、同一 `initial_r`；不按成交笔数
+  计加仓。
+- 加仓按不同计划/显式 `is_add_on` 计一次；`add_on_count`、`initial_shares`
+  持久化，不因 lot 卖出/删除重置。
+- 加仓不覆盖主策略/主计划；保护线不得下调。
+- 无计划历史成交标 `待补全`，不得用买入价作为止损。

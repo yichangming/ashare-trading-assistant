@@ -731,16 +731,20 @@ def daily(
     from app.core.full_config import load_full_config
     from app.db.session import prepare_database
     from app.jobs.daily import DailyJobService
+    from app.jobs.data_update import DataUpdateService
 
     prepare_database()
+    store = _store()
     service = DailyJobService(
-        provider=ParquetMarketDataProvider(_store()),
+        provider=ParquetMarketDataProvider(store),
         config=load_full_config(),
+        data_update=DataUpdateService(store=store, config=load_full_config()),
     )
     outcome = service.run(
         parse_date(day) if day else _today(),
         strategy_mode=strategy_mode,
         force=force,
+        run_data_update=True,
     )
     typer.echo(
         f"status={outcome.status} skipped={outcome.skipped} "

@@ -24,6 +24,8 @@ class DataHealthReport(BaseModel):
     latest_processed: str | None
     latest_raw: str | None
     account_last_synced: datetime | None
+    account_last_reconciled: datetime | None = None
+    account_last_valuation: datetime | None = None
     account_stale: bool
     ok: bool
     issues: list[str] = []
@@ -87,19 +89,35 @@ class DataHealthService:
                 )
 
         account_last_synced: datetime | None = None
+        account_last_reconciled: datetime | None = None
+        account_last_valuation: datetime | None = None
         account_stale = True
         if session is not None:
             account = AccountRepository.get(session, self.account_id)
             if account is not None:
                 account_last_synced = account.last_synced_at
+                account_last_reconciled = account.last_reconciled_at
+                account_last_valuation = account.last_valuation_at
                 account_stale = bool(account.stale)
-                reference = account_last_synced.date() if account_last_synced else None
-                if reference is None:
-                    issues.append("账户从未同步")
-                elif (as_of - reference).days > self.account_max_age_days:
+                reference = (
+                    account_last_reconciled.date()
+                    if account_last_reconciled is not None
+                    else None
+                )
+                if account.mode == "real" and reference is None:
+                    issues.append("账户从未人工核对（盘后估值不算对账）")
+                elif (
+                    account.mode == "real"
+                    and reference is not None
+                    and (as_of - reference).days > self.account_max_age_days
+                ):
                     issues.append(
-                        f"账户同步过期：{reference.isoformat()} "
+                        f"账户人工核对过期：{reference.isoformat()} "
                         f"> {self.account_max_age_days} 天"
+                    )
+                if account.valuation_incomplete:
+                    issues.append(
+                        f"估值不完整：{account.valuation_note or '部分持仓缺少行情'}"
                     )
 
         return DataHealthReport(
@@ -108,6 +126,8 @@ class DataHealthService:
             latest_processed=latest_processed,
             latest_raw=latest_raw,
             account_last_synced=account_last_synced,
+            account_last_reconciled=account_last_reconciled,
+            account_last_valuation=account_last_valuation,
             account_stale=account_stale,
             ok=not issues,
             issues=issues,

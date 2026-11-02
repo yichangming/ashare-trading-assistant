@@ -248,7 +248,7 @@ def test_manual_execution_respects_plan_price_and_expiry():
         service = _service(session)
         plan = _plan(date(2024, 1, 2))
         PlanRepository.save(session, plan)
-        with pytest.raises(PortfolioError, match="max_acceptable"):
+        with pytest.raises(PortfolioError, match="最高接受价"):
             service.record_execution(
                 ts_code="000001.SZ",
                 side=ExecutionSide.BUY,
@@ -256,8 +256,9 @@ def test_manual_execution_respects_plan_price_and_expiry():
                 shares=1000,
                 executed_at=datetime(2024, 1, 3, 10, 0),
                 plan_id=plan.id,
+                strict_plan=True,
             )
-        with pytest.raises(PortfolioError, match="expired"):
+        with pytest.raises(PortfolioError, match="有效期"):
             service.record_execution(
                 ts_code="000001.SZ",
                 side=ExecutionSide.BUY,
@@ -265,16 +266,31 @@ def test_manual_execution_respects_plan_price_and_expiry():
                 shares=1000,
                 executed_at=datetime(2024, 1, 10, 10, 0),
                 plan_id=plan.id,
+                strict_plan=True,
             )
+        # A real fill that deviates from the plan is still recorded, with an
+        # audit warning; refusing it would make the broker account unknowable.
+        deviated = service.record_execution(
+            ts_code="000001.SZ",
+            side=ExecutionSide.BUY,
+            price=Decimal("10.5"),
+            shares=1000,
+            executed_at=datetime(2024, 1, 3, 10, 0),
+            plan_id=plan.id,
+            external_id="deviation-1",
+        )
+        assert deviated.shares == 1000
+        assert "最高接受价" in (deviated.plan_deviation or "")
         execution = service.record_execution(
             ts_code="000001.SZ",
             side=ExecutionSide.BUY,
             price=Decimal("10.0"),
             shares=1000,
-            executed_at=datetime(2024, 1, 3, 10, 0),
-            plan_id=plan.id,
+            executed_at=datetime(2024, 1, 3, 10, 5),
+            external_id="fill-2",
         )
         assert execution.shares == 1000
+        assert deviated.strategy == "A"
 
 
 def test_cancel_order_rejects_filled_and_is_idempotent():

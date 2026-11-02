@@ -26,9 +26,18 @@
       <p>预期交易日：<span class="mono">{{ health.expected_trade_date if health and health.expected_trade_date else '—' }}</span></p>
       <p>最新处理日：<span class="mono">{{ data_status.latest_processed or '—' }}</span></p>
       <p>最新原始日：<span class="mono">{{ data_status.latest_raw or '—' }}</span></p>
-      <p>账户同步：<span class="mono">{{ account.last_synced_at if account and account.last_synced_at else '—' }}</span>{% if account and account.stale %}<span class="cinnabar">（过期）</span>{% endif %}</p>
+      <p>行情估值：<span class="mono">{{ account.last_valuation_at if account and account.last_valuation_at else '—' }}</span>{% if account and account.valuation_incomplete %}<span class="cinnabar">（不完整：{{ account.valuation_note }}）</span>{% endif %}</p>
+      <p>人工核对：<span class="mono">{{ account.last_reconciled_at if account and account.last_reconciled_at else '未核对' }}</span>{% if account and account.stale %}<span class="cinnabar">（过期）</span>{% endif %}</p>
       <p>调度器：<span class="{{ 'jade' if scheduler_running else 'cinnabar' }}">{{ '运行中' if scheduler_running else '未启动' }}</span></p>
       <p>实时/分钟：<span class="muted">stk_mins 限频 1 次/分钟；realtime_quote 盘中可用性需实测</span></p>
+      <p>事件同步：<span class="mono">{{ event_sync.status if event_sync else '未运行' }}</span>
+        {% if event_sync and event_sync.checked_at %}<span class="muted small">（{{ event_sync.checked_at }}）</span>{% endif %}
+        {% if event_sync and event_sync.status in ['unavailable','failed'] %}<span class="cinnabar">（事件覆盖未确认，F 暂停）</span>{% endif %}
+      </p>
+      {% if data_update and data_update.stages %}
+      <p class="small" style="margin-bottom:.2rem">最近数据更新阶段：</p>
+      <ul class="small">{% for stage in data_update.stages %}<li><span class="mono">{{ stage.name }}</span>：{{ stage.status }}{% if stage.detail %} · {{ stage.detail }}{% endif %}</li>{% endfor %}</ul>
+      {% endif %}
     </div>
     <div class="notice" style="margin-top:.6rem">
       <strong>演示模式</strong>

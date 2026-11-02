@@ -24,6 +24,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 class B2Signal:
     ts_code: str
     signal_time: datetime
+    bar_completed_at: datetime
     entry_price: float
     frozen_low: float
     frozen_high: float
@@ -57,6 +58,66 @@ def _session_ok(moment: datetime) -> bool:
         time(9, 30) <= current <= time(11, 30)
         or time(13, 0) <= current <= time(15, 0)
     )
+
+
+def add_trading_minutes(moment: datetime, minutes: int) -> datetime:
+    """Add market-open minutes, skipping the 11:30–13:00 lunch break.
+
+    A 10-minute validity at 11:25 therefore ends at 13:05, not 11:35.
+    """
+    current = moment
+    remaining = max(0, minutes)
+    sessions = (
+        (time(9, 30), time(11, 30)),
+        (time(13, 0), time(15, 0)),
+    )
+    while remaining > 0:
+        clock = current.time()
+        if clock < sessions[0][0]:
+            current = datetime.combine(
+                current.date(), sessions[0][0], tzinfo=current.tzinfo
+            )
+            clock = current.time()
+        if sessions[0][0] <= clock < sessions[0][1]:
+            available = int(
+                (
+                    datetime.combine(
+                        current.date(), sessions[0][1], tzinfo=current.tzinfo
+                    )
+                    - current
+                ).total_seconds()
+                // 60
+            )
+            step = min(remaining, available)
+            current += timedelta(minutes=step)
+            remaining -= step
+            continue
+        if sessions[1][0] <= clock < sessions[1][1]:
+            available = int(
+                (
+                    datetime.combine(
+                        current.date(), sessions[1][1], tzinfo=current.tzinfo
+                    )
+                    - current
+                ).total_seconds()
+                // 60
+            )
+            step = min(remaining, available)
+            current += timedelta(minutes=step)
+            remaining -= step
+            continue
+        # Between sessions or after close: jump to the next open minute.
+        if clock < sessions[1][0]:
+            current = datetime.combine(
+                current.date(), sessions[1][0], tzinfo=current.tzinfo
+            )
+        else:
+            current = datetime.combine(
+                current.date() + timedelta(days=1),
+                sessions[0][0],
+                tzinfo=current.tzinfo,
+            )
+    return current
 
 
 def _atr5(rows: list[dict], end_index: int, window: int = 14) -> float:
@@ -94,6 +155,10 @@ def detect_b2(
         moment = _as_datetime(row.get("trade_time"))
         if moment is None or not _session_ok(moment):
             continue
+        # Tushare ``stk_mins`` labels a bar by its completion time (the first
+        # 5-minute bar is 09:35), so a timestamp at or before ``now`` is a
+        # completed bar.  Do not subtract an extra bar: that silently delays
+        # every signal by five minutes.
         if completed_until is not None and moment > completed_until:
             continue
         row = dict(row)
@@ -173,7 +238,7 @@ def detect_b2(
             stop_distance = (close - stop_price) / close if close else 1.0
             actionable = cfg.b2_stop_min <= stop_distance <= cfg.b2_stop_max
             valid_until = min(
-                moment + timedelta(minutes=cfg.b2_valid_minutes),
+                add_trading_minutes(moment, cfg.b2_valid_minutes),
                 datetime.combine(
                     moment.date(), time(15, 0), tzinfo=moment.tzinfo
                 ),
@@ -181,6 +246,7 @@ def detect_b2(
             return B2Signal(
                 ts_code=ts_code,
                 signal_time=moment,
+                bar_completed_at=moment,
                 entry_price=close,
                 frozen_low=float(freeze["low"]),
                 frozen_high=float(freeze["high"]),

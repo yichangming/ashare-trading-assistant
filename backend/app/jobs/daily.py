@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.config import StrategyConfig, load_strategy_config
+from app.core.errors import DataNotReadyError, DataQualityError
 from app.core.full_config import FullSystemConfig, load_full_config
 from app.core.logging import redact
 from app.data.interfaces import MarketDataProvider
@@ -20,8 +21,9 @@ from app.db.repositories import (
     SnapshotRepository,
 )
 from app.db.session import session_scope
-from app.domain.enums import AccountMode
+from app.domain.enums import AccountMode, GlobalRiskMode
 from app.events.risk import EventRiskService
+from app.jobs.data_update import DataUpdateResult, DataUpdateService
 from app.jobs.exits import ExitReviewService
 from app.jobs.reports import ReportService
 from app.pipeline_v2 import StrategyPipeline, StrategyPipelineResult
@@ -32,8 +34,13 @@ class DailyJobOutcome(BaseModel):
     job_id: str
     status: str
     skipped: bool
+    incomplete: bool = False
+    data_issues: list[str] = []
+    data_notes: list[str] = []
     plans: list[str] = []
     report: dict[str, str] = {}
+    decisions: list[dict] = []
+    data_stages: list[dict] = []
 
 
 @dataclass
@@ -43,6 +50,7 @@ class DailyJobService:
     legacy_config: StrategyConfig = field(default_factory=load_strategy_config)
     pipeline: StrategyPipeline | None = None
     reports: ReportService = field(default_factory=ReportService)
+    data_update: DataUpdateService | None = None
     code_version: str = "dev"
 
     def __post_init__(self) -> None:
@@ -60,6 +68,7 @@ class DailyJobService:
         account_id: str = "default",
         strategy_mode: str = "all",
         force: bool = False,
+        run_data_update: bool = False,
     ) -> DailyJobOutcome:
         with session_scope() as session:
             key = f"daily:{as_of.isoformat()}:{strategy_mode}"
@@ -93,56 +102,137 @@ class DailyJobService:
                     cash=1_000_000,
                     mode=AccountMode.PAPER,
                 )
+                data_result: DataUpdateResult | None = None
+                incomplete: list[str] = []
+                data_notes: list[str] = []
+                if self.data_update is not None and run_data_update:
+                    data_result = self.data_update.run(as_of, session)
+                    if not data_result.data_ready:
+                        incomplete.extend(data_result.issues)
+                    data_notes.extend(
+                        issue
+                        for issue in data_result.issues
+                        if issue not in incomplete
+                    )
                 PlanRepository.expire_overdue(session, as_of)
-                AccountService(
+                account_service = AccountService(
                     session, self.config, account_id
-                ).apply_due_corporate_actions(as_of)
-                EventRiskService(session, self.config, account_id).apply(as_of)
-                account = AccountRepository.to_state(session, account_id)
-                data_version = self._data_version(as_of)
-                result: StrategyPipelineResult = self.pipeline.run(  # type: ignore[union-attr]
-                    as_of,
-                    account,
-                    strategy_mode=strategy_mode,
-                    session=session,
-                    data_version=data_version,
                 )
-                ExitReviewService(
+                # Order matters: corporate actions -> T+1 availability ->
+                # reconciliation freshness -> mark-to-market + existing
+                # position decisions -> only then new plans.
+                account_service.apply_due_corporate_actions(as_of)
+                account_service.refresh_available(as_of)
+                account_service.mark_stale(as_of)
+                EventRiskService(session, self.config, account_id).apply(as_of)
+                exit_result = ExitReviewService(
                     self.provider, self.config, account_id
                 ).review(as_of, session)
-                AccountRepository.save_state(session, result.account, account_id)
+                decisions = exit_result.decisions
+                account = AccountRepository.to_state(session, account_id)
+
+                data_version = self._data_version(as_of)
+                result: StrategyPipelineResult | None = None
+                if data_result is None or data_result.data_ready:
+                    try:
+                        result = self.pipeline.run(  # type: ignore[union-attr]
+                            as_of,
+                            account,
+                            strategy_mode=strategy_mode,
+                            session=session,
+                            data_version=data_version,
+                            events_available=(
+                                data_result.events_available
+                                if data_result is not None
+                                else None
+                            ),
+                        )
+                    except (DataNotReadyError, DataQualityError) as exc:
+                        # Existing-position protection has already run.  Missing
+                        # selection data must not roll it back or stop the report.
+                        incomplete.append(redact(str(exc)))
+
                 plan_ids: list[str] = []
-                for plan in result.plans:
-                    PlanRepository.save(
+                if result is not None:
+                    for plan in result.plans:
+                        PlanRepository.save(
+                            session,
+                            plan,
+                            account_id=account_id,
+                            trade_date=as_of,
+                        )
+                        plan_ids.append(plan.id)
+                    self._notify(session, as_of, result)
+                else:
+                    NotificationRepository.add(
                         session,
-                        plan,
-                        account_id=account_id,
+                        level="warning",
+                        code="daily_data_incomplete",
+                        title=f"每日任务数据不完整 {as_of}",
+                        message=(
+                            "；".join(incomplete)
+                            or "关键数据未就绪；已保留持仓保护，停止新增信号。"
+                        ),
+                        dedupe_key=f"daily-incomplete:{as_of.isoformat()}",
                         trade_date=as_of,
                     )
-                    plan_ids.append(plan.id)
+
+                state = AccountRepository.to_state(session, account_id)
+                risk_mode = (
+                    result.regime.global_risk
+                    if result is not None
+                    else GlobalRiskMode.NORMAL
+                )
                 SnapshotRepository.save(
                     session,
                     account_id=account_id,
                     trade_date=as_of,
-                    state=result.account,
-                    risk_mode=result.regime.global_risk,
+                    state=state,
+                    risk_mode=risk_mode,
                     detail={
-                        "by_strategy": result.by_strategy,
-                        "regime": result.regime.model_dump(mode="json"),
-                        "candidates": [
-                            candidate.model_dump(mode="json")
-                            for candidate in result.candidates
+                        "by_strategy": result.by_strategy if result else {},
+                        "regime": (
+                            result.regime.model_dump(mode="json")
+                            if result is not None
+                            else None
+                        ),
+                        "candidates": (
+                            [
+                                candidate.model_dump(mode="json")
+                                for candidate in result.candidates
+                            ]
+                            if result is not None
+                            else []
+                        ),
+                        "observations": (
+                            [
+                                candidate.model_dump(mode="json")
+                                for candidate in result.observations
+                            ]
+                            if result is not None
+                            else []
+                        ),
+                        "rejected": (
+                            [
+                                item.model_dump(mode="json")
+                                for item in result.rejected
+                            ]
+                            if result is not None
+                            else []
+                        ),
+                        "decisions": [
+                            decision.model_dump(mode="json")
+                            for decision in decisions
                         ],
-                        "observations": [
-                            candidate.model_dump(mode="json")
-                            for candidate in result.observations
-                        ],
-                        "rejected": [
-                            item.model_dump(mode="json") for item in result.rejected
-                        ],
+                        "incomplete": incomplete,
+                        "data_notes": data_notes,
+                        "data_update": (
+                            data_result.model_dump(mode="json")
+                            if data_result is not None
+                            else None
+                        ),
                     },
                 )
-                self._notify(session, as_of, result)
                 NotificationRepository.purge_older_than(
                     session,
                     datetime.now(UTC)
@@ -150,20 +240,57 @@ class DailyJobService:
                         days=self.config.scheduler.notification_retention_days
                     ),
                 )
-                report = self.reports.generate(result)
+                report = self.reports.generate(
+                    result,
+                    as_of=as_of,
+                    account=state,
+                    decisions=decisions,
+                    incomplete=incomplete,
+                    data_notes=data_notes,
+                )
                 JobRepository.finish(
                     session,
                     job.id,
                     status="succeeded",
-                    data_version=result.regime.data_version,
+                    data_version=(
+                        result.regime.data_version if result else None
+                    ),
                     strategy_version=self.config.version,
                 )
+                job.detail_json = {
+                    "incomplete": incomplete,
+                    "data_notes": data_notes,
+                    "decisions": [
+                        decision.model_dump(mode="json")
+                        for decision in decisions
+                    ],
+                    "data_update": (
+                        data_result.model_dump(mode="json")
+                        if data_result is not None
+                        else None
+                    ),
+                }
                 return DailyJobOutcome(
                     job_id=job.id,
                     status="succeeded",
                     skipped=False,
+                    incomplete=bool(incomplete),
+                    data_issues=incomplete,
+                    data_notes=data_notes,
                     plans=plan_ids,
                     report=report,
+                    decisions=[
+                        decision.model_dump(mode="json")
+                        for decision in decisions
+                    ],
+                    data_stages=(
+                        [
+                            stage.model_dump(mode="json")
+                            for stage in data_result.stages
+                        ]
+                        if data_result is not None
+                        else []
+                    ),
                 )
             except Exception as exc:
                 # Drop partial plans/snapshots but persist the failure and its

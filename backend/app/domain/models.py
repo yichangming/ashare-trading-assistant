@@ -13,12 +13,14 @@ from app.domain.enums import (
     GlobalRiskMode,
     PermissionMode,
     PlanStatus,
+    PositionAction,
     RiskOutcome,
     SentimentStage,
     Strategy,
     SubMode,
     Template,
     TrendRegime,
+    ValuationStatus,
 )
 from app.domain.money import price
 
@@ -177,6 +179,7 @@ class PositionPlan(DomainModel):
     heat_after: float = Field(ge=0)
     constraints_checked: list[str] = Field(default_factory=list)
     adjustments: list[str] = Field(default_factory=list)
+    is_add_on: bool = False
 
 
 class TakeProfitTarget(DomainModel):
@@ -189,6 +192,80 @@ class TakeProfitPlan(DomainModel):
     targets: list[TakeProfitTarget] = Field(min_length=1)
     trailing_rule: str
     time_exit_rule: str
+
+
+class ExitRules(DomainModel):
+    """Executable exit rules.
+
+    The planner writes these fields; runtime code never parses the display
+    strings in ``trailing_rule``/``time_exit_rule`` to decide a trade.
+    """
+
+    trailing: Literal[
+        "breakeven_1r_2r_atr",
+        "breakeven_1r_2r_ma5_atr",
+        "breakeven_1r_2r_range_atr",
+        "breakeven_1r_atr",
+    ] = "breakeven_1r_2r_atr"
+    time_exit: Literal[
+        "none",
+        "below_entry",
+        "no_new_high",
+        "event_expiry",
+    ] = "below_entry"
+    time_stop_days: int = Field(default=10, ge=1)
+    event_expiry_days: int | None = Field(default=None, ge=1)
+
+
+class TargetState(DomainModel):
+    price: Decimal = Field(gt=0)
+    fraction: float = Field(gt=0, le=1)
+    planned_shares: int = Field(ge=0)
+    filled_shares: int = Field(ge=0)
+    status: Literal["pending", "partial", "done"] = "pending"
+
+    @property
+    def remaining_shares(self) -> int:
+        return max(0, self.planned_shares - self.filled_shares)
+
+
+class PositionDecision(DomainModel):
+    """Structured, auditable position action shared by every surface."""
+
+    ts_code: str
+    sector: str = "未知"
+    primary_strategy: Strategy | None = None
+    sub_mode: SubMode | None = None
+    rule_version: str = ""
+    action: PositionAction
+    reason_code: str
+    explanation: str
+    trigger_price: Decimal | None = Field(default=None, ge=0)
+    trigger_time: datetime | None = None
+    data_time: datetime | None = None
+    valid_until: datetime | None = None
+    total_shares: int = Field(default=0, ge=0)
+    available_shares: int = Field(default=0, ge=0)
+    suggested_shares: int = Field(default=0, ge=0)
+    restricted_shares: int = Field(default=0, ge=0)
+    current_stop: Decimal | None = Field(default=None, ge=0)
+    proposed_stop: Decimal | None = Field(default=None, ge=0)
+    targets: list[TargetState] = Field(default_factory=list)
+    invalidation: str = ""
+    confirmed: bool = False
+    executed_shares: int = Field(default=0, ge=0)
+    pending_shares: int = Field(default=0, ge=0)
+    valuation_status: ValuationStatus = ValuationStatus.UNKNOWN
+    needs_reconciliation: bool = False
+    data_issues: list[str] = Field(default_factory=list)
+
+    @property
+    def is_risk(self) -> bool:
+        return self.action in {
+            PositionAction.EXIT,
+            PositionAction.REDUCE,
+            PositionAction.DATA_ANOMALY,
+        }
 
 
 class RiskDecision(DomainModel):
@@ -221,15 +298,21 @@ class PositionState(DomainModel):
     shares: int = Field(ge=0)
     available_shares: int = Field(ge=0)
     cost_price: Decimal = Field(gt=0)
-    current_stop: Decimal = Field(gt=0)
-    current_price: Decimal = Field(gt=0)
+    current_stop: Decimal = Field(ge=0)
+    current_price: Decimal = Field(ge=0)
     template: Template = Template.A
     strategy: Strategy | None = None
     sub_mode: SubMode | None = None
     primary_strategy: Strategy | None = None
+    strategy_version: str | None = None
     initial_r: Decimal | None = None
     initial_shares: int = Field(default=0, ge=0)
     add_on_count: int = Field(default=0, ge=0)
+    needs_reconciliation: bool = False
+    valuation_status: ValuationStatus = ValuationStatus.UNKNOWN
+    valuation_at: datetime | None = None
+    data_time: datetime | None = None
+    targets: list[TargetState] = Field(default_factory=list)
 
 
 class AccountState(DomainModel):
@@ -242,12 +325,32 @@ class AccountState(DomainModel):
     drawdown_half_latched: bool = False
     mode: AccountMode = AccountMode.PAPER
     risk_config_configured: bool = False
+    max_drawdown: float = Field(default=0.15, gt=0, le=1)
+    net_deposits: Decimal = Decimal("0")
+    valuation_incomplete: bool = False
+    valuation_note: str | None = None
     last_synced_at: datetime | None = None
+    last_valuation_at: datetime | None = None
+    last_reconciled_at: datetime | None = None
     stale: bool = False
 
     @property
+    def performance_equity(self) -> Decimal:
+        """Equity excluding external cash flows.
+
+        Deposits increase cash but are not profit; withdrawals are added
+        back.  This is the documented cash-flow adjustment used by drawdown
+        and peak tracking.
+        """
+        return self.equity - self.net_deposits
+
+    @property
     def drawdown_pct(self) -> float:
-        return max(0.0, 1.0 - float(self.equity / self.peak_equity))
+        performance = float(self.performance_equity)
+        peak = float(self.peak_equity)
+        if peak <= 0:
+            return 0.0
+        return max(0.0, 1.0 - performance / peak)
 
     @property
     def positions_value(self) -> Decimal:
@@ -288,7 +391,9 @@ class AccountState(DomainModel):
         requires an explicit manual restart.  The half-risk latch sets at
         ``half_at`` and clears once drawdown falls below ``recovery_at``.
         """
-        drawdown = max(_ZERO, _ONE - self.equity / self.peak_equity)
+        drawdown = max(
+            _ZERO, _ONE - self.performance_equity / self.peak_equity
+        )
         stop_threshold = Decimal(str(stop_at))
         half_threshold = Decimal(str(half_at))
         recovery_threshold = Decimal(str(recovery_at))
@@ -319,6 +424,8 @@ class TradePlan(DomainModel):
     status: PlanStatus = PlanStatus.DRAFT
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     expires_on: date
+    expires_at: datetime | None = None
+    exit_rules: ExitRules | None = None
     strategy_version: str
     data_version: str
     code_version: str

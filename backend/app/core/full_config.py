@@ -382,6 +382,14 @@ class SchedulerConfig(StrictModel):
     notification_retention_days: int = Field(default=90, ge=1)
 
 
+class IntradayConfig(StrictModel):
+    max_quote_age_seconds: int = Field(default=180, ge=1)
+    max_delayed_seconds: int = Field(default=900, ge=1)
+    max_future_skew_seconds: int = Field(default=30, ge=0)
+    minute_fallback: bool = True
+    quote_buffer_minutes: int = Field(default=1, ge=0)
+
+
 class WebConfig(StrictModel):
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
@@ -402,6 +410,7 @@ class FullSystemConfig(StrictModel):
     events: EventConfig = Field(default_factory=EventConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)
+    intraday: IntradayConfig = Field(default_factory=IntradayConfig)
     web: WebConfig = Field(default_factory=WebConfig)
 
     @model_validator(mode="after")

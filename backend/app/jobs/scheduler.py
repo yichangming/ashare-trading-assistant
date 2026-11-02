@@ -103,18 +103,28 @@ class SchedulerService:
         except Exception:  # noqa: BLE001 - fall back to weekday rather than block
             logger.warning("trade calendar unavailable; using weekday check")
             return day.weekday() < 5
-        calendar = TradingCalendar.from_trade_cal(frame)
-        if not calendar.dates:
+        if frame.is_empty():
             return day.weekday() < 5
+        calendar = TradingCalendar.from_trade_cal(frame)
         return calendar.is_trading_day(day)
 
-    def run_daily(self, attempt: int = 0) -> None:
+    def run_daily(self, attempt: int = 0, force: bool = False) -> None:
         day = datetime.now(SHANGHAI).date()
         if not self.is_trading_day(day):
             logger.info("skipping daily job on non-trading day %s", day)
             return
         try:
-            self.daily.run(day)
+            outcome = self.daily.run(
+                day, run_data_update=True, force=force
+            )
+            if (
+                outcome is not None
+                and getattr(outcome, "incomplete", False)
+                and not getattr(outcome, "plans", [])
+                and not getattr(outcome, "skipped", False)
+            ):
+                logger.warning("daily job incomplete for %s; retrying", day)
+                self._schedule_retry(day, attempt)
         except Exception:  # noqa: BLE001
             logger.exception("daily job failed for %s (attempt %s)", day, attempt)
             self._schedule_retry(day, attempt)
@@ -130,7 +140,7 @@ class SchedulerService:
             self.run_daily,
             trigger="date",
             run_date=when,
-            args=[attempt + 1],
+            args=[attempt + 1, True],
             id=f"daily-retry:{day.isoformat()}",
             replace_existing=True,
             max_instances=1,

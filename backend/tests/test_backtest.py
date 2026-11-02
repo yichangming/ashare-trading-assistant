@@ -134,12 +134,15 @@ def test_simulator_partial_fill_and_target():
     d0 = date(2024, 1, 2)
     d1 = date(2024, 1, 3)
     sim.add_plans([_plan(d0, shares=1000)], d0)
-    # 1% of 20,000 volume = 200 shares; partial fill leaves the rest pending.
-    sim.process_day(d1, pl.DataFrame([_bar(d1, 10.0, 10.2, 9.9, 10.1, vol=20_000)]))
-    assert sim.positions["000001.SZ"].shares == 200
+    # Tushare ``vol`` is in lots (手): 100 lots = 10,000 shares.  The 1%
+    # participation cap is 100 shares, so the order partially fills.
+    sim.process_day(d1, pl.DataFrame([_bar(d1, 10.0, 10.2, 9.9, 10.1, vol=100)]))
+    assert sim.positions["000001.SZ"].shares == 100
+    assert sim.positions["000001.SZ"].add_on_count == 0
     d2 = date(2024, 1, 4)
-    sim.process_day(d2, pl.DataFrame([_bar(d2, 10.1, 10.2, 10.0, 10.1, vol=20_000)]))
-    assert sim.positions["000001.SZ"].shares == 400
+    sim.process_day(d2, pl.DataFrame([_bar(d2, 10.1, 10.2, 10.0, 10.1, vol=100)]))
+    assert sim.positions["000001.SZ"].shares == 200
+    assert sim.positions["000001.SZ"].add_on_count == 0
     d3 = date(2024, 1, 5)
     sim.process_day(d3, pl.DataFrame([_bar(d3, 10.2, 11.2, 10.1, 11.0, vol=1e8)]))
     assert sim.trades

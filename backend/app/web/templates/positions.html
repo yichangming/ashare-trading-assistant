@@ -3,24 +3,30 @@
 {% block content %}
 <div class="grid two">
   <section class="card flush">
-    <div class="card-head" style="padding:1rem 1rem 0"><h2>当前持仓</h2><span class="muted small">权益 {{ '%.0f'|format(account.equity) if account else '—' }} · 现金 {{ '%.0f'|format(account.cash) if account else '—' }}</span></div>
+    <div class="card-head" style="padding:1rem 1rem 0"><h2>当前持仓</h2><span class="muted small">权益 <span id="account-equity">{{ '%.0f'|format(account.equity) if account else '—' }}</span> · 现金 <span id="account-cash">{{ '%.0f'|format(account.cash) if account else '—' }}</span> · 持仓市值 <span id="account-positions-value">{{ '%.0f'|format(account.positions_value) if account else '—' }}</span> · 估值 {{ account.last_valuation_at or '未知' }}</span></div>
+    {% if account and account.valuation_incomplete %}
+    <p class="small cinnabar" style="padding:0 1rem">估值不完整：{{ account.valuation_note }}。旧价格会保留，但不会用于宣称安全持有。</p>
+    {% endif %}
+    <p class="small muted" style="padding:0 1rem">人工核对：{{ account.last_reconciled_at or '未核对（盘后估值不等于对账）' }}</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>代码</th><th>策略</th><th class="num">股数/可卖</th><th class="num">成本</th><th class="num">现价</th><th class="num">保护线</th><th class="num">距止损</th><th>状态</th></tr></thead>
+        <thead><tr><th>代码</th><th>策略/子模式</th><th class="num">股数/可卖</th><th class="num">成本</th><th class="num">现价</th><th class="num">保护线</th><th>动作</th><th class="num">建议/受限</th><th>原因</th><th class="num">数据时间</th></tr></thead>
         <tbody>
         {% for pos in positions %}
-          <tr>
+          <tr data-position-code="{{ pos.ts_code }}" class="{{ 'risk-row' if pos.risk else '' }}">
             <td class="mono">{{ pos.ts_code }}<div class="muted small">{{ pos.sector }}</div></td>
-            <td><span class="tag">{{ pos.strategy or '—' }}</span></td>
-            <td class="num">{{ pos.shares }} / {{ pos.available_shares }}</td>
+            <td><span class="tag">{{ pos.strategy or '待补全' }}</span><div class="muted small">{{ pos.sub_mode or '—' }}</div></td>
+            <td class="num" data-field="shares">{{ pos.shares }} / {{ pos.available_shares }}</td>
             <td class="num">{{ pos.cost_price }}</td>
-            <td class="num">{{ pos.current_price }}</td>
-            <td class="num">{{ pos.current_stop }}</td>
-            <td class="num {{ 'cinnabar' if pos.distance_pct is not none and pos.distance_pct < 0.02 else '' }}">{{ '%.2f%%'|format(pos.distance_pct * 100) if pos.distance_pct is not none else '—' }}</td>
-            <td><span class="tag {{ 'risk' if pos.distance_pct is not none and pos.distance_pct < 0.02 else 'ok' }}">{{ pos.state }}</span></td>
+            <td class="num" data-field="price">{{ pos.current_price }}</td>
+            <td class="num" data-field="stop">{{ pos.current_stop }}{% if pos.proposed_stop and pos.proposed_stop != pos.current_stop %}<div class="muted small">→ {{ pos.proposed_stop }}</div>{% endif %}</td>
+            <td data-field="action"><span class="tag {{ 'risk' if pos.risk else 'ok' }}">{{ pos.action_label }}</span></td>
+            <td class="num" data-field="suggested">{{ pos.suggested_shares }} / {{ pos.restricted_shares }}{% if pos.pending_shares %}<div class="muted small">待成交 {{ pos.pending_shares }}</div>{% endif %}</td>
+            <td class="small" data-field="reason">{{ pos.explanation }}<div class="muted small">{{ pos.reason_code }}</div></td>
+            <td class="num small" data-field="data-time">{{ pos.data_time or '未知' }}<div class="muted small">{{ pos.valuation_status }}</div></td>
           </tr>
         {% else %}
-          <tr><td colspan="8" class="empty">暂无持仓。成交录入后会在此更新。</td></tr>
+          <tr><td colspan="10" class="empty">暂无持仓。成交录入后会在此更新。</td></tr>
         {% endfor %}
         </tbody>
       </table>

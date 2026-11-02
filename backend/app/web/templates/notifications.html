@@ -10,7 +10,7 @@
       <tr>
         <td><span class="tag {{ 'risk' if item.level in ['risk','critical'] else '' }}">{{ item.level }}</span></td>
         <td><strong>{{ item.title }}</strong><div class="muted small">{{ item.code }}</div></td>
-        <td class="small">{{ item.message }}</td>
+        <td class="small">{{ item.message }}{% if item.trade_date and item.trade_date.isoformat() < today %}<div class="muted small">历史提醒：仅为当日快照，当前是否仍有效请以持仓页的最新决策为准。</div>{% endif %}</td>
         <td class="mono small">{{ item.trade_date or '—' }}</td>
         <td>{{ '已确认' if item.acknowledged_at else '未处理' }}</td>
         <td>{% if not item.acknowledged_at %}<form method="post" action="/notifications/{{ item.id }}/ack"><button class="btn small" type="submit">确认</button></form>{% else %}<span class="muted small">—</span>{% endif %}</td>

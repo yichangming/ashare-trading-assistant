@@ -403,11 +403,62 @@ are read through DuckDB with hive partitioning.
 - The sentiment stage snapshot is validated separately (required fields,
   finite values, integer counts, rates in `[0, 1]`) as part of `run`.
 
+## Position decisions, valuation and automatic data updates
+
+The v2 system now has one shared decision path for positions:
+
+- `app/portfolio/exit_rules.py` holds executable exit rules (structured
+  `ExitRules`, not parsed display text). ATR/MA trailing, per-strategy time
+  exits, take-profit tranches, event expiry and hard stops are evaluated in
+  one place.
+- `app/portfolio/decisions.py` supplies the same structured
+  `PositionDecision` to the post-close review, intraday monitor, web
+  positions page, daily report and backtest simulator. Every decision carries
+  strategy/sub-mode/rule version, action, reason code, data time, total /
+  available / suggested / restricted shares, protection line, targets,
+  confirmation and pending/executed quantities.
+- Exit and hard-risk checks run before any conditional add-on; missing or
+  stale market data produces `data_anomaly`, never a default "safe hold".
+- `AccountService.revalue()` computes `equity = cash + Σ(price × shares)`.
+  Missing quotes keep the last known price and mark the valuation
+  incomplete. `last_valuation_at` (post-close mark) and
+  `last_reconciled_at` (human broker reconciliation) are separate; a nightly
+  run never claims the account was reconciled.
+- External deposits/withdrawals adjust `net_deposits` and are excluded from
+  peak/drawdown performance. A user-configured `max_drawdown` participates in
+  sizing and the portfolio governor.
+- The daily job order is: corporate actions → T+1 availability →
+  reconciliation freshness → valuation and existing-position decisions →
+  new plans → report. A stale `result.account` is never written back over the
+  revalued state.
+
+When `daily` is run with data updates enabled (the scheduler and web/CLI
+paths do this), the stages are: trading-day check → reference/calendar →
+incremental daily sync → assemble → quality gate → structured event sync →
+account/position evaluation → A–F selection → plans → report. Each stage is
+reported as `succeeded`, `reused`, `skipped`, `unavailable` or `failed`.
+Missing credentials are `unavailable`, not success. If critical local data is
+not ready, new signals stop and the report is marked incomplete, but existing
+position protection still runs.
+
+B2 reads the most recent completed post-close snapshot from the previous
+trading day (weekends/holidays use the trading calendar), uses completed
+5-minute bars by their timestamp without adding a hidden one-bar delay, and
+computes the 10-trading-minute validity across the lunch break. Minute-source
+rate limiting is shared across symbols. Intraday quotes are rejected when the
+date, timezone, age or future skew is invalid; one failed symbol does not stop
+other positions. Browser SSE updates position price/stop/action/freshness and
+shows deduplicated risk toasts, with polling fallback. Browser notifications
+are not guaranteed when the browser is closed or the phone is locked.
+
+See `docs/full-system/review-fixes.md` for the defect-by-defect root cause,
+fix location and verification evidence.
+
 ## Tests and checks
 
 ```bash
 cd backend
-uv run pytest                 # 842 tests collected
+uv run pytest                 # 870 tests collected
 uv run ruff check app tests   # no errors
 uv run mypy app               # no errors
 ```
@@ -429,8 +480,11 @@ The help output must list the legacy data commands plus `serve`, `migrate`,
 - **No broker integration by design.** There is no automated order path.
   Plans, confirmations, and execution imports are all human-driven.
 - **Minute data is optional and rate limited.** B2 intraday signals and the
-  minute replay require `stk_mins` (about one request per minute); without it
-  the system reports degraded data and does not substitute daily bars.
+  minute replay require `stk_mins` (about one request per minute). The rate
+  gate is shared across symbols in one source instance; without minute data
+  the system reports `degraded`/unavailable and does not substitute daily
+  bars. Bar timestamps are treated as completion times; no extra one-bar
+  delay is added.
 - **Event full text/policy coverage is manual.** Announcement full text,
   policy details, and some contract/product approvals have no stable
   interface; import structured CSV/JSON and verify by hand. AI extraction is
@@ -440,9 +494,13 @@ The help output must list the legacy data commands plus `serve`, `migrate`,
   stable `ASHARE_SECRET_KEY`; put HTTPS and a reverse proxy in front for LAN
   use (see `docs/full-system/deployment.md`).
 - **Backtest is conservative but not exchange-perfect.** Daily replay models
-  T+1, limit-up/down, suspension, fees, slippage, and same-day stop priority;
-  intraday B2 PnL is not fabricated from daily bars. Delisted names without
-  bars are reported in `missing_data` rather than force-liquidated.
+  T+1, limit-up/down, suspension, entry/exit fees, slippage, same-day stop
+  priority, remaining pending orders and their cash reservation. Intraday B2
+  PnL is not fabricated from daily bars. Delisted names without bars are
+  reported in `missing_data` rather than force-liquidated. Historical
+  corporate-action-adjusted PnL and the full delisting lifecycle remain
+  limited by the available data; the run notes say so instead of presenting a
+  complete performance history.
 - **Reference snapshots are overwritten.** `sync`/`calendar` replace
   `backend/data/raw/reference/*.parquet` in place. Manifests record reference
   checksums for the day they were written, but old reference bytes are not
@@ -487,10 +545,20 @@ The help output must list the legacy data commands plus `serve`, `migrate`,
   if a candidate has partners but none of its pairs reaches 20 observations,
   the candidate is labelled "correlation unavailable". Such candidates are
   approved with that note rather than blocked.
-- **Account state is not reconciled automatically.** Equity, cash,
-  positions, and peaks are whatever the account JSON says. The pipeline does
-  not pull broker balances or update positions from market data; you must
-  maintain that state yourself and use `--restart` with manual review.
+- **Account state is not reconciled automatically.** The v2 SQLite account
+  is updated by manual executions/CSV imports and by mark-to-market
+  valuation; no broker balances are pulled. A nightly valuation is not a
+  reconciliation: `last_reconciled_at` only moves after an explicit human
+  reconciliation. Stale real accounts and incomplete valuations restrict new
+  plans. Use `--restart` with manual review for a latched drawdown.
+- **Automatic data updates need a token and live endpoint permissions.**
+  Without `TUSHARE_TOKEN` the update stages are reported `unavailable`, not
+  successful; local data may still be used with an explicit incomplete/stale
+  status. Event coverage from structured endpoints is not the same as full
+  announcement/policy coverage.
+- **Browser notifications are best-effort.** SSE plus polling updates an open
+  page. The system does not claim delivery while the browser is closed, the
+  tab is suspended, or the phone is locked.
 - **Legacy `run` does not persist regime snapshots.** The v2 `daily` job
   stores regime and candidate JSON in SQLite snapshots; the legacy `run`
   command only includes the regime in its JSON output. Use `--output` if you
@@ -595,7 +663,7 @@ imports/                                 # uploaded CSV/JSON files
 - [x] CLI workflow: `sync`, `calendar`, `assemble`, `assemble-range`,
   `quality`, `run`, `account`, including account persistence and
   pending-plan pruning.
-- [x] Verification: 842 tests collected, ruff reports no errors, mypy
+- [x] Verification: 870 tests collected, ruff reports no errors, mypy
   reports no errors, and `--help` lists the legacy and v2 commands.
 - [x] v2 A–F strategies, permissions, unified plans, SQLite account/CSV,
   events, replay backtest, scheduler, reports, notifications, SSE, and the

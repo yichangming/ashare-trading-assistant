@@ -37,7 +37,7 @@ class _Quote:
 
 
 class _FakeReports:
-    def generate(self, result):
+    def generate(self, result, **_kwargs):
         return {"markdown": "", "html": "", "markdown_path": "", "html_path": ""}
 
 

@@ -51,17 +51,25 @@ from app.db.repositories import (
     JobRepository,
     NotificationRepository,
     PlanRepository,
+    SettingRepository,
     SnapshotRepository,
 )
 from app.db.session import get_db, prepare_database
-from app.domain.enums import AccountMode, ExecutionSide, PlanStatus
+from app.domain.enums import (
+    AccountMode,
+    ExecutionSide,
+    ExitSession,
+    PlanStatus,
+)
 from app.events.ingest import EventIngestor
 from app.jobs.b2 import B2Monitor, TushareMinuteSource
 from app.jobs.daily import DailyJobService
+from app.jobs.data_update import DataUpdateService
 from app.jobs.health import DataHealthService
 from app.jobs.intraday import IntradayMonitor, TushareQuoteAdapter
 from app.jobs.scheduler import SchedulerService
 from app.portfolio.csv_io import TEMPLATES, import_csv
+from app.portfolio.decisions import PositionDecisionService
 from app.portfolio.service import AccountService
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -73,6 +81,15 @@ STRATEGY_NAMES = {
     "E": "区间交易",
     "F": "事件驱动",
 }
+ACTION_LABELS = {
+    "hold": "持有",
+    "conditional_add": "条件加仓",
+    "reduce": "减仓",
+    "exit": "清仓",
+    "wait_execution": "等待执行",
+    "data_anomaly": "数据异常",
+}
+RISK_ACTIONS = {"exit", "reduce", "data_anomaly"}
 
 
 def _create_store() -> ParquetStore:
@@ -188,10 +205,19 @@ def create_app(database_url: str | None = None) -> FastAPI:
         ),
         name="static",
     )
-    daily = DailyJobService(provider=provider, config=config)
+    daily = DailyJobService(
+        provider=provider,
+        config=config,
+        data_update=DataUpdateService(store=store, config=config),
+    )
+    minute_source = TushareMinuteSource()
     intraday = IntradayMonitor(
         TushareQuoteAdapter(),
-        b2=B2Monitor(provider, config, TushareMinuteSource()),
+        b2=B2Monitor(provider, config, minute_source),
+        minute_source=minute_source,
+        calendar_provider=provider,
+        provider=provider,
+        config=config,
     )
     scheduler = SchedulerService(daily, intraday, config)
     app.state.daily = daily
@@ -232,9 +258,35 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "last_synced_at": account_state.last_synced_at.isoformat()
                 if account_state.last_synced_at
                 else None,
+                "last_valuation_at": account_state.last_valuation_at.isoformat()
+                if account_state.last_valuation_at
+                else None,
+                "last_reconciled_at": account_state.last_reconciled_at.isoformat()
+                if account_state.last_reconciled_at
+                else None,
                 "stale": account_state.stale,
-                "max_drawdown": config.risk.drawdown_stop_at,
+                "valuation_incomplete": account_state.valuation_incomplete,
+                "valuation_note": account_state.valuation_note,
+                "net_deposits": float(account_state.net_deposits),
+                "max_drawdown": account_state.max_drawdown,
             }
+            latest_processed = _latest_partition(store.processed_dir / "bars")
+            try:
+                value_date = (
+                    date.fromisoformat(latest_processed)
+                    if latest_processed
+                    else datetime.now(SHANGHAI).date()
+                )
+            except ValueError:
+                value_date = datetime.now(SHANGHAI).date()
+            decisions = PositionDecisionService(
+                session, config, provider=provider
+            ).evaluate_all(
+                value_date,
+                session_type=ExitSession.DAILY,
+                persist=False,
+                notify=False,
+            )
             notifications = NotificationRepository.list_recent(
                 session, unacknowledged_only=True, limit=20
             )
@@ -273,9 +325,22 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 for row in execution_rows
             ]
             data_status = {
-                "latest_processed": _latest_partition(store.processed_dir / "bars"),
+                "latest_processed": latest_processed,
                 "latest_raw": _latest_manifest(store),
                 "stale": account["stale"],
+                "valuation_incomplete": account["valuation_incomplete"],
+                "quote_freshness": (
+                    "unknown"
+                    if not decisions
+                    else (
+                        "partial"
+                        if any(
+                            item.valuation_status.value != "ok"
+                            for item in decisions
+                        )
+                        else "ok"
+                    )
+                ),
             }
             pending_count = sum(
                 1
@@ -295,31 +360,91 @@ def create_app(database_url: str | None = None) -> FastAPI:
             "strategy_names": STRATEGY_NAMES,
             "plans": plans,
             "pending_count": pending_count,
-            "positions": [
-                {
-                    "ts_code": pos.ts_code,
-                    "sector": pos.sector,
-                    "shares": pos.shares,
-                    "available_shares": pos.available_shares,
-                    "cost_price": str(pos.cost_price),
-                    "current_price": str(pos.current_price),
-                    "current_stop": str(pos.current_stop),
-                    "strategy": pos.strategy.value if pos.strategy else None,
-                    "distance_pct": (
-                        (float(pos.current_price) - float(pos.current_stop))
-                        / float(pos.current_price)
-                        if float(pos.current_price) > 0
-                        else None
-                    ),
-                    "state": "接近止损"
-                    if float(pos.current_price) > 0
-                    and (float(pos.current_price) - float(pos.current_stop))
-                    / float(pos.current_price)
-                    < 0.02
-                    else "持有",
-                }
-                for pos in account_state.positions
-            ],
+            "positions": sorted(
+                [
+                    {
+                        "ts_code": decision.ts_code,
+                        "sector": decision.sector,
+                        "shares": decision.total_shares,
+                        "available_shares": decision.available_shares,
+                        "cost_price": (
+                            str(state_position.cost_price)
+                            if state_position is not None
+                            else "0"
+                        ),
+                        "current_price": str(
+                            decision.trigger_price
+                            or (
+                                state_position.current_price
+                                if state_position is not None
+                                else 0
+                            )
+                        ),
+                        "current_stop": str(decision.current_stop or 0),
+                        "proposed_stop": (
+                            str(decision.proposed_stop)
+                            if decision.proposed_stop is not None
+                            else None
+                        ),
+                        "strategy": (
+                            decision.primary_strategy.value
+                            if decision.primary_strategy
+                            else None
+                        ),
+                        "sub_mode": (
+                            decision.sub_mode.value
+                            if decision.sub_mode
+                            else None
+                        ),
+                        "rule_version": decision.rule_version,
+                        "action": decision.action.value,
+                        "action_label": ACTION_LABELS.get(
+                            decision.action.value, decision.action.value
+                        ),
+                        "reason_code": decision.reason_code,
+                        "explanation": decision.explanation,
+                        "suggested_shares": decision.suggested_shares,
+                        "restricted_shares": decision.restricted_shares,
+                        "executed_shares": decision.executed_shares,
+                        "pending_shares": decision.pending_shares,
+                        "data_time": (
+                            decision.data_time.isoformat()
+                            if decision.data_time
+                            else None
+                        ),
+                        "valuation_status": decision.valuation_status.value,
+                        "needs_reconciliation": decision.needs_reconciliation,
+                        "confirmed": decision.confirmed,
+                        "risk": decision.action.value in RISK_ACTIONS,
+                        "distance_pct": (
+                            (
+                                float(decision.trigger_price)
+                                - float(decision.current_stop)
+                            )
+                            / float(decision.trigger_price)
+                            if decision.trigger_price
+                            and decision.current_stop
+                            and float(decision.trigger_price) > 0
+                            else None
+                        ),
+                    }
+                    for decision in decisions
+                    for state_position in [
+                        next(
+                            (
+                                item
+                                for item in account_state.positions
+                                if item.ts_code == decision.ts_code
+                            ),
+                            None,
+                        )
+                    ]
+                ],
+                key=lambda item: (
+                    0 if item["action"] in RISK_ACTIONS else 1,
+                    item["ts_code"],
+                ),
+            ),
             "executions": executions,
             "notifications": notifications,
             "notification_count": notification_count,
@@ -580,6 +705,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
             health = DataHealthService(provider).check(
                 datetime.now(SHANGHAI).date(), session
             )
+            event_sync = SettingRepository.get(session, "event_sync", {})
+            recent_jobs = JobRepository.list_recent(session, limit=1)
+            data_update = (
+                ((recent_jobs[0].detail_json or {}).get("data_update"))
+                if recent_jobs
+                else None
+            )
             account_view = {
                 "equity": float(account.equity) if account else 0,
                 "cash": float(account.cash) if account else 0,
@@ -589,12 +721,29 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "last_synced_at": account.last_synced_at.isoformat()
                 if account and account.last_synced_at
                 else None,
+                "last_valuation_at": account.last_valuation_at.isoformat()
+                if account and account.last_valuation_at
+                else None,
+                "last_reconciled_at": account.last_reconciled_at.isoformat()
+                if account and account.last_reconciled_at
+                else None,
+                "valuation_incomplete": bool(
+                    account and account.valuation_incomplete
+                ),
+                "valuation_note": account.valuation_note if account else None,
                 "stale": bool(account and account.stale),
             }
         return templates.TemplateResponse(
             request,
             "settings.html",
-            base_context(request, "settings", account=account_view, health=health),
+            base_context(
+                request,
+                "settings",
+                account=account_view,
+                health=health,
+                event_sync=event_sync,
+                data_update=data_update,
+            ),
         )
 
     @app.post("/positions/execute")
@@ -748,9 +897,17 @@ def create_app(database_url: str | None = None) -> FastAPI:
         api_guard(request)
         with next(get_db()) as session:
             jobs = JobRepository.list_recent(session, limit=5)
+            event_sync = SettingRepository.get(session, "event_sync", {})
+            data_update = (
+                ((jobs[0].detail_json or {}).get("data_update"))
+                if jobs
+                else None
+            )
         return {
             "latest_processed": _latest_partition(store.processed_dir / "bars"),
             "latest_raw": _latest_manifest(store),
+            "event_sync": event_sync,
+            "data_update": data_update,
             "jobs": [
                 {
                     "id": job.id,
@@ -797,7 +954,94 @@ def create_app(database_url: str | None = None) -> FastAPI:
         api_guard(request)
         with next(get_db()) as session:
             state = AccountRepository.to_state(session)
-            return state.model_dump(mode="json")
+            latest = _latest_partition(store.processed_dir / "bars")
+            try:
+                value_date = (
+                    date.fromisoformat(latest)
+                    if latest
+                    else datetime.now(SHANGHAI).date()
+                )
+            except ValueError:
+                value_date = datetime.now(SHANGHAI).date()
+            decisions = PositionDecisionService(
+                session, config, provider=provider
+            ).evaluate_all(
+                value_date,
+                session_type=ExitSession.DAILY,
+                persist=False,
+                notify=False,
+            )
+            payload = state.model_dump(mode="json")
+            payload["positions_value"] = str(state.positions_value)
+            payload["heat"] = state.heat
+            payload["drawdown_pct"] = state.drawdown_pct
+            payload["decisions"] = [
+                decision.model_dump(mode="json") for decision in decisions
+            ]
+            payload["valuation"] = {
+                "incomplete": state.valuation_incomplete,
+                "note": state.valuation_note,
+                "last_valuation_at": state.last_valuation_at.isoformat()
+                if state.last_valuation_at
+                else None,
+                "last_reconciled_at": state.last_reconciled_at.isoformat()
+                if state.last_reconciled_at
+                else None,
+                "quote_freshness": (
+                    "unknown"
+                    if not decisions
+                    else (
+                        "partial"
+                        if any(
+                            item.valuation_status.value != "ok"
+                            for item in decisions
+                        )
+                        else "ok"
+                    )
+                ),
+            }
+            return payload
+
+    @app.get("/api/positions/decisions")
+    def api_position_decisions(request: Request):
+        api_guard(request)
+        with next(get_db()) as session:
+            latest = _latest_partition(store.processed_dir / "bars")
+            try:
+                value_date = (
+                    date.fromisoformat(latest)
+                    if latest
+                    else datetime.now(SHANGHAI).date()
+                )
+            except ValueError:
+                value_date = datetime.now(SHANGHAI).date()
+            decisions = PositionDecisionService(
+                session, config, provider=provider
+            ).evaluate_all(
+                value_date,
+                session_type=ExitSession.DAILY,
+                persist=False,
+                notify=False,
+            )
+            return {
+                "data_time": latest,
+                "quote_freshness": (
+                    "unknown"
+                    if not decisions
+                    else (
+                        "partial"
+                        if any(
+                            item.valuation_status.value != "ok"
+                            for item in decisions
+                        )
+                        else "ok"
+                    )
+                ),
+                "decisions": [
+                    decision.model_dump(mode="json")
+                    for decision in decisions
+                ],
+            }
 
     @app.get("/api/executions")
     def api_executions(request: Request):
@@ -918,7 +1162,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
             raise HTTPException(401, "login required")
         target = trade_date or datetime.now(SHANGHAI).date()
         background.add_task(
-            daily.run, target, strategy_mode=strategy_mode, force=force
+            daily.run,
+            target,
+            strategy_mode=strategy_mode,
+            force=force,
+            run_data_update=True,
         )
         if redirect:
             return RedirectResponse(redirect, status_code=303)
@@ -937,14 +1185,114 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     session, unacknowledged_only=True, limit=5
                 )
                 latest = jobs[0] if jobs else None
+                state = AccountRepository.to_state(session)
+                latest_processed = _latest_partition(store.processed_dir / "bars")
+                try:
+                    value_date = (
+                        date.fromisoformat(latest_processed)
+                        if latest_processed
+                        else datetime.now(SHANGHAI).date()
+                    )
+                except ValueError:
+                    value_date = datetime.now(SHANGHAI).date()
+                decisions = PositionDecisionService(
+                    session, config, provider=provider
+                ).evaluate_all(
+                    value_date,
+                    session_type=ExitSession.DAILY,
+                    persist=False,
+                    notify=False,
+                )
+                ordered = sorted(
+                    decisions,
+                    key=lambda item: (
+                        0
+                        if item.action.value in RISK_ACTIONS
+                        else 1,
+                        item.ts_code,
+                    ),
+                )
+                quote_freshness = (
+                    "unknown"
+                    if not decisions
+                    else (
+                        "partial"
+                        if any(
+                            item.valuation_status.value != "ok"
+                            for item in decisions
+                        )
+                        else "ok"
+                    )
+                )
+                state_prices = {
+                    item.ts_code: float(item.current_price or 0)
+                    for item in state.positions
+                }
+                positions_value = sum(
+                    float(
+                        item.trigger_price
+                        or state_prices.get(item.ts_code, 0)
+                    )
+                    * item.total_shares
+                    for item in decisions
+                )
+                cash_value = float(state.cash)
                 return {
                     "unacknowledged": count,
+                    "equity": round(cash_value + positions_value, 2),
+                    "cash": round(cash_value, 2),
+                    "positions_value": round(positions_value, 2),
                     "latest_job": latest.status if latest else None,
                     "latest_job_name": latest.job_name if latest else None,
                     "latest_job_date": latest.trade_date.isoformat()
                     if latest and latest.trade_date
                     else None,
                     "latest_job_error": latest.error if latest else None,
+                    "data_time": latest_processed,
+                    "quote_freshness": quote_freshness,
+                    "valuation_incomplete": state.valuation_incomplete,
+                    "last_valuation_at": state.last_valuation_at.isoformat()
+                    if state.last_valuation_at
+                    else None,
+                    "last_reconciled_at": state.last_reconciled_at.isoformat()
+                    if state.last_reconciled_at
+                    else None,
+                    "positions": [
+                        {
+                            "ts_code": item.ts_code,
+                            "strategy": (
+                                item.primary_strategy.value
+                                if item.primary_strategy
+                                else None
+                            ),
+                            "sub_mode": (
+                                item.sub_mode.value if item.sub_mode else None
+                            ),
+                            "shares": item.total_shares,
+                            "available_shares": item.available_shares,
+                            "current_price": str(
+                                item.trigger_price
+                                or state_prices.get(item.ts_code, 0.0)
+                            ),
+                            "current_stop": str(item.current_stop or ""),
+                            "proposed_stop": str(item.proposed_stop or ""),
+                            "action": item.action.value,
+                            "action_label": ACTION_LABELS.get(
+                                item.action.value, item.action.value
+                            ),
+                            "reason_code": item.reason_code,
+                            "explanation": item.explanation,
+                            "suggested_shares": item.suggested_shares,
+                            "pending_shares": item.pending_shares,
+                            "executed_shares": item.executed_shares,
+                            "data_time": item.data_time.isoformat()
+                            if item.data_time
+                            else None,
+                            "valuation_status": item.valuation_status.value,
+                            "risk": item.action.value in RISK_ACTIONS,
+                        }
+                        for item in ordered
+                    ],
                     "notifications": [
                         {
                             "id": item.id,

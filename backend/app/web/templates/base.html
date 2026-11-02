@@ -40,6 +40,7 @@
       </div>
       <div class="spacer"></div>
       <span class="chip"><span class="sse-dot" id="sse-dot"></span><span id="sse-label">连接中</span></span>
+      <span class="chip">行情 <strong id="quote-freshness">{{ data_status.quote_freshness if data_status else '未知' }}</strong></span>
       <a class="chip" href="/notifications">未处理通知 <strong id="notif-count">{{ notification_count or 0 }}</strong></a>
       <form method="post" action="/logout" style="margin:0">
         <button class="btn small" type="submit">退出</button>
@@ -51,41 +52,171 @@
     </div>
   </main>
 </div>
+<div id="toast-root" aria-live="polite" aria-atomic="false"></div>
 <script>
 (function () {
   const dot = document.getElementById('sse-dot');
   const label = document.getElementById('sse-label');
   const count = document.getElementById('notif-count');
-  function setState(on, text) {
+  const freshness = document.getElementById('quote-freshness');
+  const toastRoot = document.getElementById('toast-root');
+  const seenNotifications = new Set();
+  const actionLabels = {
+    hold: '持有', conditional_add: '条件加仓', reduce: '减仓',
+    exit: '清仓', wait_execution: '等待执行', data_anomaly: '数据异常'
+  };
+  let firstPayload = true;
+  let audioContext = null;
+
+  function setConnection(on, text) {
     if (!dot) return;
     dot.classList.toggle('on', on);
     if (label) label.textContent = text;
   }
+  function setFreshness(value) {
+    if (!freshness) return;
+    const labels = { ok: '正常', partial: '部分过期', unknown: '未知' };
+    freshness.textContent = labels[value] || value || '未知';
+    freshness.classList.toggle('cinnabar', value !== 'ok');
+  }
+  function beep() {
+    try {
+      audioContext = audioContext || new (window.AudioContext || window.webkitAudioContext)();
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+      oscillator.frequency.value = 880;
+      gain.gain.setValueAtTime(0.05, audioContext.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.25);
+      oscillator.connect(gain); gain.connect(audioContext.destination);
+      oscillator.start(); oscillator.stop(audioContext.currentTime + 0.25);
+    } catch (e) { /* audio requires a user gesture; ignore */ }
+  }
+  function toast(item) {
+    if (!toastRoot || !item) return;
+    const node = document.createElement('div');
+    node.className = 'toast ' + (item.level === 'critical' || item.level === 'risk' ? 'risk' : '');
+    const title = document.createElement('strong');
+    title.textContent = item.title || '提醒';
+    const message = document.createElement('div');
+    message.className = 'small muted';
+    message.textContent = item.message || '';
+    node.appendChild(title); node.appendChild(message);
+    toastRoot.appendChild(node);
+    setTimeout(function () { node.remove(); }, 12000);
+  }
+  function handleNotifications(items) {
+    if (!items) return;
+    items.forEach(function (item) {
+      if (!item || !item.id || seenNotifications.has(item.id)) return;
+      seenNotifications.add(item.id);
+      // The first payload may contain an old risk reminder; show it once so
+      // reopening the page surfaces unresolved risk, but do not replay it.
+      if (!firstPayload || item.level === 'critical' || item.level === 'risk' || item.level === 'warning') {
+        toast(item);
+        if (item.level === 'critical' || item.level === 'risk') beep();
+      }
+    });
+  }
+  function applyPositions(positions) {
+    if (!positions) return;
+    positions.forEach(function (item) {
+      const row = document.querySelector('[data-position-code="' + item.ts_code + '"]');
+      if (!row) return;
+      function set(field, value) {
+        const node = row.querySelector('[data-field="' + field + '"]');
+        if (node && value !== undefined && value !== null) node.textContent = value;
+      }
+      set('shares', item.shares + ' / ' + item.available_shares);
+      set('price', item.current_price || item.trigger_price);
+      set('stop', item.current_stop + (item.proposed_stop && item.proposed_stop !== item.current_stop ? ' → ' + item.proposed_stop : ''));
+      const action = row.querySelector('[data-field="action"]');
+      if (action) {
+        const tag = action.querySelector('.tag') || action;
+        tag.textContent = item.action_label || item.action;
+        if (tag.classList.contains('tag')) {
+          tag.className = 'tag ' + (item.risk ? 'risk' : 'ok');
+        }
+      }
+      set('suggested', (item.suggested_shares || 0) + ' / ' + (item.restricted_shares || 0));
+      set('reason', (item.explanation || '') + ' ' + (item.reason_code || ''));
+      set('data-time', (item.data_time || '未知') + ' ' + (item.valuation_status || ''));
+      row.classList.toggle('risk-row', !!item.risk);
+    });
+  }
+  function setText(id, value) {
+    const node = document.getElementById(id);
+    if (node && value !== undefined && value !== null) node.textContent = value;
+  }
+  function handlePayload(payload) {
+    if (!payload) return;
+    if (payload.unacknowledged !== undefined && count) count.textContent = payload.unacknowledged;
+    if (payload.quote_freshness) setFreshness(payload.quote_freshness);
+    if (payload.equity !== undefined) setText('account-equity', Math.round(payload.equity));
+    if (payload.cash !== undefined) setText('account-cash', Math.round(payload.cash));
+    if (payload.positions_value !== undefined) setText('account-positions-value', Math.round(payload.positions_value));
+    if (payload.positions) applyPositions(payload.positions);
+    handleNotifications(payload.notifications);
+    if (payload.latest_job) {
+      setConnection(true, '实时 · 任务 ' + payload.latest_job);
+    } else {
+      setConnection(true, '实时连接');
+    }
+    firstPayload = false;
+  }
+
   if (window.EventSource) {
     const source = new EventSource('/api/events/stream');
-    source.onopen = function () { setState(true, '实时连接'); };
+    source.onopen = function () { setConnection(true, '实时连接'); };
     source.onmessage = function (event) {
-      try {
-        const payload = JSON.parse(event.data);
-        if (payload.unacknowledged !== undefined && count) count.textContent = payload.unacknowledged;
-        if (payload.latest_job) setState(true, '实时 · 任务 ' + payload.latest_job);
-        if (count && payload.notifications && payload.notifications.length) {
-          count.parentElement.title = payload.notifications[0].title;
-        }
-      } catch (e) { /* ignore malformed heartbeat */ }
+      try { handlePayload(JSON.parse(event.data)); }
+      catch (e) { /* ignore malformed heartbeat */ }
     };
-    source.onerror = function () { setState(false, '轮询回退'); };
+    source.onerror = function () {
+      setConnection(false, '连接中断 · 轮询回退');
+      setFreshness('unknown');
+    };
   } else {
-    setState(false, '轮询回退');
+    setConnection(false, '轮询回退');
   }
+
   async function poll() {
     try {
-      const response = await fetch('/api/notifications?unacknowledged=1&limit=1');
-      const data = await response.json();
-      if (count) count.textContent = data.unacknowledged || 0;
+      const response = await fetch('/api/positions');
+      if (response.ok) {
+        const data = await response.json();
+        applyPositions((data.decisions || []).map(function (item) {
+          return {
+            ts_code: item.ts_code,
+            shares: item.total_shares,
+            available_shares: item.available_shares,
+            current_price: item.trigger_price,
+            current_stop: item.current_stop,
+            proposed_stop: item.proposed_stop,
+            action: item.action,
+            action_label: actionLabels[item.action] || item.action,
+            risk: ['exit', 'reduce', 'data_anomaly'].indexOf(item.action) >= 0,
+            suggested_shares: item.suggested_shares,
+            restricted_shares: item.restricted_shares,
+            explanation: item.explanation,
+            reason_code: item.reason_code,
+            data_time: item.data_time,
+            valuation_status: item.valuation_status
+          };
+        }));
+        setFreshness((data.valuation || {}).quote_freshness || 'unknown');
+        if (data.equity !== undefined) setText('account-equity', Math.round(data.equity));
+        if (data.cash !== undefined) setText('account-cash', Math.round(data.cash));
+        if (data.positions_value !== undefined) setText('account-positions-value', Math.round(data.positions_value));
+      }
+      const notice = await fetch('/api/notifications?unacknowledged=1&limit=5');
+      if (notice.ok) {
+        const data = await notice.json();
+        if (count) count.textContent = data.unacknowledged || 0;
+        handleNotifications(data.items);
+      }
     } catch (e) { /* offline */ }
   }
-  setInterval(poll, 30000);
+  setInterval(poll, 15000);
 })();
 </script>
 </body>
