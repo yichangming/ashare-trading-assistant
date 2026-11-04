@@ -244,17 +244,27 @@ class PositionDecision(DomainModel):
     trigger_time: datetime | None = None
     data_time: datetime | None = None
     valid_until: datetime | None = None
+    decision_source: str = "daily"
+    market_phase: str = "unknown"
+    is_current: bool = True
+    stale_reason: str | None = None
     total_shares: int = Field(default=0, ge=0)
     available_shares: int = Field(default=0, ge=0)
     suggested_shares: int = Field(default=0, ge=0)
     restricted_shares: int = Field(default=0, ge=0)
+    covered_shares: int = Field(default=0, ge=0)
     current_stop: Decimal | None = Field(default=None, ge=0)
     proposed_stop: Decimal | None = Field(default=None, ge=0)
+    pending_stop: Decimal | None = Field(default=None, ge=0)
+    pending_stop_effective_at: datetime | None = None
+    last_new_high_on: date | None = None
+    days_since_new_high: int | None = Field(default=None, ge=0)
     targets: list[TargetState] = Field(default_factory=list)
     invalidation: str = ""
     confirmed: bool = False
     executed_shares: int = Field(default=0, ge=0)
     pending_shares: int = Field(default=0, ge=0)
+    pending_sell_orders: list[dict] = Field(default_factory=list)
     valuation_status: ValuationStatus = ValuationStatus.UNKNOWN
     needs_reconciliation: bool = False
     data_issues: list[str] = Field(default_factory=list)

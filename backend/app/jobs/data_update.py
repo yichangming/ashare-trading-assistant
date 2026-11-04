@@ -85,10 +85,13 @@ class DataUpdateService:
 
     def _reference_ready(self, as_of: date) -> bool:
         calendar = self._calendar()
-        if not calendar.dates:
+        if not calendar.dates or calendar.covered_end is None:
             return False
+        required_end = as_of + timedelta(days=self._forward_days())
         return (
-            calendar.is_trading_day(as_of)
+            calendar.covers(as_of)
+            and calendar.is_trading_day(as_of)
+            and calendar.covered_end >= required_end
             and self.store.reference_path("stock_basic").exists()
         )
 
@@ -164,16 +167,33 @@ class DataUpdateService:
             SettingRepository.set(session, "event_sync", payload)
             return "failed", {"error": str(exc)}, False
 
+    def _forward_days(self) -> int:
+        """Calendar days needed for the longest plan validity window.
+
+        The calendar must cover future expiry dates used by plans created on
+        ``as_of``; a fixed 45-day window is only a floor.
+        """
+        strategies = self.config.strategies
+        validity = max(
+            strategies.a.valid_days,
+            strategies.c.c1_valid_days,
+            strategies.c.c2_valid_days,
+            strategies.e.valid_days,
+            strategies.f.event_window_days,
+        )
+        return max(45, validity * 3 + 20)
+
     def run(self, as_of: date, session: Session) -> DataUpdateResult:
         stages: list[StageResult] = []
         issues: list[str] = []
         calendar = self._calendar()
-        if calendar.dates and not calendar.is_trading_day(as_of):
+        coverage_known = calendar.covers(as_of)
+        if coverage_known and not calendar.is_trading_day(as_of):
             stages.append(
                 StageResult(
                     name="trading_day",
                     status="skipped",
-                    detail=f"{as_of} 不是交易日",
+                    detail=f"{as_of} 不在交易日历开市日，确认休市",
                 )
             )
             return DataUpdateResult(
@@ -181,11 +201,27 @@ class DataUpdateService:
                 status="skipped",
                 data_ready=False,
                 stages=stages,
-                issues=[f"{as_of} 不是交易日"],
+                issues=[f"{as_of} 是已确认的休市日"],
             )
-        stages.append(StageResult(name="trading_day", status="succeeded"))
+        if coverage_known:
+            stages.append(StageResult(name="trading_day", status="succeeded"))
+        else:
+            # A date outside the downloaded calendar range is not evidence of
+            # a holiday.  Try to refresh coverage; if that fails, continue as
+            # unknown rather than permanently skipping the day.
+            stages.append(
+                StageResult(
+                    name="trading_day",
+                    status="unknown",
+                    detail=(
+                        f"交易日历未覆盖 {as_of}；"
+                        "覆盖不足不等于休市，将尝试刷新"
+                    ),
+                )
+            )
+            issues.append(f"交易日历未覆盖 {as_of}，休市状态未知")
 
-        reference_ready = self._reference_ready(as_of)
+        reference_ready = self._reference_ready(as_of) and calendar.covers(as_of)
         if reference_ready:
             stages.append(
                 StageResult(
@@ -199,7 +235,7 @@ class DataUpdateService:
                 sync = self._sync()
                 counts = sync.sync_reference(
                     as_of - timedelta(days=10),
-                    as_of + timedelta(days=45),
+                    as_of + timedelta(days=self._forward_days()),
                 )
                 stages.append(
                     StageResult(
@@ -210,6 +246,28 @@ class DataUpdateService:
                     )
                 )
                 reference_ready = self._reference_ready(as_of)
+                calendar = self._calendar()
+                if calendar.covers(as_of):
+                    if not calendar.is_trading_day(as_of):
+                        stages[-2] = StageResult(
+                            name="trading_day",
+                            status="skipped",
+                            detail=f"刷新后确认 {as_of} 休市",
+                        )
+                        return DataUpdateResult(
+                            as_of=as_of,
+                            status="skipped",
+                            data_ready=False,
+                            stages=stages,
+                            issues=[f"{as_of} 是已确认的休市日"],
+                        )
+                    stages[-2] = StageResult(
+                        name="trading_day", status="succeeded"
+                    )
+                else:
+                    issues.append(
+                        f"交易日历刷新后仍不覆盖 {as_of}；按未知继续，不判定为休市"
+                    )
             except Exception as exc:  # noqa: BLE001
                 stages.append(
                     StageResult(

@@ -8,7 +8,7 @@ service adds persistence, market-data freshness and notification state.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -48,7 +48,13 @@ from app.portfolio.exit_rules import (
     evaluate_exit,
     target_states_from_plan,
 )
-from app.portfolio.market import PricePoint, points_from_bars
+from app.portfolio.market import (
+    SHANGHAI,
+    PricePoint,
+    market_phase,
+    next_session_open,
+    points_from_bars,
+)
 
 
 @dataclass
@@ -115,13 +121,13 @@ class PositionDecisionService:
                 now=moment,
                 ma5=ma5.get(position.ts_code),
                 calendar=calendar,
+                persist_state=persist,
             )
             if persist:
                 self._persist(
                     position,
                     decision,
                     now=moment,
-                    point=point,
                 )
             if notify:
                 self._notify(
@@ -136,6 +142,177 @@ class PositionDecisionService:
             self.session.flush()
         return decisions
 
+    def current_all(
+        self,
+        as_of: date,
+        *,
+        points: dict[str, PricePoint] | None = None,
+        now: datetime | None = None,
+    ) -> list[PositionDecision]:
+        """Return the latest valid decision for every position.
+
+        Page/API/SSE views must not recompute a previous-close decision and
+        overwrite a newer intraday decision.  Persisted decisions are compared
+        with a fresh post-close baseline by data time; stale snapshots are
+        explicitly marked instead of being presented as a safe hold.
+        """
+        moment = now or datetime.now(SHANGHAI)
+        if points is None:
+            points = self._daily_points(as_of)
+        calendar = self._calendar_for(max(as_of, moment.date()))
+        ma5 = self._ma5_map(as_of)
+        decisions: list[PositionDecision] = []
+        for position in PositionRepository.list_positions(
+            self.session, self.account_id
+        ):
+            point = points.get(position.ts_code)
+            if (
+                point is not None
+                and point.data_time is not None
+                and position.opened_at is not None
+                and point.data_time.date() < position.opened_at.date()
+            ):
+                point = None
+            fresh = self.evaluate_position(
+                position,
+                as_of=as_of,
+                point=point,
+                session_type=ExitSession.DAILY,
+                now=moment,
+                ma5=ma5.get(position.ts_code),
+                calendar=calendar,
+                persist_state=False,
+            )
+            persisted = self.latest(position.ts_code)
+            chosen = self._choose_current(
+                fresh, persisted, now=moment, calendar=calendar
+            )
+            decisions.append(chosen)
+        return decisions
+
+    def _choose_current(
+        self,
+        fresh: PositionDecision,
+        persisted: PositionDecision | None,
+        *,
+        now: datetime,
+        calendar: TradingCalendar | None,
+    ) -> PositionDecision:
+        chosen = fresh
+        if persisted is not None and persisted.data_time is not None:
+            fresh_time = self._aware_shanghai(fresh.data_time)
+            persisted_time = self._aware_shanghai(persisted.data_time)
+            if (
+                fresh_time is None
+                or persisted_time is None
+                or persisted_time > fresh_time
+            ):
+                chosen = persisted
+                if chosen.decision_source == "daily":
+                    # Legacy payload: a persisted decision newer than the
+                    # daily baseline can only have come from an intraday run.
+                    chosen = chosen.model_copy(
+                        update={"decision_source": "persisted"}
+                    )
+        phase = market_phase(now, calendar)
+        return self._assess_current(
+            chosen, now=now, phase=phase, calendar=calendar
+        )
+
+    def _assess_current(
+        self,
+        chosen: PositionDecision,
+        *,
+        now: datetime,
+        phase: str,
+        calendar: TradingCalendar | None,
+    ) -> PositionDecision:
+        moment = now.astimezone(SHANGHAI) if now.tzinfo else now.replace(
+            tzinfo=SHANGHAI
+        )
+        day = moment.date()
+        chosen = chosen.model_copy(update={"market_phase": phase})
+        risk_actions = {
+            PositionAction.EXIT,
+            PositionAction.REDUCE,
+            PositionAction.DATA_ANOMALY,
+        }
+        intraday = chosen.decision_source in ("intraday", "persisted")
+        data_day = chosen.data_time.date() if chosen.data_time else None
+        reason: str | None = None
+        if data_day is None:
+            reason = "decision_time_missing"
+        elif intraday:
+            expiry = self._aware_shanghai(chosen.valid_until)
+            if expiry is not None and moment > expiry:
+                reason = "intraday_quote_expired"
+            elif data_day < day and phase in ("trading", "lunch"):
+                reason = "intraday_quote_from_earlier_day"
+            elif data_day < day and phase in ("post_close",):
+                reason = "intraday_snapshot_before_latest_close"
+        else:
+            # Daily baseline: it is current as the latest completed close, but
+            # during a newer trading session it is not a live decision.
+            if phase in ("trading", "lunch") and data_day < day:
+                reason = "intraday_decision_missing"
+            elif phase == "post_close" and data_day < day:
+                expected = self._latest_completed_trading_day(day, calendar)
+                if expected is not None and data_day < expected:
+                    reason = "post_close_data_missing"
+            elif data_day < day and phase in ("holiday", "weekend", "pre_open"):
+                # Weekend/holiday/pre-open: the previous close is the latest
+                # available market state, not an error.
+                expected = self._latest_completed_trading_day(day, calendar)
+                if expected is not None and data_day < expected:
+                    reason = "daily_data_stale"
+        if reason is None:
+            return chosen.model_copy(update={"is_current": True, "stale_reason": None})
+        if chosen.action in risk_actions:
+            explanation = (
+                f"{chosen.explanation}（行情状态：{reason}；"
+                "底层风险动作仍保留，不以过期行情改为持有。）"
+            )
+            return chosen.model_copy(
+                update={
+                    "is_current": False,
+                    "stale_reason": reason,
+                    "valuation_status": (
+                        chosen.valuation_status
+                        if chosen.valuation_status.value != "ok"
+                        else ValuationStatus.STALE
+                    ),
+                    "explanation": explanation,
+                }
+            )
+        return chosen.model_copy(
+            update={
+                "action": PositionAction.DATA_ANOMALY,
+                "reason_code": "quote_stale",
+                "explanation": (
+                    f"最新决策数据时间为 {chosen.data_time}，状态 {reason}；"
+                    "不能把过期/缺失行情视为安全持有。"
+                ),
+                "is_current": False,
+                "stale_reason": reason,
+                "valuation_status": ValuationStatus.STALE,
+                "suggested_shares": 0,
+                "covered_shares": 0,
+                "confirmed": False,
+            }
+        )
+
+    @staticmethod
+    def _latest_completed_trading_day(
+        day: date, calendar: TradingCalendar | None
+    ) -> date | None:
+        if calendar is not None and calendar.covers(day):
+            candidates = [item for item in calendar.dates if item <= day]
+            return candidates[-1] if candidates else None
+        candidate = day
+        while candidate.weekday() >= 5:
+            candidate -= timedelta(days=1)
+        return candidate
+
     def evaluate_position(
         self,
         position: PositionRow,
@@ -146,9 +323,38 @@ class PositionDecisionService:
         now: datetime,
         ma5: float | None = None,
         calendar: TradingCalendar | None = None,
+        persist_state: bool = True,
     ) -> PositionDecision:
+        moment = now if now.tzinfo else now.replace(tzinfo=UTC)
+        calendar = calendar or self._calendar_for(
+            max(as_of, moment.astimezone(SHANGHAI).date())
+        )
+        effective_stop = self._effective_stop(
+            position, point, moment, persist_state=persist_state
+        )
+        entry_price = self._entry_price(position)
+        prior_high = float(position.highest_price or entry_price or 0)
+        daily_bar = (
+            session_type == ExitSession.DAILY
+            and point is not None
+            and point.usable
+        )
+        tick_high = float(point.high) if daily_bar and point is not None else 0.0
+        new_high_today = tick_high > prior_high + 1e-9
+        policy_high = max(prior_high, tick_high)
+        last_high_on = position.last_new_high_on or (
+            position.opened_at.date() if position.opened_at is not None else None
+        )
+        if new_high_today and point is not None and point.data_time is not None:
+            last_high_on = point.data_time.date()
+        days_since_high = self._days_since_high(last_high_on, as_of, calendar)
         policy = self._policy(
-            position, point, ma5=ma5, as_of=as_of, calendar=calendar
+            position,
+            ma5=ma5,
+            as_of=as_of,
+            calendar=calendar,
+            current_stop=effective_stop,
+            highest_price=policy_high,
         )
         if point is None:
             observation = ExitObservation(
@@ -160,6 +366,8 @@ class PositionDecisionService:
                 data_time=None,
                 data_ok=False,
                 data_issues=("缺少行情",),
+                days_since_new_high=days_since_high,
+                last_new_high_on=last_high_on,
             )
             valuation = ValuationStatus.MISSING
         else:
@@ -172,6 +380,8 @@ class PositionDecisionService:
                 session=session_type,
                 intrabar_stop=session_type != ExitSession.DAILY,
                 days_held=self._days_held(position, as_of, calendar),
+                days_since_new_high=days_since_high,
+                last_new_high_on=last_high_on,
                 data_time=point.data_time,
                 data_ok=point.usable,
                 data_issues=point.issues,
@@ -183,11 +393,14 @@ class PositionDecisionService:
             total_shares=position.shares,
             available_shares=position.available_shares,
         )
-        pending_shares, executed_shares = self._execution_totals(position)
+        pending_shares, executed_shares, pending_orders = self._execution_totals(
+            position
+        )
         action = raw.action
         reason_code = raw.reason_code
         explanation = raw.explanation
         suggested = raw.suggested_shares
+        covered = 0
         if action == PositionAction.HOLD and self._add_on_eligible(position):
             action = PositionAction.ADD_CONDITIONAL
             reason_code = "conditional_add"
@@ -196,29 +409,81 @@ class PositionDecisionService:
                 "按加仓规则评估（退出/减仓仍优先）。"
             )
         if action in (PositionAction.EXIT, PositionAction.REDUCE) and pending_shares > 0:
-            action = PositionAction.WAIT_EXECUTION
-            reason_code = "awaiting_execution"
+            # The underlying risk action is preserved.  Pending sell orders
+            # only cover part of it; the uncovered remainder remains a real
+            # recommendation, and partial fills count from the actual filled
+            # quantity rather than the original order size.
+            covered = min(pending_shares, suggested)
+            suggested = max(0, suggested - covered)
             explanation = (
-                f"已有 {pending_shares} 股卖出委托待成交；成交前不释放风险、"
-                "不重复生成卖出建议。"
+                f"{explanation} 已有 {pending_shares} 股卖出委托待成交，"
+                f"覆盖本次建议 {covered} 股，尚未覆盖 {suggested} 股；"
+                "请核对是否需要撤改单或补充卖出。"
             )
-            suggested = 0
         target_states = tuple(policy.targets)
         # "Confirmed" means a real sell order/acknowledged action exists, not
         # merely that the same alert was shown before.
         confirmed = pending_shares > 0
+        proposed = raw.proposed_stop
+        if (
+            persist_state
+            and session_type == ExitSession.DAILY
+            and point is not None
+            and point.usable
+            and action not in (PositionAction.EXIT, PositionAction.DATA_ANOMALY)
+            and proposed is not None
+            and (effective_stop is None or proposed > effective_stop + 1e-9)
+            and (
+                position.pending_stop is None
+                or proposed > float(position.pending_stop) + 1e-9
+            )
+        ):
+            position.pending_stop = Decimal(str(proposed))
+            position.pending_stop_data_time = point.data_time
+            position.pending_stop_effective_at = next_session_open(
+                as_of, calendar
+            )
+        if (
+            persist_state
+            and session_type == ExitSession.DAILY
+            and point is not None
+            and point.usable
+        ):
+            if new_high_today:
+                position.highest_price = Decimal(str(tick_high))
+                if point.data_time is not None:
+                    position.last_new_high_on = point.data_time.date()
+            elif position.last_new_high_on is None and position.opened_at is not None:
+                position.last_new_high_on = position.opened_at.date()
+        valid_until: datetime | None
         if session_type == ExitSession.INTRADAY:
             valid_until = now + timedelta(
                 seconds=self.config.intraday.max_quote_age_seconds
             )
-        elif point is not None and point.data_time is not None:
-            valid_until = datetime.combine(
-                point.data_time.date() + timedelta(days=1),
-                time(15, 0),
-                tzinfo=point.data_time.tzinfo,
-            )
         else:
-            valid_until = None
+            valid_until = next_session_open(
+                as_of, calendar
+            ) if point is not None else None
+        pending_stop_value = (
+            float(position.pending_stop)
+            if position.pending_stop is not None
+            else None
+        )
+        pending_stop_effective_at = position.pending_stop_effective_at
+        pending_effective_moment = self._aware_shanghai(
+            pending_stop_effective_at
+        )
+        moment_for_pending = self._aware_shanghai(
+            point.data_time if point else None
+        ) or self._aware_shanghai(now)
+        if (
+            pending_stop_value is not None
+            and pending_effective_moment is not None
+            and moment_for_pending is not None
+            and moment_for_pending >= pending_effective_moment
+        ):
+            pending_stop_value = None
+            pending_stop_effective_at = None
         return PositionDecision(
             ts_code=position.ts_code,
             sector=position.sector,
@@ -240,23 +505,38 @@ class PositionDecisionService:
             trigger_time=point.data_time if point else None,
             data_time=point.data_time if point else None,
             valid_until=valid_until,
+            decision_source=(
+                "daily" if session_type == ExitSession.DAILY else "intraday"
+            ),
+            market_phase=market_phase(moment, calendar),
+            is_current=valuation == ValuationStatus.OK,
             total_shares=position.shares,
             available_shares=position.available_shares,
             suggested_shares=suggested,
             restricted_shares=raw.restricted_shares,
-            current_stop=Decimal(str(position.current_stop))
-            if position.current_stop > 0
+            covered_shares=covered,
+            current_stop=Decimal(str(effective_stop))
+            if effective_stop is not None and effective_stop > 0
             else None,
             proposed_stop=(
                 Decimal(str(raw.proposed_stop))
                 if raw.proposed_stop is not None
                 else None
             ),
+            pending_stop=(
+                Decimal(str(pending_stop_value))
+                if pending_stop_value is not None
+                else None
+            ),
+            pending_stop_effective_at=pending_stop_effective_at,
+            last_new_high_on=last_high_on,
+            days_since_new_high=days_since_high,
             targets=list(target_states),
             invalidation=raw.invalidation,
             confirmed=confirmed,
             executed_shares=executed_shares,
             pending_shares=pending_shares,
+            pending_sell_orders=pending_orders,
             valuation_status=valuation,
             needs_reconciliation=policy.needs_reconciliation,
             data_issues=list(raw.data_issues),
@@ -280,7 +560,6 @@ class PositionDecisionService:
         decision: PositionDecision,
         *,
         now: datetime,
-        point: PricePoint | None,
     ) -> None:
         position.last_decision_json = decision.model_dump(mode="json")
         position.last_decision_at = now
@@ -292,22 +571,6 @@ class PositionDecisionService:
             and decision.trigger_price is not None
         ):
             position.current_price = decision.trigger_price
-        if (
-            decision.proposed_stop is not None
-            and decision.action
-            not in (PositionAction.EXIT, PositionAction.DATA_ANOMALY)
-            and decision.proposed_stop > position.current_stop
-        ):
-            position.current_stop = decision.proposed_stop
-        if (
-            point is not None
-            and decision.valuation_status == ValuationStatus.OK
-            and point.high > 0
-        ):
-            position.highest_price = max(
-                position.highest_price or Decimal("0"),
-                Decimal(str(point.high)),
-            )
 
     def _notify(
         self,
@@ -396,11 +659,12 @@ class PositionDecisionService:
     def _policy(
         self,
         position: PositionRow,
-        point: PricePoint | None,
         *,
         ma5: float | None,
         as_of: date,
         calendar: TradingCalendar | None,
+        current_stop: float | None,
+        highest_price: float,
     ) -> ExitPolicy:
         plan = (
             PlanRepository.get(self.session, position.plan_id)
@@ -499,10 +763,7 @@ class PositionDecisionService:
                 or evidence.get("event_retracted")
                 or evidence.get("direction") == "negative"
             )
-        highest = max(
-            float(position.highest_price or entry_price),
-            point.high if point is not None else 0.0,
-        )
+        highest = highest_price
         return ExitPolicy(
             strategy=strategy,
             sub_mode=str(sub_mode_value) if sub_mode_value else None,
@@ -515,11 +776,7 @@ class PositionDecisionService:
             initial_r=(
                 float(initial_r_value) if initial_r_value is not None else None
             ),
-            current_stop=(
-                float(position.current_stop)
-                if position.current_stop is not None
-                else None
-            ),
+            current_stop=current_stop,
             highest_price=highest,
             atr14=float(stop_payload.get("atr14") or 0) or None,
             ma5=ma5,
@@ -646,16 +903,85 @@ class PositionDecisionService:
         return result
 
     def _calendar(self, as_of: date) -> TradingCalendar | None:
+        return self._calendar_for(as_of)
+
+    def _calendar_for(self, day: date) -> TradingCalendar | None:
         if self.provider is None:
             return None
         try:
             frame = self.provider.load_trade_cal(
-                as_of - timedelta(days=400), as_of
+                day - timedelta(days=400), day + timedelta(days=15)
             )
         except Exception:  # noqa: BLE001
             return None
         calendar = TradingCalendar.from_trade_cal(frame)
-        return calendar if calendar.dates else None
+        return calendar if calendar.dates or calendar.covered_start else None
+
+    @staticmethod
+    def _entry_price(position: PositionRow) -> float:
+        return float(position.cost_price or 0)
+
+    @staticmethod
+    def _aware_shanghai(value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=SHANGHAI)
+        return value.astimezone(SHANGHAI)
+
+    def _effective_stop(
+        self,
+        position: PositionRow,
+        point: PricePoint | None,
+        now: datetime,
+        *,
+        persist_state: bool,
+    ) -> float | None:
+        stop = (
+            float(position.current_stop)
+            if position.current_stop is not None and position.current_stop > 0
+            else None
+        )
+        pending = position.pending_stop
+        effective_at = self._aware_shanghai(
+            position.pending_stop_effective_at
+        )
+        if pending is None or pending <= 0 or effective_at is None:
+            return stop
+        moment = self._aware_shanghai(point.data_time if point else None) or (
+            self._aware_shanghai(now)
+        )
+        if moment is None or moment < effective_at:
+            return stop
+        promoted = float(pending)
+        if stop is not None and promoted <= stop:
+            if persist_state:
+                position.pending_stop = None
+                position.pending_stop_data_time = None
+                position.pending_stop_effective_at = None
+            return stop
+        if persist_state:
+            position.current_stop = Decimal(str(promoted))
+            position.pending_stop = None
+            position.pending_stop_data_time = None
+            position.pending_stop_effective_at = None
+        return promoted
+
+    @staticmethod
+    def _days_since_high(
+        last_high_on: date | None,
+        as_of: date,
+        calendar: TradingCalendar | None,
+    ) -> int | None:
+        if last_high_on is None:
+            return None
+        if as_of <= last_high_on:
+            return 0
+        if calendar is not None:
+            return calendar.count_between(
+                last_high_on + timedelta(days=1), as_of
+            )
+        return max(0, (as_of - last_high_on).days)
 
     def _days_held(
         self,
@@ -670,7 +996,9 @@ class PositionDecisionService:
             return calendar.count_between(opened, as_of)
         return max(0, sum(1 for _ in range((as_of - opened).days + 1)))
 
-    def _execution_totals(self, position: PositionRow) -> tuple[int, int]:
+    def _execution_totals(
+        self, position: PositionRow
+    ) -> tuple[int, int, list[dict]]:
         executions = list(
             self.session.scalars(
                 select(ExecutionRow).where(
@@ -686,13 +1014,33 @@ class PositionDecisionService:
                     OrderRow.ts_code == position.ts_code,
                     OrderRow.side == ExecutionSide.SELL.value,
                     OrderRow.status.in_(
-                        [OrderStatus.PENDING.value, OrderStatus.PARTIAL.value]
+                        [
+                            OrderStatus.PENDING.value,
+                            OrderStatus.PARTIAL.value,
+                            OrderStatus.CANCEL_REQUESTED.value,
+                        ]
                     ),
                 )
             )
         )
+        # The original order size is not the remaining exposure.  A partial
+        # fill reduces the quantity that is still working at the broker.
+        details: list[dict[str, Any]] = [
+            {
+                "order_id": order.id,
+                "ts_code": order.ts_code,
+                "price": str(order.price),
+                "shares": int(order.shares),
+                "filled_shares": int(order.filled_shares or 0),
+                "remaining_shares": max(
+                    0, int(order.shares) - int(order.filled_shares or 0)
+                ),
+                "status": order.status,
+            }
+            for order in pending
+        ]
         pending_shares = sum(
-            max(0, order.shares) for order in pending
+            item["remaining_shares"] for item in details
         )
         opened_at = position.opened_at
         executed_shares = sum(
@@ -704,7 +1052,7 @@ class PositionDecisionService:
                 or execution.executed_at >= opened_at
             )
         )
-        return pending_shares, executed_shares
+        return pending_shares, executed_shares, details
 
     def _add_on_eligible(self, position: PositionRow) -> bool:
         strategy_value = position.primary_strategy

@@ -26,6 +26,7 @@
       <p>预期交易日：<span class="mono">{{ health.expected_trade_date if health and health.expected_trade_date else '—' }}</span></p>
       <p>最新处理日：<span class="mono">{{ data_status.latest_processed or '—' }}</span></p>
       <p>最新原始日：<span class="mono">{{ data_status.latest_raw or '—' }}</span></p>
+      <p>行情新鲜度：<span class="mono">{{ health.quote_freshness if health else 'unknown' }}</span></p>
       <p>行情估值：<span class="mono">{{ account.last_valuation_at if account and account.last_valuation_at else '—' }}</span>{% if account and account.valuation_incomplete %}<span class="cinnabar">（不完整：{{ account.valuation_note }}）</span>{% endif %}</p>
       <p>人工核对：<span class="mono">{{ account.last_reconciled_at if account and account.last_reconciled_at else '未核对' }}</span>{% if account and account.stale %}<span class="cinnabar">（过期）</span>{% endif %}</p>
       <p>调度器：<span class="{{ 'jade' if scheduler_running else 'cinnabar' }}">{{ '运行中' if scheduler_running else '未启动' }}</span></p>

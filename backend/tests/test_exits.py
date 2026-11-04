@@ -103,4 +103,7 @@ def test_exit_review_tightens_protection_and_flags_target():
         assert result.tightened == 1
         assert result.target_alerts == 1
         position = PositionRepository.get(session, "default", "000001.SZ")
-        assert float(position.current_stop) >= 10.5
+        assert float(position.current_stop) == 9.5
+        assert position.pending_stop is not None
+        assert float(position.pending_stop) >= 10.5
+        assert position.pending_stop_effective_at is not None

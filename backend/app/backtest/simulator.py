@@ -10,13 +10,15 @@ their stated expiry.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from math import sqrt
 from statistics import fmean, pstdev
+from zoneinfo import ZoneInfo
 
 import polars as pl
 
+from app.core.calendar import TradingCalendar
 from app.core.full_config import FullSystemConfig
 from app.domain.enums import (
     ExitSession,
@@ -42,6 +44,26 @@ from app.portfolio.exit_rules import (
     target_states_from_plan,
 )
 from app.portfolio.fees import calculate_fees
+
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _event_day(event: dict) -> date | None:
+    value = (
+        event.get("first_seen_at")
+        or event.get("ann_date")
+        or event.get("published_at")
+    )
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value[:10])
+        except ValueError:
+            return None
+    return None
 
 
 def _number(row: dict, key: str, default: float | None = None) -> float | None:
@@ -132,6 +154,11 @@ class SimPosition:
     exit_rules: ExitRules = field(default_factory=ExitRules)
     event_expiry: date | None = None
     event_invalid: bool = False
+    event_data_available: bool = True
+    event_id: str | None = None
+    last_new_high_on: date | None = None
+    pending_stop: float | None = None
+    pending_stop_source_day: date | None = None
     last_exit_reason: str | None = None
     primary_plan_id: str = ""
 
@@ -178,6 +205,10 @@ class Simulator:
     planned_shares: int = 0
     filled_shares: int = 0
     invested_ratios: list[float] = field(default_factory=list)
+    calendar: TradingCalendar | None = None
+    events_by_code: dict[str, list[dict]] | None = None
+    day_index: dict[date, int] = field(default_factory=dict)
+    recent_bars: dict[str, list[dict]] = field(default_factory=dict)
     expired_orders: list[dict] = field(default_factory=list)
     cancelled_orders: list[dict] = field(default_factory=list)
     invalidated_orders: list[dict] = field(default_factory=list)
@@ -273,30 +304,60 @@ class Simulator:
             self.missing_data.append(day.isoformat())
             return []
         by_code = {row["ts_code"]: row for row in bars.iter_rows(named=True)}
+        if day not in self.day_index:
+            self.day_index[day] = len(self.day_index)
+        for code, row in by_code.items():
+            history = self.recent_bars.setdefault(code, [])
+            history.append(
+                {
+                    "high": float(row.get("high") or 0),
+                    "low": float(row.get("low") or 0),
+                    "close": float(row.get("close") or 0),
+                }
+            )
+            if len(history) > 20:
+                del history[:-20]
         new_trades: list[SimTrade] = []
         # Exits first; positions bought today are protected by T+1.
         for code in list(self.positions):
             position = self.positions[code]
-            row = by_code.get(code)
-            if row is None:
+            bar_row = by_code.get(code)
+            if bar_row is None:
                 self.missing_data.append(
                     f"{day.isoformat()}:{code}: no bar (suspended/delisted?)"
                 )
                 continue
-            high = float(row["high"])
-            close = float(row["close"])
+            high = float(bar_row["high"])
+            close = float(bar_row["close"])
             position.current_price = close
-            position.highest = max(position.highest, high)
+            # A protection line calculated at a prior close takes effect only
+            # on the next processed trading day; it is never applied to the
+            # bar that produced it.
+            if (
+                position.pending_stop is not None
+                and position.pending_stop_source_day is not None
+                and day > position.pending_stop_source_day
+            ):
+                position.current_stop = max(
+                    position.current_stop, position.pending_stop
+                )
+                position.pending_stop = None
+                position.pending_stop_source_day = None
+            if high > position.highest + 1e-9:
+                position.highest = high
+                position.last_new_high_on = day
+            self._update_trailing_inputs(position, code)
+            self._update_event_state(position, day)
             if position.opened_on >= day:
                 continue
-            if _suspended(row):
+            if _suspended(bar_row):
                 continue
             position.days_held += 1
-            trades = self._check_exit(position, day, row)
+            trades = self._check_exit(position, day, bar_row)
             if trades:
                 new_trades.extend(trades)
             else:
-                self._update_stop(position, high, close)
+                self._update_stop(position, high, close, day=day)
 
         # Entries from previously approved plans.  An unfilled order that has
         # not expired stays pending; it is not deleted just because today's
@@ -323,11 +384,11 @@ class Simulator:
             if order.created_on >= day:
                 remaining_orders.append(order)
                 continue
-            row = by_code.get(order.plan.candidate.ts_code)
-            if row is None:
+            bar_row = by_code.get(order.plan.candidate.ts_code)
+            if bar_row is None:
                 remaining_orders.append(order)
                 continue
-            filled = self._try_entry(order, day, row)
+            filled = self._try_entry(order, day, bar_row)
             if filled and order.remaining <= 0:
                 order.state = "filled"
                 continue
@@ -515,6 +576,39 @@ class Simulator:
             exit_rules = plan.exit_rules or _default_exit_rules(
                 plan.strategy, self.config
             )
+            range_midpoint = self._range_midpoint_for(plan)
+            event_expiry = self._event_expiry_for(
+                plan, exit_rules, day
+            )
+            evidence = plan.candidate.evidence or {}
+            events_for_code = (
+                (self.events_by_code or {}).get(plan.candidate.ts_code, [])
+                if self.events_by_code is not None
+                else []
+            )
+            event_id = (
+                str(evidence.get("event_id"))
+                if evidence.get("event_id") is not None
+                else None
+            )
+            events_available = (
+                plan.strategy != Strategy.F
+                or (
+                    self.events_by_code is not None
+                    and (
+                        event_id is None
+                        or any(
+                            str(event.get("event_id")) == event_id
+                            for event in events_for_code
+                        )
+                    )
+                )
+            )
+            if plan.strategy == Strategy.F and not events_available:
+                self.missing_data.append(
+                    f"{day.isoformat()}:{plan.candidate.ts_code}: "
+                    "历史事件覆盖缺失，F 事件否定/撤回无法完整验证"
+                )
             position = SimPosition(
                 ts_code=plan.candidate.ts_code,
                 sector=plan.candidate.sector,
@@ -538,7 +632,13 @@ class Simulator:
                 initial_r=initial_r,
                 entry_fee_total=float(fees),
                 entry_fee_remaining=float(fees),
+                ma5=self._ma5_for(plan.candidate.ts_code),
+                range_midpoint=range_midpoint,
                 exit_rules=exit_rules,
+                event_expiry=event_expiry,
+                event_data_available=events_available,
+                event_id=event_id,
+                last_new_high_on=day,
                 primary_plan_id=plan.id,
             )
             self.positions[position.ts_code] = position
@@ -551,7 +651,9 @@ class Simulator:
             position.shares = total
             position.entry_fee_total += float(fees)
             position.entry_fee_remaining += float(fees)
-            position.highest = max(position.highest, float(fill_price))
+            if float(fill_price) > position.highest + 1e-9:
+                position.highest = float(fill_price)
+                position.last_new_high_on = day
             is_add_on = bool(
                 plan.position_plan.is_add_on
                 or (
@@ -589,6 +691,133 @@ class Simulator:
         order.filled_shares += shares
         self.filled_shares += shares
         return True
+
+    def _ma5_for(self, code: str) -> float | None:
+        rows = self.recent_bars.get(code) or []
+        closes = [row["close"] for row in rows if row["close"] > 0][-5:]
+        if len(closes) < 5:
+            return None
+        return sum(closes) / len(closes)
+
+    def _atr14_for(self, code: str) -> float | None:
+        rows = self.recent_bars.get(code) or []
+        if len(rows) < 15:
+            return None
+        ranges: list[float] = []
+        for index in range(1, len(rows)):
+            high = rows[index]["high"]
+            low = rows[index]["low"]
+            previous_close = rows[index - 1]["close"]
+            ranges.append(
+                max(
+                    high - low,
+                    abs(high - previous_close),
+                    abs(low - previous_close),
+                )
+            )
+        window = ranges[-14:]
+        if len(window) < 14:
+            return None
+        return sum(window) / len(window)
+
+    def _update_trailing_inputs(self, position: SimPosition, code: str) -> None:
+        ma5 = self._ma5_for(code)
+        if ma5 is not None:
+            position.ma5 = ma5
+        atr = self._atr14_for(code)
+        if atr is not None:
+            position.atr14 = atr
+
+    @staticmethod
+    def _date_value(value) -> date | None:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                return None
+        return None
+
+    def _range_midpoint_for(self, plan: TradePlan) -> float | None:
+        evidence = plan.candidate.evidence or {}
+        upper = evidence.get("range_upper")
+        lower = evidence.get("range_lower")
+        try:
+            if upper is None or lower is None:
+                return None
+            return (float(upper) + float(lower)) / 2
+        except (TypeError, ValueError):
+            return None
+
+    def _event_expiry_for(
+        self, plan: TradePlan, rules: ExitRules, entry_day: date
+    ) -> date | None:
+        if plan.strategy != Strategy.F:
+            return None
+        evidence = plan.candidate.evidence or {}
+        base = (
+            self._date_value(evidence.get("event_ann_date"))
+            or self._date_value(evidence.get("first_seen_at"))
+            or self._date_value(plan.signal_time)
+            or (
+                plan.candidate.data_time.date()
+                if plan.candidate.data_time is not None
+                else None
+            )
+            or entry_day
+        )
+        days = (
+            rules.event_expiry_days
+            or self.config.strategies.f.event_window_days
+        )
+        if self.calendar is not None:
+            anchor = base
+            if not self.calendar.is_trading_day(anchor):
+                upcoming = [
+                    item for item in self.calendar.dates if item >= anchor
+                ]
+                if upcoming:
+                    anchor = upcoming[0]
+            if self.calendar.is_trading_day(anchor):
+                try:
+                    return self.calendar.add_trading_days(anchor, days)
+                except ValueError:
+                    pass
+        return base + timedelta(days=days)
+
+    def _update_event_state(self, position: SimPosition, day: date) -> None:
+        if position.strategy != Strategy.F or not position.event_data_available:
+            return
+        for event in (self.events_by_code or {}).get(position.ts_code, []):
+            event_day = _event_day(event)
+            if event_day is None or event_day > day:
+                continue
+            same_event = (
+                position.event_id is not None
+                and str(event.get("event_id")) == position.event_id
+            )
+            if not same_event and event_day < position.opened_on:
+                continue
+            if event.get("retracted") or (
+                event.get("direction") == "negative"
+                and event.get("verification_status") == "verified"
+            ):
+                position.event_invalid = True
+                return
+
+    def _days_since_new_high(
+        self, position: SimPosition, day: date
+    ) -> int | None:
+        if position.last_new_high_on is None:
+            return None
+        current_index = self.day_index.get(day)
+        high_index = self.day_index.get(position.last_new_high_on)
+        if current_index is None or high_index is None:
+            return max(0, (day - position.last_new_high_on).days)
+        return max(0, current_index - high_index)
 
     def _policy(self, position: SimPosition) -> ExitPolicy:
         return ExitPolicy(
@@ -633,6 +862,11 @@ class Simulator:
             session=ExitSession.DAILY,
             intrabar_stop=True,
             days_held=position.days_held,
+            days_since_new_high=self._days_since_new_high(position, day),
+            last_new_high_on=position.last_new_high_on,
+            data_time=datetime.combine(
+                day, time(15, 0), tzinfo=SHANGHAI
+            ),
             data_ok=True,
         )
         decision = evaluate_exit(
@@ -696,19 +930,33 @@ class Simulator:
             if position.shares > 0:
                 # The stop proposal is for the next check, after today's
                 # target execution; it is never applied retroactively.
-                self._update_stop(position, high, close)
+                self._update_stop(position, high, close, day=day)
             return trades
-        self._update_stop(position, high, close)
+        self._update_stop(position, high, close, day=day)
         return []
 
     def _update_stop(
-        self, position: SimPosition, high: float, close: float
+        self,
+        position: SimPosition,
+        high: float,
+        close: float,
+        *,
+        day: date | None = None,
     ) -> None:
         proposed = proposed_trailing_stop(
             self._policy(position), high=high, close=close
         )
-        if proposed is not None:
-            position.current_stop = max(position.current_stop, proposed)
+        if proposed is None:
+            return
+        candidate = max(position.current_stop, proposed)
+        if candidate <= position.current_stop + 1e-9:
+            return
+        # Effective from the next processed trading day, never on the bar
+        # that produced the calculation.
+        position.pending_stop = max(
+            position.pending_stop or 0.0, candidate
+        )
+        position.pending_stop_source_day = day or position.opened_on
 
     def _allocate_entry_fee(self, position: SimPosition, shares: int) -> float:
         if position.shares <= 0:

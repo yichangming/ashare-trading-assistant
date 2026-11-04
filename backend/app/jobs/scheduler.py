@@ -104,8 +104,14 @@ class SchedulerService:
             logger.warning("trade calendar unavailable; using weekday check")
             return day.weekday() < 5
         if frame.is_empty():
+            logger.warning("trade calendar has no coverage for %s; attempting job", day)
             return day.weekday() < 5
         calendar = TradingCalendar.from_trade_cal(frame)
+        if not calendar.covers(day):
+            # Missing coverage is not a confirmed holiday.  Let the daily job
+            # refresh the calendar instead of skipping forever.
+            logger.warning("trade calendar does not cover %s; attempting job", day)
+            return day.weekday() < 5
         return calendar.is_trading_day(day)
 
     def run_daily(self, attempt: int = 0, force: bool = False) -> None:

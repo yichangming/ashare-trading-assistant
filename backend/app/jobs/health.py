@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 
 from app.core.calendar import TradingCalendar
 from app.data.interfaces import MarketDataProvider
-from app.db.repositories import AccountRepository, NotificationRepository
+from app.db.repositories import (
+    AccountRepository,
+    NotificationRepository,
+    PositionRepository,
+)
 from app.db.session import session_scope
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -27,6 +31,7 @@ class DataHealthReport(BaseModel):
     account_last_reconciled: datetime | None = None
     account_last_valuation: datetime | None = None
     account_stale: bool
+    quote_freshness: str = "unknown"
     ok: bool
     issues: list[str] = []
 
@@ -92,7 +97,37 @@ class DataHealthService:
         account_last_reconciled: datetime | None = None
         account_last_valuation: datetime | None = None
         account_stale = True
+        quote_freshness = "unknown"
         if session is not None:
+            positions = PositionRepository.list_positions(
+                session, self.account_id
+            )
+            if positions:
+                statuses = {
+                    position.valuation_status or "unknown"
+                    for position in positions
+                }
+                if statuses == {"ok"}:
+                    quote_freshness = "ok"
+                elif statuses & {"stale", "missing"}:
+                    quote_freshness = "stale"
+                else:
+                    quote_freshness = "partial"
+                for position in positions:
+                    last = position.last_decision_json or {}
+                    if position.valuation_status not in (None, "ok") or (
+                        isinstance(last, dict) and last.get("is_current") is False
+                    ):
+                        issues.append(
+                            f"{position.ts_code} 行情/决策状态："
+                            f"{position.valuation_status or 'unknown'}"
+                            + (
+                                f" ({last.get('stale_reason')})"
+                                if isinstance(last, dict)
+                                and last.get("stale_reason")
+                                else ""
+                            )
+                        )
             account = AccountRepository.get(session, self.account_id)
             if account is not None:
                 account_last_synced = account.last_synced_at
@@ -129,6 +164,7 @@ class DataHealthService:
             account_last_reconciled=account_last_reconciled,
             account_last_valuation=account_last_valuation,
             account_stale=account_stale,
+            quote_freshness=quote_freshness,
             ok=not issues,
             issues=issues,
         )

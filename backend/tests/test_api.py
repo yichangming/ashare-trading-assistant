@@ -172,3 +172,95 @@ def test_plan_confirmation_is_persisted(client: TestClient):
     assert response.status_code == 200
     with session_scope() as session:
         assert "用户已确认计划" in PlanRepository.get(session, plan.id).plan_json["reasons"]
+
+
+def test_api_sse_and_page_prefer_newer_intraday_decision(client: TestClient):
+    import json
+    from datetime import datetime, timedelta
+    from decimal import Decimal
+    from zoneinfo import ZoneInfo
+
+    from app.db.repositories import PositionRepository
+    from app.db.session import session_scope
+    from app.domain.enums import PositionAction, ValuationStatus
+    from app.domain.models import PositionDecision
+
+    shanghai = ZoneInfo("Asia/Shanghai")
+    now = datetime.now(shanghai)
+    _login(client)
+    with session_scope() as session:
+        PositionRepository.upsert(
+            session,
+            account_id="default",
+            ts_code="999999.SZ",
+            shares=1000,
+            available_shares=1000,
+            cost_price=10,
+            current_stop=9.5,
+            current_price=10,
+            primary_strategy="A",
+            initial_r=0.5,
+            initial_shares=1000,
+        )
+        position = PositionRepository.get(session, "default", "999999.SZ")
+        decision = PositionDecision(
+            ts_code="999999.SZ",
+            action=PositionAction.EXIT,
+            reason_code="hard_stop",
+            explanation="盘中价格跌破保护线",
+            trigger_price=Decimal("9.0"),
+            data_time=now - timedelta(minutes=1),
+            valid_until=now + timedelta(hours=1),
+            current_stop=Decimal("9.5"),
+            total_shares=1000,
+            available_shares=1000,
+            suggested_shares=1000,
+            decision_source="intraday",
+            valuation_status=ValuationStatus.OK,
+        )
+        position.last_decision_json = decision.model_dump(mode="json")
+    payload = client.get("/api/positions").json()
+    current = next(
+        item for item in payload["decisions"] if item["ts_code"] == "999999.SZ"
+    )
+    assert current["action"] == "exit"
+    assert current["decision_source"] == "intraday"
+    assert float(current["trigger_price"]) == 9.0
+    assert current["is_current"] is True
+
+    page = client.get("/positions")
+    assert page.status_code == 200
+    assert 'data-position-code="999999.SZ"' in page.text
+    assert "清仓" in page.text
+
+    with client.stream("GET", "/api/events/stream") as response:
+        assert response.status_code == 200
+        first = next(response.iter_lines())
+    snapshot = json.loads(first.removeprefix("data:").strip())
+    sse_position = next(
+        item for item in snapshot["positions"] if item["ts_code"] == "999999.SZ"
+    )
+    assert sse_position["action"] == "exit"
+    assert sse_position["decision_source"] == "intraday"
+    assert float(sse_position["current_price"]) == 9.0
+
+
+def test_reports_page_renders_markdown_as_html(client: TestClient, tmp_path, monkeypatch):
+    from app.api import app as app_module
+
+    _login(client)
+    report_dir = tmp_path / "data" / "reports" / "2026-11-03"
+    report_dir.mkdir(parents=True)
+    (report_dir / "daily.md").write_text(
+        "# 日报\n\n## 今日摘要\n\n- 市场：防守\n\n"
+        "| 策略 | 权限 |\n|---|---|\n| A 趋势回踩 | 暂停 |\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_module, "BACKEND_ROOT", tmp_path)
+    page = client.get("/reports?date=2026-11-03")
+    assert page.status_code == 200
+    assert "<h2>今日摘要</h2>" in page.text
+    assert "<table>" in page.text
+    assert "<li>市场：防守</li>" in page.text
+    assert "## 今日摘要" not in page.text
+    assert "SELECTED" not in page.text

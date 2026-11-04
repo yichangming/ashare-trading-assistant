@@ -15,6 +15,8 @@ from app.db.models import (
     AccountRow,
     CorporateActionRow,
     ExecutionRow,
+    OrderRow,
+    PlanRow,
     PositionLotRow,
     PositionRow,
 )
@@ -383,6 +385,7 @@ class AccountService:
                 plan_id=plan_id,
                 opened_at=executed_at,
                 highest_price=price,
+                last_new_high_on=executed_at.date(),
                 initial_r=initial_r,
                 initial_shares=shares,
                 add_on_count=0,
@@ -397,9 +400,10 @@ class AccountService:
             if proposed_stop is not None:
                 position.current_stop = proposed_stop
             position.current_price = price
-            position.highest_price = max(
-                position.highest_price or price, price
-            )
+            prior_high = position.highest_price or price
+            position.highest_price = max(prior_high, price)
+            if price > prior_high + Decimal("1e-9"):
+                position.last_new_high_on = executed_at.date()
             if strategy and not position.primary_strategy:
                 position.primary_strategy = strategy.value
             if sub_mode and not position.sub_mode:
@@ -702,11 +706,6 @@ class AccountService:
             position.current_price = Decimal(str(point.price))
             position.valuation_status = ValuationStatus.OK.value
             position.valuation_at = point.data_time or now or datetime.now(UTC)
-            if point.high > 0:
-                position.highest_price = max(
-                    position.highest_price or Decimal("0"),
-                    Decimal(str(point.high)),
-                )
         value = sum(
             (position.current_price * position.shares for position in positions),
             Decimal("0"),
@@ -955,23 +954,187 @@ class AccountService:
         )
 
 
-def cancel_order(session: Session, order_id: str, reason: str) -> None:
-    from app.db.models import OrderRow
+ACTIVE_ORDER_STATUSES = (
+    OrderStatus.PENDING.value,
+    OrderStatus.PARTIAL.value,
+    OrderStatus.CANCEL_REQUESTED.value,
+)
 
+
+def cancel_order(
+    session: Session,
+    order_id: str,
+    reason: str,
+    *,
+    confirmed: bool = False,
+) -> OrderRow:
+    """Request or confirm an order cancellation.
+
+    ``cancel_order`` without confirmation records a broker request that may
+    still fill; the order remains in ``cancel_requested`` and keeps consuming
+    cash/risk capacity.  Only an explicit broker confirmation releases it.
+    """
     order = session.get(OrderRow, order_id)
     if order is None:
         raise PortfolioError("order not found")
     if order.status == OrderStatus.FILLED.value:
         raise PortfolioError("cannot cancel a filled order")
-    if order.status == OrderStatus.CANCELLED.value:
-        return
-    order.status = OrderStatus.CANCELLED.value
+    if order.status in (
+        OrderStatus.CANCELLED.value,
+        OrderStatus.REJECTED.value,
+    ):
+        return order
+    order.status = (
+        OrderStatus.CANCELLED.value
+        if confirmed
+        else OrderStatus.CANCEL_REQUESTED.value
+    )
     order.cancel_reason = reason
     AuditRepository.log(
         session,
         actor="user",
-        action="cancel_order",
+        action="confirm_cancel_order" if confirmed else "request_cancel_order",
         target=order_id,
-        after={"reason": reason},
+        after={"reason": reason, "status": order.status},
     )
     session.flush()
+    return order
+
+
+def confirm_order_cancel(
+    session: Session, order_id: str, reason: str = "broker confirmed"
+) -> OrderRow:
+    order = session.get(OrderRow, order_id)
+    if order is None:
+        raise PortfolioError("order not found")
+    if order.status == OrderStatus.FILLED.value:
+        raise PortfolioError("cannot cancel a filled order")
+    return cancel_order(session, order_id, reason, confirmed=True)
+
+
+def reject_order_cancel(
+    session: Session, order_id: str, reason: str = "broker rejected cancel"
+) -> OrderRow:
+    """The broker refused the cancel: revert to the actual working state."""
+    order = session.get(OrderRow, order_id)
+    if order is None:
+        raise PortfolioError("order not found")
+    if order.status not in ACTIVE_ORDER_STATUSES:
+        return order
+    filled = int(order.filled_shares or 0)
+    order.status = (
+        OrderStatus.PARTIAL.value if filled > 0 else OrderStatus.PENDING.value
+    )
+    order.cancel_reason = reason
+    AuditRepository.log(
+        session,
+        actor="user",
+        action="reject_cancel_order",
+        target=order_id,
+        after={"reason": reason, "status": order.status},
+    )
+    session.flush()
+    return order
+
+
+def record_order_fill(
+    session: Session,
+    order_id: str,
+    *,
+    filled_shares: int | None = None,
+    add_shares: int | None = None,
+    reason: str | None = None,
+) -> OrderRow:
+    """Apply a broker fill fact without inventing an execution record.
+
+    ``filled_shares`` is the cumulative filled quantity when supplied;
+    ``add_shares`` is an increment.  Remaining exposure is recalculated from
+    this value, never from the original order quantity.
+    """
+    order = session.get(OrderRow, order_id)
+    if order is None:
+        raise PortfolioError("order not found")
+    if order.status in (
+        OrderStatus.CANCELLED.value,
+        OrderStatus.REJECTED.value,
+    ):
+        raise PortfolioError("cannot fill a cancelled/rejected order")
+    if filled_shares is not None:
+        filled = int(filled_shares)
+    elif add_shares is not None:
+        filled = int(order.filled_shares or 0) + int(add_shares)
+    else:
+        raise PortfolioError("filled_shares or add_shares is required")
+    if filled < 0 or filled > order.shares:
+        raise PortfolioError("filled quantity is out of range")
+    order.filled_shares = filled
+    order.status = (
+        OrderStatus.FILLED.value
+        if filled >= order.shares
+        else OrderStatus.PARTIAL.value
+        if filled > 0
+        else OrderStatus.PENDING.value
+    )
+    if reason:
+        order.cancel_reason = reason
+    AuditRepository.log(
+        session,
+        actor="user",
+        action="order_fill",
+        target=order_id,
+        after={"filled_shares": filled, "status": order.status},
+    )
+    session.flush()
+    return order
+
+
+def cancel_plan(
+    session: Session, plan_id: str, reason: str = "user cancelled"
+) -> dict:
+    """Cancel the local plan without pretending broker orders are cancelled.
+
+    The plan status changes, but any pending/partial/cancel-requested order
+    keeps its remaining quantity and therefore its cash/risk reservation.
+    """
+    plan = session.get(PlanRow, plan_id)
+    if plan is None:
+        raise PortfolioError("plan not found")
+    orders = list(
+        session.scalars(
+            select(OrderRow).where(
+                OrderRow.plan_id == plan_id,
+                OrderRow.status.in_(list(ACTIVE_ORDER_STATUSES)),
+            )
+        )
+    )
+    remaining = sum(
+        max(0, int(order.shares) - int(order.filled_shares or 0))
+        for order in orders
+    )
+    PlanRepository.update_status(
+        session, plan_id, PlanStatus.CANCELLED, reason
+    )
+    AuditRepository.log(
+        session,
+        actor="user",
+        action="cancel_plan",
+        target=plan_id,
+        after={
+            "status": PlanStatus.CANCELLED.value,
+            "active_orders": [order.id for order in orders],
+            "remaining_shares": remaining,
+        },
+    )
+    return {
+        "plan_id": plan_id,
+        "status": PlanStatus.CANCELLED.value,
+        "active_orders": [order.id for order in orders],
+        "remaining_shares": remaining,
+        "exposure_retained": remaining > 0,
+        "message": (
+            "计划已取消，但仍有未确认撤销的委托；资金/风险占用保留，"
+            "需在券商端撤单并确认。"
+            if remaining > 0
+            else "计划已取消，无活动委托。"
+        ),
+    }

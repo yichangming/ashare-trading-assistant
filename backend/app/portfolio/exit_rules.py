@@ -49,6 +49,8 @@ class ExitObservation:
     session: ExitSession = ExitSession.DAILY
     intrabar_stop: bool = False
     days_held: int = 0
+    days_since_new_high: int | None = None
+    last_new_high_on: date | None = None
     data_time: datetime | None = None
     data_ok: bool = True
     data_issues: tuple[str, ...] = ()
@@ -182,13 +184,9 @@ def evaluate_exit(
     overridden by an add-on suggestion.
     """
     issues = list(observation.data_issues)
-    if not observation.data_ok:
-        return ExitDecision(
-            action=PositionAction.DATA_ANOMALY,
-            reason_code="data_unavailable",
-            explanation="行情缺失或不可用；不能默认判定为安全持有。",
-            data_issues=tuple(issues or ["quote unavailable"]),
-        )
+    # Position integrity is checked before transient quote availability: if
+    # the protection line or strategy is missing, even a fresh quote cannot
+    # make the position safe.  Missing quote alone is reported separately.
     if not _valid(policy.initial_stop) or not _valid(policy.current_stop):
         return ExitDecision(
             action=PositionAction.DATA_ANOMALY,
@@ -198,6 +196,13 @@ def evaluate_exit(
                 "不得把买入价当作有效止损。"
             ),
             data_issues=tuple(issues or ["stop missing"]),
+        )
+    if not observation.data_ok:
+        return ExitDecision(
+            action=PositionAction.DATA_ANOMALY,
+            reason_code="data_unavailable",
+            explanation="行情缺失或不可用；不能默认判定为安全持有。",
+            data_issues=tuple(issues or ["quote unavailable"]),
         )
     latest = observation.latest_price
     high = observation.high
@@ -272,14 +277,32 @@ def evaluate_exit(
                 "time_stop",
                 f"持有 {observation.days_held} 个交易日仍未达到 +1R 且低于成本。",
             )
-    elif rules.time_exit == "no_new_high" and (
-        observation.days_held >= rules.time_stop_days
-        and policy.highest_price <= policy.entry_price + 1e-9
-    ):
-        return _exit(
-            "time_stop",
-            f"持有 {observation.days_held} 个交易日未创新高。",
-        )
+    elif rules.time_exit == "no_new_high":
+        since_high = observation.days_since_new_high
+        if since_high is None:
+            # Legacy positions without a recorded high date are not
+            # automatically held forever; derive from the holding period is
+            # handled by the service.  Here an unknown count is a data gap.
+            return ExitDecision(
+                action=PositionAction.DATA_ANOMALY,
+                reason_code="new_high_history_missing",
+                explanation=(
+                    "缺少最近一次有效新高的日期，无法计算时间退出；"
+                    "请补全历史或核对持仓。"
+                ),
+                data_issues=tuple(issues or ["last new high date missing"]),
+            )
+        if since_high >= rules.time_stop_days:
+            last = (
+                f"最近新高 {observation.last_new_high_on.isoformat()}"
+                if observation.last_new_high_on is not None
+                else "最近新高日期"
+            )
+            return _exit(
+                "time_stop",
+                f"{last} 后已 {since_high} 个交易日未创新高"
+                f"（阈值 {rules.time_stop_days}）；按时间退出。",
+            )
 
     # The stop proposal is computed from today's high/close but only included
     # as the next-day protection line; it is never used for today's exit.

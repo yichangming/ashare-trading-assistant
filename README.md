@@ -451,14 +451,15 @@ other positions. Browser SSE updates position price/stop/action/freshness and
 shows deduplicated risk toasts, with polling fallback. Browser notifications
 are not guaranteed when the browser is closed or the phone is locked.
 
-See `docs/full-system/review-fixes.md` for the defect-by-defect root cause,
+See `docs/full-system/review-fixes.md` and
+`docs/full-system/followup-fixes.md` for the defect-by-defect root cause,
 fix location and verification evidence.
 
 ## Tests and checks
 
 ```bash
 cd backend
-uv run pytest                 # 870 tests collected
+uv run pytest                 # 896 tests collected
 uv run ruff check app tests   # no errors
 uv run mypy app               # no errors
 ```
@@ -663,7 +664,7 @@ imports/                                 # uploaded CSV/JSON files
 - [x] CLI workflow: `sync`, `calendar`, `assemble`, `assemble-range`,
   `quality`, `run`, `account`, including account persistence and
   pending-plan pruning.
-- [x] Verification: 870 tests collected, ruff reports no errors, mypy
+- [x] Verification: 896 tests collected, ruff reports no errors, mypy
   reports no errors, and `--help` lists the legacy and v2 commands.
 - [x] v2 A–F strategies, permissions, unified plans, SQLite account/CSV,
   events, replay backtest, scheduler, reports, notifications, SSE, and the

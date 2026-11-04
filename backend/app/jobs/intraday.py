@@ -165,6 +165,9 @@ class IntradayMonitor:
         if frame.is_empty():
             return day.weekday() < 5
         calendar = TradingCalendar.from_trade_cal(frame)
+        if not calendar.covers(day):
+            # Coverage gaps are unknown, not confirmed holidays.
+            return day.weekday() < 5
         return calendar.is_trading_day(day)
 
     def _minute_quote(
@@ -286,7 +289,7 @@ class IntradayMonitor:
             return (
                 ValuationStatus.STALE,
                 (f"报价已过期 {age:.0f}s（阈值 {limit}s）",),
-                True,
+                False,
             )
         return ValuationStatus.OK, (), True
 
@@ -356,6 +359,15 @@ class IntradayMonitor:
                 persist=True,
                 notify=True,
             )
+            # Revalue through the single account-valuation path after position
+            # prices are updated.  Missing/stale quotes keep the last price and
+            # mark the valuation incomplete; they are never reported as a
+            # complete real-time mark.
+            from app.portfolio.service import AccountService
+
+            AccountService(
+                session, self.config, self.account_id
+            ).revalue(day, points, now=current)
             if self.b2 is not None:
                 try:
                     self.b2.check(day, now=current, session=session)

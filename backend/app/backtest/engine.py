@@ -109,7 +109,14 @@ class BacktestEngine:
         ]
         if max_days is not None:
             open_dates = open_dates[:max_days]
-        simulator = Simulator(self.config, equity, equity, equity)
+        simulator = Simulator(
+            self.config,
+            equity,
+            equity,
+            equity,
+            calendar=calendar,
+            events_by_code=events_by_code,
+        )
         notes: list[str] = [
             "daily OHLC replay; same-day stop and target resolves to stop",
             "unfilled orders remain pending until expires_on",

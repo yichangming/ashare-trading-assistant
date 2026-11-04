@@ -19,11 +19,11 @@
             <td class="num" data-field="shares">{{ pos.shares }} / {{ pos.available_shares }}</td>
             <td class="num">{{ pos.cost_price }}</td>
             <td class="num" data-field="price">{{ pos.current_price }}</td>
-            <td class="num" data-field="stop">{{ pos.current_stop }}{% if pos.proposed_stop and pos.proposed_stop != pos.current_stop %}<div class="muted small">→ {{ pos.proposed_stop }}</div>{% endif %}</td>
+            <td class="num" data-field="stop">{{ pos.current_stop }}{% if pos.pending_stop and pos.pending_stop != pos.current_stop %}<div class="muted small">待生效 {{ pos.pending_stop }}{% if pos.pending_stop_effective_at %} @ {{ pos.pending_stop_effective_at }}{% endif %}</div>{% endif %}</td>
             <td data-field="action"><span class="tag {{ 'risk' if pos.risk else 'ok' }}">{{ pos.action_label }}</span></td>
-            <td class="num" data-field="suggested">{{ pos.suggested_shares }} / {{ pos.restricted_shares }}{% if pos.pending_shares %}<div class="muted small">待成交 {{ pos.pending_shares }}</div>{% endif %}</td>
+            <td class="num" data-field="suggested">{{ pos.suggested_shares }} / {{ pos.restricted_shares }}{% if pos.covered_shares %}<div class="muted small">委托覆盖 {{ pos.covered_shares }}</div>{% endif %}{% if pos.pending_shares %}<div class="muted small">待成交 {{ pos.pending_shares }}</div>{% endif %}</td>
             <td class="small" data-field="reason">{{ pos.explanation }}<div class="muted small">{{ pos.reason_code }}</div></td>
-            <td class="num small" data-field="data-time">{{ pos.data_time or '未知' }}<div class="muted small">{{ pos.valuation_status }}</div></td>
+            <td class="num small" data-field="data-time">{{ pos.data_time or '未知' }}<div class="muted small">{{ pos.decision_source }} · {{ pos.valuation_status }}{% if pos.stale_reason %} · {{ pos.stale_reason }}{% endif %}</div></td>
           </tr>
         {% else %}
           <tr><td colspan="10" class="empty">暂无持仓。成交录入后会在此更新。</td></tr>

@@ -13,7 +13,7 @@
       <div class="brand-mark">木</div>
       <div>
         <div class="brand-name">A 股交易辅助台</div>
-        <div class="brand-sub">DECISION DESK</div>
+        <div class="brand-sub">决策辅助台</div>
       </div>
     </div>
     <nav class="nav">
@@ -40,7 +40,7 @@
       </div>
       <div class="spacer"></div>
       <span class="chip"><span class="sse-dot" id="sse-dot"></span><span id="sse-label">连接中</span></span>
-      <span class="chip">行情 <strong id="quote-freshness">{{ data_status.quote_freshness if data_status else '未知' }}</strong></span>
+      <span class="chip">行情 <strong id="quote-freshness">{{ data_status.quote_freshness_label if data_status else '未知' }}</strong></span>
       <a class="chip" href="/notifications">未处理通知 <strong id="notif-count">{{ notification_count or 0 }}</strong></a>
       <form method="post" action="/logout" style="margin:0">
         <button class="btn small" type="submit">退出</button>
@@ -75,7 +75,7 @@
   }
   function setFreshness(value) {
     if (!freshness) return;
-    const labels = { ok: '正常', partial: '部分过期', unknown: '未知' };
+    const labels = { ok: '正常', partial: '部分过期', stale: '已过期', missing: '缺失', unknown: '未知' };
     freshness.textContent = labels[value] || value || '未知';
     freshness.classList.toggle('cinnabar', value !== 'ok');
   }
@@ -128,7 +128,7 @@
       }
       set('shares', item.shares + ' / ' + item.available_shares);
       set('price', item.current_price || item.trigger_price);
-      set('stop', item.current_stop + (item.proposed_stop && item.proposed_stop !== item.current_stop ? ' → ' + item.proposed_stop : ''));
+      set('stop', item.current_stop + (item.pending_stop && item.pending_stop !== item.current_stop ? ' 待生效 ' + item.pending_stop + (item.pending_stop_effective_at ? ' @ ' + item.pending_stop_effective_at : '') : (item.proposed_stop && item.proposed_stop !== item.current_stop ? ' → ' + item.proposed_stop : '')));
       const action = row.querySelector('[data-field="action"]');
       if (action) {
         const tag = action.querySelector('.tag') || action;
@@ -137,9 +137,9 @@
           tag.className = 'tag ' + (item.risk ? 'risk' : 'ok');
         }
       }
-      set('suggested', (item.suggested_shares || 0) + ' / ' + (item.restricted_shares || 0));
+      set('suggested', (item.suggested_shares || 0) + ' / ' + (item.restricted_shares || 0) + (item.covered_shares ? ' 覆盖 ' + item.covered_shares : '') + (item.pending_shares ? ' 待成交 ' + item.pending_shares : ''));
       set('reason', (item.explanation || '') + ' ' + (item.reason_code || ''));
-      set('data-time', (item.data_time || '未知') + ' ' + (item.valuation_status || ''));
+      set('data-time', (item.data_time || '未知') + ' ' + (item.decision_source || '') + ' ' + (item.valuation_status || '') + (item.stale_reason ? ' ' + item.stale_reason : ''));
       row.classList.toggle('risk-row', !!item.risk);
     });
   }
@@ -192,15 +192,21 @@
             current_price: item.trigger_price,
             current_stop: item.current_stop,
             proposed_stop: item.proposed_stop,
+            pending_stop: item.pending_stop,
+            pending_stop_effective_at: item.pending_stop_effective_at,
             action: item.action,
             action_label: actionLabels[item.action] || item.action,
             risk: ['exit', 'reduce', 'data_anomaly'].indexOf(item.action) >= 0,
             suggested_shares: item.suggested_shares,
             restricted_shares: item.restricted_shares,
+            covered_shares: item.covered_shares,
+            pending_shares: item.pending_shares,
             explanation: item.explanation,
             reason_code: item.reason_code,
             data_time: item.data_time,
-            valuation_status: item.valuation_status
+            decision_source: item.decision_source,
+            valuation_status: item.valuation_status,
+            stale_reason: item.stale_reason
           };
         }));
         setFreshness((data.valuation || {}).quote_freshness || 'unknown');

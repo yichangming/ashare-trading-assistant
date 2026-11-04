@@ -318,5 +318,8 @@ def test_cancel_order_rejects_filled_and_is_idempotent():
             cancel_order(session, "order-1", "user")
         session.get(OrderRow, "order-1").status = "pending"
         cancel_order(session, "order-1", "user")
-        cancel_order(session, "order-1", "user")
+        assert session.get(OrderRow, "order-1").status == "cancel_requested"
+        cancel_order(session, "order-1", "user", confirmed=True)
+        assert session.get(OrderRow, "order-1").status == "cancelled"
+        cancel_order(session, "order-1", "user", confirmed=True)
         assert session.get(OrderRow, "order-1").status == "cancelled"

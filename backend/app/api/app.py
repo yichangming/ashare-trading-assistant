@@ -58,8 +58,6 @@ from app.db.session import get_db, prepare_database
 from app.domain.enums import (
     AccountMode,
     ExecutionSide,
-    ExitSession,
-    PlanStatus,
 )
 from app.events.ingest import EventIngestor
 from app.jobs.b2 import B2Monitor, TushareMinuteSource
@@ -67,10 +65,18 @@ from app.jobs.daily import DailyJobService
 from app.jobs.data_update import DataUpdateService
 from app.jobs.health import DataHealthService
 from app.jobs.intraday import IntradayMonitor, TushareQuoteAdapter
+from app.jobs.report_text import markdown_to_html
 from app.jobs.scheduler import SchedulerService
 from app.portfolio.csv_io import TEMPLATES, import_csv
 from app.portfolio.decisions import PositionDecisionService
-from app.portfolio.service import AccountService
+from app.portfolio.service import (
+    AccountService,
+    cancel_order,
+    cancel_plan,
+    confirm_order_cancel,
+    record_order_fill,
+    reject_order_cancel,
+)
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 STRATEGY_NAMES = {
@@ -90,6 +96,25 @@ ACTION_LABELS = {
     "data_anomaly": "数据异常",
 }
 RISK_ACTIONS = {"exit", "reduce", "data_anomaly"}
+
+
+def _quote_freshness(decisions: list) -> str:
+    """Single freshness vocabulary for page, API, SSE and health checks."""
+    if not decisions:
+        return "unknown"
+    if all(
+        item.is_current and item.valuation_status.value == "ok"
+        for item in decisions
+    ):
+        return "ok"
+    if any(
+        item.valuation_status.value in ("stale", "missing")
+        or item.stale_reason
+        for item in decisions
+    ):
+        return "stale"
+    return "partial"
+
 
 
 def _create_store() -> ParquetStore:
@@ -281,11 +306,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 value_date = datetime.now(SHANGHAI).date()
             decisions = PositionDecisionService(
                 session, config, provider=provider
-            ).evaluate_all(
+            ).current_all(
                 value_date,
-                session_type=ExitSession.DAILY,
-                persist=False,
-                notify=False,
+                now=datetime.now(SHANGHAI),
             )
             notifications = NotificationRepository.list_recent(
                 session, unacknowledged_only=True, limit=20
@@ -324,23 +347,20 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 }
                 for row in execution_rows
             ]
+            freshness = _quote_freshness(decisions)
             data_status = {
                 "latest_processed": latest_processed,
                 "latest_raw": _latest_manifest(store),
                 "stale": account["stale"],
                 "valuation_incomplete": account["valuation_incomplete"],
-                "quote_freshness": (
-                    "unknown"
-                    if not decisions
-                    else (
-                        "partial"
-                        if any(
-                            item.valuation_status.value != "ok"
-                            for item in decisions
-                        )
-                        else "ok"
-                    )
-                ),
+                "quote_freshness": freshness,
+                "quote_freshness_label": {
+                    "ok": "正常",
+                    "partial": "部分过期",
+                    "stale": "已过期",
+                    "missing": "缺失",
+                    "unknown": "未知",
+                }.get(freshness, "未知"),
             }
             pending_count = sum(
                 1
@@ -407,12 +427,34 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         "restricted_shares": decision.restricted_shares,
                         "executed_shares": decision.executed_shares,
                         "pending_shares": decision.pending_shares,
+                        "pending_sell_orders": decision.pending_sell_orders,
+                        "covered_shares": decision.covered_shares,
                         "data_time": (
                             decision.data_time.isoformat()
                             if decision.data_time
                             else None
                         ),
                         "valuation_status": decision.valuation_status.value,
+                        "decision_source": decision.decision_source,
+                        "market_phase": decision.market_phase,
+                        "is_current": decision.is_current,
+                        "stale_reason": decision.stale_reason,
+                        "pending_stop": (
+                            str(decision.pending_stop)
+                            if decision.pending_stop is not None
+                            else None
+                        ),
+                        "pending_stop_effective_at": (
+                            decision.pending_stop_effective_at.isoformat()
+                            if decision.pending_stop_effective_at
+                            else None
+                        ),
+                        "last_new_high_on": (
+                            decision.last_new_high_on.isoformat()
+                            if decision.last_new_high_on
+                            else None
+                        ),
+                        "days_since_new_high": decision.days_since_new_high,
                         "needs_reconciliation": decision.needs_reconciliation,
                         "confirmed": decision.confirmed,
                         "risk": decision.action.value in RISK_ACTIONS,
@@ -567,10 +609,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
         )[::-1] if root.exists() else []
         selected = date_value or (report_dates[0] if report_dates else "")
         markdown = ""
+        selected_html = ""
         if selected:
             path = root / selected / "daily.md"
             if path.exists():
                 markdown = path.read_text(encoding="utf-8")
+                selected_html = markdown_to_html(markdown)
         reports = [{"date": item} for item in report_dates]
         return templates.TemplateResponse(
             request,
@@ -581,6 +625,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 reports=reports,
                 selected_date=selected,
                 selected_markdown=markdown,
+                selected_html=selected_html,
             ),
         )
 
@@ -591,7 +636,11 @@ def create_app(database_url: str | None = None) -> FastAPI:
         path = BACKEND_ROOT / "data" / "reports" / report_date / "daily.md"
         if not path.exists():
             raise HTTPException(404, "report not found")
-        return FileResponse(path, media_type="text/markdown; charset=utf-8")
+        return FileResponse(
+            path,
+            media_type="text/markdown; charset=utf-8",
+            filename=f"{report_date}-daily.md",
+        )
 
     @app.get("/reports/{report_date}/html")
     def report_html(request: Request, report_date: str):
@@ -965,11 +1014,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 value_date = datetime.now(SHANGHAI).date()
             decisions = PositionDecisionService(
                 session, config, provider=provider
-            ).evaluate_all(
+            ).current_all(
                 value_date,
-                session_type=ExitSession.DAILY,
-                persist=False,
-                notify=False,
+                now=datetime.now(SHANGHAI),
             )
             payload = state.model_dump(mode="json")
             payload["positions_value"] = str(state.positions_value)
@@ -987,18 +1034,7 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 "last_reconciled_at": state.last_reconciled_at.isoformat()
                 if state.last_reconciled_at
                 else None,
-                "quote_freshness": (
-                    "unknown"
-                    if not decisions
-                    else (
-                        "partial"
-                        if any(
-                            item.valuation_status.value != "ok"
-                            for item in decisions
-                        )
-                        else "ok"
-                    )
-                ),
+                "quote_freshness": _quote_freshness(decisions),
             }
             return payload
 
@@ -1017,26 +1053,13 @@ def create_app(database_url: str | None = None) -> FastAPI:
                 value_date = datetime.now(SHANGHAI).date()
             decisions = PositionDecisionService(
                 session, config, provider=provider
-            ).evaluate_all(
+            ).current_all(
                 value_date,
-                session_type=ExitSession.DAILY,
-                persist=False,
-                notify=False,
+                now=datetime.now(SHANGHAI),
             )
             return {
                 "data_time": latest,
-                "quote_freshness": (
-                    "unknown"
-                    if not decisions
-                    else (
-                        "partial"
-                        if any(
-                            item.valuation_status.value != "ok"
-                            for item in decisions
-                        )
-                        else "ok"
-                    )
-                ),
+                "quote_freshness": _quote_freshness(decisions),
                 "decisions": [
                     decision.model_dump(mode="json")
                     for decision in decisions
@@ -1134,20 +1157,99 @@ def create_app(database_url: str | None = None) -> FastAPI:
         if not logged_in(request):
             raise HTTPException(401, "login required")
         with next(get_db()) as session:
-            plan = PlanRepository.update_status(
-                session, plan_id, PlanStatus.CANCELLED, "user cancelled"
-            )
-            AuditRepository.log(
-                session,
-                actor="user",
-                action="cancel_plan",
-                target=plan_id,
-                after={"status": plan.status},
-            )
-            session.commit()
+            try:
+                result = cancel_plan(session, plan_id, "user cancelled")
+                session.commit()
+            except Exception as exc:  # noqa: BLE001 - surface as 400
+                session.rollback()
+                raise HTTPException(400, str(exc)) from exc
         if redirect:
             return RedirectResponse(redirect, status_code=303)
-        return {"ok": True}
+        return {"ok": True, **result}
+
+    @app.post("/api/orders/{order_id}/cancel")
+    def api_order_cancel(
+        request: Request, order_id: str, reason: str = Form("user requested")
+    ):
+        if not logged_in(request):
+            raise HTTPException(401, "login required")
+        with next(get_db()) as session:
+            try:
+                order = cancel_order(session, order_id, reason)
+                session.commit()
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                raise HTTPException(400, str(exc)) from exc
+            return {
+                "ok": True,
+                "order_id": order.id,
+                "status": order.status,
+                "remaining_shares": max(
+                    0, int(order.shares) - int(order.filled_shares or 0)
+                ),
+                "confirmed": False,
+            }
+
+    @app.post("/api/orders/{order_id}/confirm-cancel")
+    def api_order_confirm_cancel(
+        request: Request, order_id: str, reason: str = Form("broker confirmed")
+    ):
+        if not logged_in(request):
+            raise HTTPException(401, "login required")
+        with next(get_db()) as session:
+            try:
+                order = confirm_order_cancel(session, order_id, reason)
+                session.commit()
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                raise HTTPException(400, str(exc)) from exc
+            return {"ok": True, "order_id": order.id, "status": order.status}
+
+    @app.post("/api/orders/{order_id}/reject-cancel")
+    def api_order_reject_cancel(
+        request: Request, order_id: str, reason: str = Form("broker rejected")
+    ):
+        if not logged_in(request):
+            raise HTTPException(401, "login required")
+        with next(get_db()) as session:
+            try:
+                order = reject_order_cancel(session, order_id, reason)
+                session.commit()
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                raise HTTPException(400, str(exc)) from exc
+            return {"ok": True, "order_id": order.id, "status": order.status}
+
+    @app.post("/api/orders/{order_id}/fill")
+    def api_order_fill(
+        request: Request,
+        order_id: str,
+        filled_shares: int = Form(...),
+        reason: str | None = Form(None),
+    ):
+        if not logged_in(request):
+            raise HTTPException(401, "login required")
+        with next(get_db()) as session:
+            try:
+                order = record_order_fill(
+                    session,
+                    order_id,
+                    filled_shares=filled_shares,
+                    reason=reason,
+                )
+                session.commit()
+            except Exception as exc:  # noqa: BLE001
+                session.rollback()
+                raise HTTPException(400, str(exc)) from exc
+            return {
+                "ok": True,
+                "order_id": order.id,
+                "status": order.status,
+                "filled_shares": order.filled_shares,
+                "remaining_shares": max(
+                    0, int(order.shares) - int(order.filled_shares or 0)
+                ),
+            }
 
     @app.post("/api/jobs/run")
     def api_run_job(
@@ -1197,11 +1299,9 @@ def create_app(database_url: str | None = None) -> FastAPI:
                     value_date = datetime.now(SHANGHAI).date()
                 decisions = PositionDecisionService(
                     session, config, provider=provider
-                ).evaluate_all(
+                ).current_all(
                     value_date,
-                    session_type=ExitSession.DAILY,
-                    persist=False,
-                    notify=False,
+                    now=datetime.now(SHANGHAI),
                 )
                 ordered = sorted(
                     decisions,
@@ -1212,34 +1312,12 @@ def create_app(database_url: str | None = None) -> FastAPI:
                         item.ts_code,
                     ),
                 )
-                quote_freshness = (
-                    "unknown"
-                    if not decisions
-                    else (
-                        "partial"
-                        if any(
-                            item.valuation_status.value != "ok"
-                            for item in decisions
-                        )
-                        else "ok"
-                    )
-                )
-                state_prices = {
-                    item.ts_code: float(item.current_price or 0)
-                    for item in state.positions
-                }
-                positions_value = sum(
-                    float(
-                        item.trigger_price
-                        or state_prices.get(item.ts_code, 0)
-                    )
-                    * item.total_shares
-                    for item in decisions
-                )
+                quote_freshness = _quote_freshness(decisions)
+                positions_value = float(state.positions_value)
                 cash_value = float(state.cash)
                 return {
                     "unacknowledged": count,
-                    "equity": round(cash_value + positions_value, 2),
+                    "equity": round(float(state.equity), 2),
                     "cash": round(cash_value, 2),
                     "positions_value": round(positions_value, 2),
                     "latest_job": latest.status if latest else None,
@@ -1272,9 +1350,26 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             "available_shares": item.available_shares,
                             "current_price": str(
                                 item.trigger_price
-                                or state_prices.get(item.ts_code, 0.0)
+                                or next(
+                                    (
+                                        position.current_price
+                                        for position in state.positions
+                                        if position.ts_code == item.ts_code
+                                    ),
+                                    0,
+                                )
                             ),
                             "current_stop": str(item.current_stop or ""),
+                            "pending_stop": (
+                                str(item.pending_stop)
+                                if item.pending_stop is not None
+                                else None
+                            ),
+                            "pending_stop_effective_at": (
+                                item.pending_stop_effective_at.isoformat()
+                                if item.pending_stop_effective_at
+                                else None
+                            ),
                             "proposed_stop": str(item.proposed_stop or ""),
                             "action": item.action.value,
                             "action_label": ACTION_LABELS.get(
@@ -1284,11 +1379,23 @@ def create_app(database_url: str | None = None) -> FastAPI:
                             "explanation": item.explanation,
                             "suggested_shares": item.suggested_shares,
                             "pending_shares": item.pending_shares,
+                            "pending_sell_orders": item.pending_sell_orders,
+                            "covered_shares": item.covered_shares,
                             "executed_shares": item.executed_shares,
                             "data_time": item.data_time.isoformat()
                             if item.data_time
                             else None,
                             "valuation_status": item.valuation_status.value,
+                            "decision_source": item.decision_source,
+                            "market_phase": item.market_phase,
+                            "is_current": item.is_current,
+                            "stale_reason": item.stale_reason,
+                            "last_new_high_on": (
+                                item.last_new_high_on.isoformat()
+                                if item.last_new_high_on
+                                else None
+                            ),
+                            "days_since_new_high": item.days_since_new_high,
                             "risk": item.action.value in RISK_ACTIONS,
                         }
                         for item in ordered

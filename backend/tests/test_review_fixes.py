@@ -221,7 +221,10 @@ def test_b_position_tightens_protection_and_suggests_target_reduction():
         assert decision.reason_code.startswith("target")
         assert decision.proposed_stop is not None
         assert float(decision.proposed_stop) >= 10.0
-        assert float(position.current_stop) >= 10.0
+        assert float(position.current_stop) == 9.5
+        assert position.pending_stop is not None
+        assert float(position.pending_stop) >= 10.0
+        assert position.pending_stop_effective_at is not None
         assert decision.suggested_shares == 500
         assert decision.targets[0].status == "pending"
 
@@ -495,7 +498,9 @@ def test_live_and_backtest_use_same_exit_rule_without_future_stop():
         )
         assert trades
         assert all(trade.exit_reason == "target" for trade in trades)
-        assert sim.positions["000001.SZ"].current_stop >= 10.5
+        assert sim.positions["000001.SZ"].current_stop == pytest.approx(9.5)
+        assert sim.positions["000001.SZ"].pending_stop is not None
+        assert sim.positions["000001.SZ"].pending_stop >= 10.5
 
 
 def test_b2_previous_trading_day_watchlist_lunch_validity_and_restart():
@@ -618,6 +623,7 @@ def test_intraday_rejects_stale_and_missing_time_and_keeps_other_positions():
                 primary_strategy="A",
                 initial_r=0.5,
                 initial_shares=1000,
+                opened_at=datetime(2026, 10, 30, 10, 0),
             )
     from app.jobs.intraday import IntradayMonitor
 
@@ -669,6 +675,7 @@ def test_intraday_deduplicates_alert_and_emits_recovery():
             primary_strategy="A",
             initial_r=0.5,
             initial_shares=1000,
+            opened_at=datetime(2026, 10, 30, 10, 0),
         )
     from app.jobs.intraday import IntradayMonitor
 
@@ -1207,13 +1214,18 @@ def test_report_contains_position_actions_from_shared_decisions(tmp_path):
         account=account,
         decisions=[decision],
         incomplete=["测试数据不完整"],
+        position_reviewed=True,
     )
     assert "持仓行动建议" in report["markdown"]
     assert "000001.SZ" in report["markdown"]
-    assert "target_1" in report["markdown"]
+    assert "触及分批止盈目标 1" in report["markdown"]
+    assert "减仓" in report["markdown"]
     assert "数据不完整" in report["markdown"]
     assert "000001.SZ" in report["html"]
     assert "测试数据不完整" in report["html"]
+    assert "<h2>今日摘要</h2>" in report["html"]
+    assert "<table>" in report["html"]
+    assert "<pre>" not in report["html"]
 
 
 def test_user_max_drawdown_participates_in_plan_governance():
@@ -1415,6 +1427,7 @@ def test_intraday_missing_and_future_timestamps_are_unknown_and_holiday_skips():
             primary_strategy="A",
             initial_r=1,
             initial_shares=1000,
+            opened_at=datetime(2026, 10, 30, 10, 0),
         )
     from app.jobs.intraday import IntradayMonitor, Quote
 
@@ -1502,6 +1515,7 @@ def test_intraday_minute_fallback_is_explicitly_delayed():
             primary_strategy="A",
             initial_r=1,
             initial_shares=1000,
+            opened_at=datetime(2026, 10, 30, 10, 0),
         )
     monitor = IntradayMonitor(
         NoQuote(),

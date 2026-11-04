@@ -93,6 +93,7 @@ def test_intraday_monitor_raises_hard_stop_without_auto_trade():
             cost_price=10,
             current_stop=10,
             current_price=10.5,
+            opened_at=datetime(2026, 10, 30, 10, 0),
         )
     monitor = IntradayMonitor(_Quote(9.9))
     result = monitor.check(
@@ -121,6 +122,7 @@ def test_intraday_monitor_reports_data_degradation_without_fake_price():
             cost_price=10,
             current_stop=10,
             current_price=10.5,
+            opened_at=datetime(2026, 10, 30, 10, 0),
         )
     monitor = IntradayMonitor(_Quote(None))
     result = monitor.check(

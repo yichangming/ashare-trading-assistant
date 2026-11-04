@@ -1,25 +1,65 @@
 {% extends "base.html" %}
 {% block title %}每日报告 · 交易辅助台{% endblock %}
 {% block content %}
+<style>
+  .report-body { font-size: 0.95rem; line-height: 1.7; }
+  .report-body h1 { font-size: 1.55rem; margin: 0 0 .8rem; }
+  .report-body h2 { font-size: 1.2rem; margin: 1.2rem 0 .5rem; }
+  .report-body h3 { font-size: 1rem; margin: 1rem 0 .4rem; }
+  .report-body p { margin: .4rem 0; }
+  .report-body ul, .report-body ol { margin: .4rem 0 .8rem; padding-left: 1.35rem; }
+  .report-body li { margin: .2rem 0; }
+  .report-body blockquote {
+    margin: .9rem 0; padding: .2rem 0 .2rem .9rem;
+    border-left: 3px solid var(--brass); color: var(--muted);
+  }
+  .report-body .table-wrap { overflow-x: auto; margin: .7rem 0 1.1rem; }
+  .report-body table {
+    border-collapse: collapse; width: 100%; min-width: 560px;
+    font-size: .9rem;
+  }
+  .report-body th, .report-body td {
+    border: 1px solid var(--line); padding: .45rem .55rem;
+    text-align: left; vertical-align: top;
+  }
+  .report-body th { background: var(--panel-2); white-space: nowrap; }
+  .report-body code {
+    font-family: var(--mono); background: var(--panel-2);
+    padding: .08rem .25rem; border-radius: 4px;
+  }
+  .report-body hr { border: 0; border-top: 1px solid var(--line); margin: 1.2rem 0; }
+  @media (max-width: 700px) {
+    .report-body table { min-width: 520px; font-size: .84rem; }
+    .report-body th, .report-body td { padding: .35rem .4rem; }
+    .report-body h1 { font-size: 1.3rem; }
+    .report-body h2 { font-size: 1.08rem; }
+  }
+</style>
 <div class="grid two">
   <section class="card">
-    <div class="eyebrow">DAILY REPORTS</div>
+    <div class="eyebrow">每日报告</div>
     <h1>每日报告</h1>
     <p class="muted small">报告是盘后快照；数据未就绪时会标注不完整，不伪装为最终结果。</p>
     <div class="table-wrap"><table>
-      <thead><tr><th>日期</th><th>Markdown</th><th>HTML</th></tr></thead>
+      <thead><tr><th>日期</th><th>下载报告文本</th><th>打开网页版</th></tr></thead>
       <tbody>
       {% for report in reports %}
-        <tr><td class="mono"><a href="/reports?date={{ report.date }}">{{ report.date }}</a></td><td><a href="/reports/{{ report.date }}/markdown">daily.md</a></td><td><a href="/reports/{{ report.date }}/html">daily.html</a></td></tr>
+        <tr><td class="mono"><a href="/reports?date={{ report.date }}">{{ report.date }}</a></td><td><a href="/reports/{{ report.date }}/markdown">下载报告文本</a></td><td><a href="/reports/{{ report.date }}/html">打开网页版</a></td></tr>
       {% else %}<tr><td colspan="3" class="empty">暂无报告。运行每日任务后生成。</td></tr>{% endfor %}
       </tbody>
     </table></div>
   </section>
   <section class="card">
-    <div class="eyebrow">SELECTED</div>
+    <div class="eyebrow">报告预览</div>
     {% if selected_date %}
       <h2>{{ selected_date }}</h2>
-      {% if selected_markdown %}<pre class="small" style="white-space:pre-wrap;max-height:60vh;overflow:auto">{{ selected_markdown }}</pre>{% else %}<p class="empty">该日报告尚未生成。</p>{% endif %}
+      {% if selected_html %}
+        <div class="report-body">{{ selected_html | safe }}</div>
+      {% elif selected_markdown %}
+        <pre class="small" style="white-space:pre-wrap;max-height:60vh;overflow:auto">{{ selected_markdown }}</pre>
+      {% else %}
+        <p class="empty">该日报告尚未生成。</p>
+      {% endif %}
     {% else %}
       <p class="empty">选择左侧日期查看报告。</p>
     {% endif %}

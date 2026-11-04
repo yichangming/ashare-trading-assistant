@@ -247,6 +247,7 @@ class DailyJobService:
                     decisions=decisions,
                     incomplete=incomplete,
                     data_notes=data_notes,
+                    position_reviewed=True,
                 )
                 JobRepository.finish(
                     session,

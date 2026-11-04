@@ -59,6 +59,7 @@ TEMPLATES: dict[str, list[str]] = {
         "side",
         "price",
         "shares",
+        "filled_shares",
         "status",
         "broker_order_id",
         "note",
@@ -260,6 +261,10 @@ def _import_order(
     )
     if existing is not None:
         return False
+    shares = int(row["shares"])
+    filled_shares = int(row.get("filled_shares") or 0)
+    if filled_shares < 0 or filled_shares > shares:
+        raise PortfolioError("filled_shares is out of range")
     session.add(
         OrderRow(
             id=uuid4().hex,
@@ -268,7 +273,8 @@ def _import_order(
             ts_code=row["ts_code"],
             side=ExecutionSide(row["side"]).value,
             price=Decimal(row["price"]),
-            shares=int(row["shares"]),
+            shares=shares,
+            filled_shares=filled_shares,
             status=OrderStatus(row.get("status") or "pending").value,
             broker_order_id=external,
         )

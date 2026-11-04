@@ -20,6 +20,7 @@ from app.db.models import (
     ExecutionRow,
     JobRunRow,
     NotificationRow,
+    OrderRow,
     PlanRow,
     PortfolioSnapshotRow,
     PositionLotRow,
@@ -30,6 +31,7 @@ from app.domain.enums import (
     AccountMode,
     ExecutionSide,
     GlobalRiskMode,
+    OrderStatus,
     PlanStatus,
     Strategy,
     SubMode,
@@ -264,6 +266,7 @@ class PositionRepository:
         opened_at: datetime | None = None,
         status: str = "open",
         highest_price: Decimal | float | None = None,
+        last_new_high_on: date | None = None,
         initial_r: Decimal | float | None = None,
         initial_shares: int | None = None,
         add_on_count: int | None = None,
@@ -295,6 +298,7 @@ class PositionRepository:
                     if highest_price is not None
                     else Decimal(str(cost_price))
                 ),
+                last_new_high_on=last_new_high_on,
                 initial_r=(
                     Decimal(str(initial_r)) if initial_r is not None else None
                 ),
@@ -325,6 +329,8 @@ class PositionRepository:
             row.status = status
             if highest_price is not None:
                 row.highest_price = Decimal(str(highest_price))
+            if last_new_high_on is not None:
+                row.last_new_high_on = last_new_high_on
             if initial_r is not None:
                 row.initial_r = Decimal(str(initial_r))
             if initial_shares is not None:
@@ -505,47 +511,129 @@ class PlanRepository:
         return len(rows)
 
     @staticmethod
+    def active_order_remaining(
+        session: Session, account_id: str, plan_id: str
+    ) -> int:
+        """Remaining BUY quantity still working at the broker for a plan."""
+        orders = session.scalars(
+            select(OrderRow).where(
+                OrderRow.account_id == account_id,
+                OrderRow.plan_id == plan_id,
+                OrderRow.side == ExecutionSide.BUY.value,
+                OrderRow.status.in_(
+                    [
+                        OrderStatus.PENDING.value,
+                        OrderStatus.PARTIAL.value,
+                        OrderStatus.CANCEL_REQUESTED.value,
+                    ]
+                ),
+            )
+        )
+        return sum(
+            max(0, int(order.shares) - int(order.filled_shares or 0))
+            for order in orders
+        )
+
+    @staticmethod
     def pending_exposures(session: Session, account_id: str = "default") -> list[PendingExposure]:
+        """Return exposure that still consumes cash/risk capacity.
+
+        A local plan and a broker order are different facts.  Cancelling or
+        expiring a plan does not cancel an order, so an active order keeps its
+        remaining quantity reserved until a fill, confirmed cancellation or
+        rejection is recorded.  Orders are authoritative when present.
+        """
         exposures: list[PendingExposure] = []
         today = date.today()
         now = datetime.now(UTC)
-        for row in PlanRepository.list_open(session, account_id):
-            if row.expires_on < today:
+        rows = list(
+            session.scalars(
+                select(PlanRow).where(PlanRow.account_id == account_id)
+            )
+        )
+        plan_by_id = {row.id: row for row in rows}
+        active_statuses = {
+            OrderStatus.PENDING.value,
+            OrderStatus.PARTIAL.value,
+            OrderStatus.CANCEL_REQUESTED.value,
+        }
+        order_rows = list(
+            session.scalars(
+                select(OrderRow).where(
+                    OrderRow.account_id == account_id,
+                    OrderRow.side == ExecutionSide.BUY.value,
+                    OrderRow.status.in_(list(active_statuses)),
+                )
+            )
+        )
+        remaining_by_plan: dict[str, int] = {}
+        price_by_plan: dict[str, Decimal] = {}
+        for order in order_rows:
+            remaining = max(
+                0, int(order.shares) - int(order.filled_shares or 0)
+            )
+            if remaining <= 0:
                 continue
-            expires_at = row.expires_at
-            if expires_at is not None:
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=UTC)
-                if expires_at <= now:
-                    continue
-            if row.status not in (
-                PlanStatus.PENDING_EXECUTION.value,
-                PlanStatus.PENDING_ENTRY.value,
-                PlanStatus.PARTIAL_FILL.value,
-            ):
+            remaining_by_plan[order.plan_id] = (
+                remaining_by_plan.get(order.plan_id, 0) + remaining
+            )
+            price_by_plan[order.plan_id] = order.price
+        active_plan_statuses = {
+            PlanStatus.PENDING_EXECUTION.value,
+            PlanStatus.PENDING_ENTRY.value,
+            PlanStatus.PARTIAL_FILL.value,
+        }
+        for plan_id in sorted(set(plan_by_id) | set(remaining_by_plan)):
+            row = plan_by_id.get(plan_id)
+            if row is None:
                 continue
+            plan_active = row.status in active_plan_statuses
+            if plan_active:
+                if row.expires_on < today:
+                    plan_active = False
+                expires_at = row.expires_at
+                if expires_at is not None:
+                    if expires_at.tzinfo is None:
+                        expires_at = expires_at.replace(tzinfo=UTC)
+                    if expires_at <= now:
+                        plan_active = False
             try:
                 plan = PlanRepository.to_domain(row)
-            except Exception:
+            except Exception:  # noqa: BLE001 - legacy payload is not exposure
                 continue
-            remaining = max(0, plan.position_plan.shares - sum(
-                execution.shares
-                for execution in session.scalars(
-                    select(ExecutionRow).where(
-                        ExecutionRow.plan_id == plan.id,
-                        ExecutionRow.side == ExecutionSide.BUY.value,
+            order_remaining = remaining_by_plan.get(plan_id, 0)
+            if order_remaining > 0:
+                # The order may outlive its plan.  Keep the exact remaining
+                # quantity and the price that is actually reserved.
+                entry_price = price_by_plan.get(
+                    plan_id, plan.entry_plan.entry_price
+                )
+                if entry_price <= plan.stop_plan.initial_stop:
+                    entry_price = plan.entry_plan.entry_price
+                shares = order_remaining
+            elif plan_active:
+                filled = sum(
+                    execution.shares
+                    for execution in session.scalars(
+                        select(ExecutionRow).where(
+                            ExecutionRow.plan_id == plan.id,
+                            ExecutionRow.side == ExecutionSide.BUY.value,
+                        )
                     )
                 )
-            ))
-            if remaining <= 0:
+                shares = max(0, plan.position_plan.shares - filled)
+                entry_price = plan.entry_plan.entry_price
+            else:
+                continue
+            if shares <= 0:
                 continue
             exposures.append(
                 PendingExposure(
                     ts_code=plan.candidate.ts_code,
                     sector=plan.candidate.sector,
-                    entry_price=plan.entry_plan.entry_price,
+                    entry_price=entry_price,
                     stop_price=plan.stop_plan.initial_stop,
-                    shares=remaining,
+                    shares=shares,
                     template=plan.candidate.template,
                     expires_on=plan.expires_on,
                     strategy=plan.strategy,

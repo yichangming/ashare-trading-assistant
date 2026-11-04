@@ -103,6 +103,7 @@ class ExecutionSide(StrEnum):
 class OrderStatus(StrEnum):
     PENDING = "pending"
     PARTIAL = "partial"
+    CANCEL_REQUESTED = "cancel_requested"
     FILLED = "filled"
     CANCELLED = "cancelled"
     REJECTED = "rejected"
